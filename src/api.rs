@@ -60,12 +60,12 @@ pub struct ReinforceResponse {
 
 #[derive(Clone)]
 pub enum EngineState {
-    SingleTenant(CueMapEngine),
-    MultiTenant(Arc<MultiTenantEngine>),
+    SingleTenant { engine: CueMapEngine, read_only: bool },
+    MultiTenant { mt_engine: Arc<MultiTenantEngine>, read_only: bool },
 }
 
 /// Routes for single-tenant mode
-pub fn routes(engine: std::sync::Arc<CueMapEngine>, auth_config: AuthConfig) -> Router {
+pub fn routes(engine: std::sync::Arc<CueMapEngine>, auth_config: AuthConfig, read_only: bool) -> Router {
     let mut router = Router::new()
         .route("/", get(root))
         .route("/memories", post(add_memory))
@@ -73,7 +73,10 @@ pub fn routes(engine: std::sync::Arc<CueMapEngine>, auth_config: AuthConfig) -> 
         .route("/memories/:id/reinforce", patch(reinforce_memory))
         .route("/memories/:id", get(get_memory))
         .route("/stats", get(get_stats))
-        .with_state(EngineState::SingleTenant(CueMapEngine::clone(&engine)));
+        .with_state(EngineState::SingleTenant { 
+            engine: CueMapEngine::clone(&engine),
+            read_only 
+        });
     
     // Add auth middleware if enabled
     if auth_config.is_enabled() {
@@ -84,7 +87,7 @@ pub fn routes(engine: std::sync::Arc<CueMapEngine>, auth_config: AuthConfig) -> 
 }
 
 /// Routes for multi-tenant mode
-pub fn routes_with_mt_engine(mt_engine: Arc<MultiTenantEngine>, auth_config: AuthConfig) -> Router {
+pub fn routes_with_mt_engine(mt_engine: Arc<MultiTenantEngine>, auth_config: AuthConfig, read_only: bool) -> Router {
     let mut router = Router::new()
         .route("/", get(root))
         .route("/memories", post(add_memory_mt))
@@ -94,7 +97,10 @@ pub fn routes_with_mt_engine(mt_engine: Arc<MultiTenantEngine>, auth_config: Aut
         .route("/stats", get(get_stats_mt))
         .route("/projects", get(list_projects))
         .route("/projects/:id", delete(delete_project))
-        .with_state(EngineState::MultiTenant(mt_engine));
+        .with_state(EngineState::MultiTenant { 
+            mt_engine,
+            read_only 
+        });
     
     // Add auth middleware if enabled
     if auth_config.is_enabled() {
@@ -116,7 +122,17 @@ async fn add_memory(
     State(state): State<EngineState>,
     Json(req): Json<AddMemoryRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if let EngineState::SingleTenant(engine) = state {
+    if let EngineState::SingleTenant { engine, read_only } = state {
+        // Check if read-only
+        if read_only {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "Read-only mode: modifications are not allowed"
+                })),
+            );
+        }
+        
         let memory_id = engine.add_memory(req.content, req.cues, req.metadata);
         
         (
@@ -141,7 +157,7 @@ async fn recall(
     State(state): State<EngineState>,
     Json(req): Json<RecallRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if let EngineState::SingleTenant(engine) = state {
+    if let EngineState::SingleTenant { engine, .. } = state {
         let results = engine.recall(req.cues, req.limit, req.auto_reinforce);
         (StatusCode::OK, Json(serde_json::json!({ "results": results })))
     } else {
@@ -157,7 +173,17 @@ async fn reinforce_memory(
     Path(memory_id): Path<String>,
     Json(req): Json<ReinforceRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if let EngineState::SingleTenant(engine) = state {
+    if let EngineState::SingleTenant { engine, read_only } = state {
+        // Check if read-only
+        if read_only {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "Read-only mode: modifications are not allowed"
+                })),
+            );
+        }
+        
         let success = engine.reinforce_memory(&memory_id, req.cues);
         
         if success {
@@ -192,7 +218,7 @@ async fn get_memory(
     State(state): State<EngineState>,
     Path(memory_id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if let EngineState::SingleTenant(engine) = state {
+    if let EngineState::SingleTenant { engine, .. } = state {
         match engine.get_memory(&memory_id) {
             Some(memory) => (StatusCode::OK, Json(serde_json::json!(memory))),
             None => (
@@ -209,7 +235,7 @@ async fn get_memory(
 }
 
 async fn get_stats(State(state): State<EngineState>) -> (StatusCode, Json<serde_json::Value>) {
-    if let EngineState::SingleTenant(engine) = state {
+    if let EngineState::SingleTenant { engine, .. } = state {
         let stats = engine.get_stats();
         (StatusCode::OK, Json(serde_json::Value::Object(stats.into_iter().collect())))
     } else {
@@ -252,7 +278,17 @@ async fn add_memory_mt(
         Err(e) => return e,
     };
     
-    if let EngineState::MultiTenant(mt_engine) = state {
+    if let EngineState::MultiTenant { mt_engine, read_only } = state {
+        // Check if read-only
+        if read_only {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "Read-only mode: modifications are not allowed"
+                })),
+            );
+        }
+        
         let engine = mt_engine.get_or_create_project(project_id.clone());
         let memory_id = engine.add_memory(req.content.clone(), req.cues.clone(), req.metadata);
         
@@ -288,7 +324,7 @@ async fn recall_mt(
 ) -> (StatusCode, Json<serde_json::Value>) {
     use std::time::Instant;
     
-    if let EngineState::MultiTenant(mt_engine) = state {
+    if let EngineState::MultiTenant { mt_engine, .. } = state {
         // Cross-domain query if projects array is provided
         if let Some(projects) = req.projects {
             let start = Instant::now();
@@ -394,7 +430,7 @@ async fn reinforce_memory_mt(
         Err(e) => return e,
     };
     
-    if let EngineState::MultiTenant(mt_engine) = state {
+    if let EngineState::MultiTenant { mt_engine, .. } = state {
         let engine = mt_engine.get_or_create_project(project_id);
         let success = engine.reinforce_memory(&memory_id, req.cues);
         
@@ -436,7 +472,7 @@ async fn get_memory_mt(
         Err(e) => return e,
     };
     
-    if let EngineState::MultiTenant(mt_engine) = state {
+    if let EngineState::MultiTenant { mt_engine, .. } = state {
         let engine = mt_engine.get_or_create_project(project_id);
         match engine.get_memory(&memory_id) {
             Some(memory) => (StatusCode::OK, Json(serde_json::json!(memory))),
@@ -462,7 +498,7 @@ async fn get_stats_mt(
         Err(e) => return e,
     };
     
-    if let EngineState::MultiTenant(mt_engine) = state {
+    if let EngineState::MultiTenant { mt_engine, .. } = state {
         let engine = mt_engine.get_or_create_project(project_id);
         let stats = engine.get_stats();
         (StatusCode::OK, Json(serde_json::Value::Object(stats.into_iter().collect())))
@@ -477,7 +513,7 @@ async fn get_stats_mt(
 async fn list_projects(
     State(state): State<EngineState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if let EngineState::MultiTenant(mt_engine) = state {
+    if let EngineState::MultiTenant { mt_engine, .. } = state {
         let projects = mt_engine.list_projects();
         (StatusCode::OK, Json(serde_json::json!({ "projects": projects })))
     } else {
@@ -492,7 +528,7 @@ async fn delete_project(
     State(state): State<EngineState>,
     Path(project_id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if let EngineState::MultiTenant(mt_engine) = state {
+    if let EngineState::MultiTenant { mt_engine, .. } = state {
         let deleted = mt_engine.delete_project(&project_id);
         if deleted {
             (

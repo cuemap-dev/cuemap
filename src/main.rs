@@ -169,11 +169,11 @@ async fn main() {
         let mt_engine = mt_engine;
         
         Router::new()
-            .merge(api::routes_with_mt_engine(mt_engine, auth_config))
+            .merge(api::routes_with_mt_engine(mt_engine, auth_config, is_static))
             .layer(CorsLayer::permissive())
     } else {
         Router::new()
-            .merge(api::routes(engine, auth_config))
+            .merge(api::routes(engine, auth_config, is_static))
             .layer(CorsLayer::permissive())
     };
     
