@@ -4,10 +4,12 @@
 
 ## Overview
 
-CueMap implements a memory system inspired by how the human brain recalls information:
-- **Temporal**: Recent memories are more accessible
-- **Associative**: Multiple cues trigger stronger recall
-- **Reinforcement**: Frequently accessed memories stay "front of mind"
+CueMap implements a **Continuous Gradient Algorithm** inspired by biological memory:
+
+1.  **Intersection (Context Filter)**: Triangulates relevant memories by overlapping cues (e.g., `service:payments` + `error:500`).
+2.  **Recency (Signal Attenuation)**: Applies a continuous decay curve, prioritizing fresh data.
+3.  **Reinforcement (Hebbian Learning)**: Frequently accessed memories gain signal strength, staying "front of mind" even as they age.
+4.  **Self-Regulating Dynamics**: Uses a $\sigma = \sqrt{N}$ scaling factor to automatically balance Recency vs. Reinforcement as datasets grow from 10k to 10M+.
 
 Built with Rust for maximum performance and reliability.
 
@@ -179,6 +181,7 @@ Tested on realistic workloads with Zipfian distribution (80% of operations hit 2
 |---------|-------------|-------------|------------|
 | 100K    | 0.19ms      | 0.30ms      | 3,067 ops/s |
 | 1M      | 0.20ms      | 0.33ms      | 2,926 ops/s |
+| 10M     | 0.25ms      | 0.32ms      | 2,567 ops/s |
 
 #### Read Performance
 
@@ -186,14 +189,13 @@ Tested on realistic workloads with Zipfian distribution (80% of operations hit 2
 |---------|-------------|-------------|-------------|------------|
 | 100K    | 0.23ms      | 0.22ms      | 0.35ms      | 2,782 ops/s |
 | 1M      | 0.23ms      | 0.22ms      | 0.37ms      | 2,763 ops/s |
-| 10M     | 1.40ms      | 1.20ms      | 3.90ms      | 700 ops/s |
+| 10M     | 0.23ms      | 0.28ms      | 0.38ms      | 2,800 ops/s |
 
 **Key Metrics**:
 - ✅ **Sub-millisecond P99 latency** at 1M scale
-- ✅ **Sub-5ms P99 latency** at 10M scale (production-tested)
+- ✅ **0.38ms P99 latency** at 10M scale (production-tested)
 - ✅ **Consistent performance** across dataset sizes
-- ✅ **2,900+ ops/sec** sustained throughput (1M)
-- ✅ **700+ queries/sec** at 10M scale
+- ✅ **2,700+ ops/sec** sustained throughput (10M)
 
 **Memory Efficiency**:
 - ✅ **~500 bytes per memory** (content + cues + indexes)
@@ -255,6 +257,7 @@ curl -X POST http://localhost:8080/recall \
     "limit": 10,
     "auto_reinforce": false
   }'
+# Note: auto_reinforce=true will increment the reinforcement count for returned memories
 ```
 
 ### Reinforce Memory
