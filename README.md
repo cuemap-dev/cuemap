@@ -87,11 +87,6 @@ Snapshots are automatically managed:
 - **Format**: Bincode binary (same as single-tenant mode)
 - **Files**: `{project-id}.bin` (one file per project)
 
-Test persistence:
-```bash
-./test_persistence.sh
-```
-
 ## Authentication
 
 Secure your CueMap instance with API key authentication.
@@ -181,7 +176,7 @@ Tested on realistic workloads with Zipfian distribution (80% of operations hit 2
 |---------|-------------|-------------|------------|
 | 100K    | 0.19ms      | 0.30ms      | 3,067 ops/s |
 | 1M      | 0.20ms      | 0.33ms      | 2,926 ops/s |
-| 10M     | 0.25ms      | 0.32ms      | 2,567 ops/s |
+| 10M     | 0.22ms      | 0.32ms      | 2,737 ops/s |
 
 #### Read Performance
 
@@ -242,8 +237,8 @@ Stress tested with 400+ parallel operations:
 curl -X POST http://localhost:8080/memories \
   -H "Content-Type: application/json" \
   -d '{
-    "content": "Server password is abc123",
-    "cues": ["server", "password", "credentials"]
+    "content": "API Rate Limit Policy: 1000/min",
+    "cues": ["api", "rate_limit", "policy"]
   }'
 ```
 
@@ -253,7 +248,7 @@ curl -X POST http://localhost:8080/memories \
 curl -X POST http://localhost:8080/recall \
   -H "Content-Type: application/json" \
   -d '{
-    "cues": ["server", "password"],
+    "cues": ["api", "rate_limit"],
     "limit": 10,
     "auto_reinforce": false
   }'
