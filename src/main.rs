@@ -1,19 +1,15 @@
-mod structures;
-mod engine;
-mod api;
-mod config;
-mod persistence;
-mod auth;
-mod multi_tenant;
-
-use auth::AuthConfig;
+use cuemap_rust::projects::ProjectContext;
+use cuemap_rust::normalization::NormalizationConfig;
+use cuemap_rust::taxonomy::Taxonomy;
+use cuemap_rust::auth::AuthConfig;
+use cuemap_rust::*;
 use axum::Router;
 use clap::Parser;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::path::Path;
 use tower_http::cors::CorsLayer;
-use tracing::{info, warn, Level};
+use tracing::{info, warn, error, Level};
 use tracing_subscriber;
 
 #[derive(Parser, Debug)]
@@ -39,6 +35,14 @@ struct Args {
     /// Load static snapshots (read-only mode, disables persistence)
     #[arg(long)]
     load_static: Option<String>,
+
+    /// Directory to watch for Self-Learning Agent
+    #[arg(long)]
+    agent_dir: Option<String>,
+
+    /// Agent throttle in milliseconds
+    #[arg(long, default_value = "100")]
+    agent_throttle: u64,
 }
 
 #[tokio::main]
@@ -78,7 +82,7 @@ async fn main() {
 
     
     // Initialize engine for single-tenant mode
-    let engine = if !args.multi_tenant {
+    let project = if !args.multi_tenant {
         info!("Single-tenant mode");
         
         if let Some(ref static_dir) = args.load_static {
@@ -89,42 +93,62 @@ async fn main() {
                 match persistence::PersistenceManager::load_from_path(&snapshot_path) {
                     Ok((memories, cue_index)) => {
                         info!("Loaded {} memories, {} cues", memories.len(), cue_index.len());
-                        Arc::new(engine::CueMapEngine::from_state(memories, cue_index))
+                        let main_engine = engine::CueMapEngine::from_state(memories, cue_index);
+                        Arc::new(ProjectContext {
+                            main: main_engine,
+                            aliases: engine::CueMapEngine::new(),
+                            lexicon: engine::CueMapEngine::new(),
+                            query_cache: dashmap::DashMap::new(),
+                            normalization: NormalizationConfig::default(),
+                            taxonomy: Taxonomy::default(),
+                        })
                     }
                     Err(e) => {
                         warn!("Failed to load static snapshot: {}, starting fresh", e);
-                        Arc::new(engine::CueMapEngine::new())
+                        Arc::new(ProjectContext::new(NormalizationConfig::default(), Taxonomy::default()))
                     }
                 }
             } else {
                 warn!("No snapshot found at {:?}, starting fresh", snapshot_path);
-                Arc::new(engine::CueMapEngine::new())
+                Arc::new(ProjectContext::new(NormalizationConfig::default(), Taxonomy::default()))
             }
         } else if let Some(ref pm) = persistence {
             // Load from data directory
             match pm.load_state() {
                 Ok((memories, cue_index)) => {
                     info!("Loaded {} memories, {} cues", memories.len(), cue_index.len());
-                    Arc::new(engine::CueMapEngine::from_state(memories, cue_index))
+                    let main_engine = engine::CueMapEngine::from_state(memories, cue_index);
+                    Arc::new(ProjectContext {
+                        main: main_engine,
+                        aliases: engine::CueMapEngine::new(),
+                        lexicon: engine::CueMapEngine::new(),
+                        query_cache: dashmap::DashMap::new(),
+                        normalization: NormalizationConfig::default(),
+                        taxonomy: Taxonomy::default(),
+                    })
                 }
                 Err(e) => {
                     info!("Failed to load state: {}, starting fresh", e);
-                    Arc::new(engine::CueMapEngine::new())
+                    Arc::new(ProjectContext::new(NormalizationConfig::default(), Taxonomy::default()))
                 }
             }
         } else {
-            Arc::new(engine::CueMapEngine::new())
+            Arc::new(ProjectContext::new(NormalizationConfig::default(), Taxonomy::default()))
         }
     } else {
-        // Not used in multi-tenant mode
-        Arc::new(engine::CueMapEngine::new())
+        // Not used in multi-tenant mode, but we need a dummy value matching the type if we were using same variable.
+        // But we can just use a dummy context.
+        Arc::new(ProjectContext::new(NormalizationConfig::default(), Taxonomy::default()))
     };
     
     // Start background snapshots (skip if static mode)
     if let Some(ref pm) = persistence {
         if !args.multi_tenant {
-            let _snapshot_handle = pm.start_background_snapshots(engine.clone()).await;
-            persistence::setup_shutdown_handler(pm.clone(), engine.clone()).await;
+            // We need to pass Arc<CueMapEngine> to persistence, so we wrap the main engine.
+            // Since CueMapEngine holds Arcs internally, cloning it is cheap and shares data.
+            let main_engine = Arc::new(project.main.clone());
+            let _snapshot_handle = pm.start_background_snapshots(main_engine.clone()).await;
+            persistence::setup_shutdown_handler(pm.clone(), main_engine).await;
         }
     }
     
@@ -166,18 +190,58 @@ async fn main() {
             setup_multi_tenant_shutdown_handler(mt_engine.clone()).await;
         }
         
+        let provider: Arc<dyn jobs::ProjectProvider> = mt_engine.clone();
+        let job_queue = Arc::new(jobs::JobQueue::new(provider));
+        
         let mt_engine = mt_engine;
         
         Router::new()
-            .merge(api::routes_with_mt_engine(mt_engine, auth_config, is_static))
+            .merge(api::routes_with_mt_engine(mt_engine, job_queue, auth_config, is_static))
             .layer(CorsLayer::permissive())
     } else {
+        let provider = Arc::new(jobs::SingleTenantProvider { project: project.clone() });
+        let job_queue = Arc::new(jobs::JobQueue::new(provider.clone()));
+        
+        // Start Agent if configured
+        let _agent_handle = if let Some(agent_dir) = args.agent_dir {
+            info!("Initializing Self-Learning Agent for: {}", agent_dir);
+            if let Some(llm_config) = llm::LlmConfig::from_env() {
+                // ... (Ollama check kept)
+                if !llm::setup::ensure_ollama_running(&llm_config).await {
+                    error!("Failed to setup Ollama (install/serve/pull). Agent will likely fail.");
+                }
+
+                let config = agent::AgentConfig {
+                    watch_dir: agent_dir,
+                    throttle_ms: args.agent_throttle,
+                    llm: llm_config,
+                };
+                
+                let provider_for_agent: Arc<dyn jobs::ProjectProvider> = provider.clone();
+                
+                match agent::Agent::new(config, job_queue.clone(), provider_for_agent) {
+                    Ok(agent) => {
+                        agent.start().await;
+                        Some(agent) // Keep alive
+                    },
+                    Err(e) => {
+                        error!("Failed to start agent: {}", e);
+                        None
+                    }
+                }
+            } else {
+                warn!("Agent requested but LLM not configured (LLM_PROVIDER). Skipping agent.");
+                None
+            }
+        } else {
+            None
+        };
+
         Router::new()
-            .merge(api::routes(engine, auth_config, is_static))
+            .merge(api::routes(project, job_queue, auth_config, is_static))
             .layer(CorsLayer::permissive())
     };
     
-    // Start the server
     let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
     info!("Server listening on {}", addr);
     info!("Performance optimizations enabled:");

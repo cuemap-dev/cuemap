@@ -2,6 +2,9 @@
 
 use crate::engine::CueMapEngine;
 use crate::persistence::PersistenceManager;
+use crate::projects::ProjectContext;
+use crate::normalization::NormalizationConfig;
+use crate::taxonomy::Taxonomy;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -23,7 +26,7 @@ pub struct ProjectStats {
 
 #[derive(Clone)]
 pub struct MultiTenantEngine {
-    projects: Arc<DashMap<ProjectId, Arc<CueMapEngine>>>,
+    projects: Arc<DashMap<ProjectId, Arc<ProjectContext>>>,
     snapshots_dir: PathBuf,
 }
 
@@ -47,17 +50,22 @@ impl MultiTenantEngine {
         }
     }
     
-    pub fn get_or_create_project(&self, project_id: ProjectId) -> Arc<CueMapEngine> {
-        if let Some(engine) = self.projects.get(&project_id) {
-            engine.clone()
+    pub fn get_or_create_project(&self, project_id: ProjectId) -> Arc<ProjectContext> {
+        if let Some(ctx) = self.projects.get(&project_id) {
+            ctx.clone()
         } else {
-            let engine = Arc::new(CueMapEngine::new());
-            self.projects.insert(project_id, engine.clone());
-            engine
+            // Create new project with default config
+            // TODO: Load config from disk if available
+            let ctx = Arc::new(ProjectContext::new(
+                NormalizationConfig::default(),
+                Taxonomy::default(),
+            ));
+            self.projects.insert(project_id, ctx.clone());
+            ctx
         }
     }
     
-    pub fn get_project(&self, project_id: &ProjectId) -> Option<Arc<CueMapEngine>> {
+    pub fn get_project(&self, project_id: &ProjectId) -> Option<Arc<ProjectContext>> {
         self.projects.get(project_id).map(|e| e.clone())
     }
     
@@ -66,8 +74,8 @@ impl MultiTenantEngine {
             .iter()
             .map(|entry| {
                 let project_id = entry.key().clone();
-                let engine = entry.value();
-                let stats = engine.get_stats();
+                let ctx = entry.value();
+                let stats = ctx.main.get_stats();
                 
                 ProjectStats {
                     project_id,
@@ -96,24 +104,25 @@ impl MultiTenantEngine {
     
     /// Insert a pre-loaded project engine (for static loading)
     #[allow(dead_code)]
-    pub fn insert_project(&self, project_id: ProjectId, engine: Arc<CueMapEngine>) {
-        self.projects.insert(project_id, engine);
+    pub fn insert_project(&self, project_id: ProjectId, ctx: Arc<ProjectContext>) {
+        self.projects.insert(project_id, ctx);
     }
     
     /// Save a project snapshot to disk
     pub fn save_project(&self, project_id: &ProjectId) -> Result<PathBuf, String> {
-        let engine = self.get_project(project_id)
+        let ctx = self.get_project(project_id)
             .ok_or_else(|| format!("Project '{}' not found", project_id))?;
         
         let snapshot_path = self.snapshots_dir.join(format!("{}.bin", project_id));
-        PersistenceManager::save_to_path(&engine, &snapshot_path)
+        // Only save main engine for now
+        PersistenceManager::save_to_path(&ctx.main, &snapshot_path)
             .map_err(|e| format!("Failed to save project: {}", e))?;
         
         Ok(snapshot_path)
     }
     
     /// Load a project snapshot from disk
-    pub fn load_project(&self, project_id: &ProjectId) -> Result<Arc<CueMapEngine>, String> {
+    pub fn load_project(&self, project_id: &ProjectId) -> Result<Arc<ProjectContext>, String> {
         let snapshot_path = self.snapshots_dir.join(format!("{}.bin", project_id));
         
         if !snapshot_path.exists() {
@@ -123,10 +132,21 @@ impl MultiTenantEngine {
         let (memories, cue_index) = PersistenceManager::load_from_path(&snapshot_path)
             .map_err(|e| format!("Failed to load project: {}", e))?;
         
-        let engine = Arc::new(CueMapEngine::from_state(memories, cue_index));
-        self.projects.insert(project_id.clone(), engine.clone());
+        // Create context and populate main engine
+        let main_engine = CueMapEngine::from_state(memories, cue_index);
         
-        Ok(engine)
+        let ctx = Arc::new(ProjectContext {
+            main: main_engine,
+            aliases: CueMapEngine::new(),
+            lexicon: CueMapEngine::new(),
+            query_cache: DashMap::new(),
+            normalization: NormalizationConfig::default(),
+            taxonomy: Taxonomy::default(),
+        });
+        
+        self.projects.insert(project_id.clone(), ctx.clone());
+        
+        Ok(ctx)
     }
     
     /// Save all projects to disk
