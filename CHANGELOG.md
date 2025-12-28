@@ -2,17 +2,30 @@
 
 All notable changes to the CueMap Rust Engine will be documented in this file.
 
-## [0.5.0] - 2025-12-27
+## [0.5.0] - 2025-12-28
 
-### Added
+### Added (Alias Management & Control)
+- **Alias Management API**: Native support for manual alias management via `POST /aliases`, `GET /aliases`, and `POST /aliases/merge`.
+- **Deterministic Cue Expansion**: Strict filtering in alias resolution to prevent "fuzzy" leaks. Aliases are now only expanded if they strictly match the source cue.
+- **LLM Context Injection**: The engine now resolves existing cues from content before prompting the LLM. These "known cues" are injected into the prompt to guide semantic expansion while maintaining determinism.
+
+### Added (Brain-Inspired Features)
+- **Pattern Completion (Hippocampal CA3)**: Implemented cue co-occurrence matrix for associative recall. The engine now automatically infers missing cues based on historical co-occurrence at retrieval-time. Features a new `disable_pattern_completion` query flag for strict matching.
+- **Temporal Chunking**: Memories are now automatically grouped into "episodes" based on temporal proximity and cue overlap, linked via `episode:<id>` cues. Supports `disable_temporal_chunking` at write-time.
+- **Salience Bias (Amygdala)**: Introduced a dynamic salience score for memories, boosted by cue density, reinforcement frequency, and complexity. Salient memories decay slower and rank higher. Supports `disable_salience_bias` at retrieval.
+- **Match Integrity**: Each recall result now includes a `match_integrity` score (0.0 - 1.0) derived from intersection strength, context agreement, and reinforcement counts.
+- **Systems Consolidation**: New mechanism to periodically merge highly overlapping memories into abstracted summaries. Consolidation is strictly additive; original "Ground Truth" memories are preserved. Summaries can be ignored during retrieval via `disable_systems_consolidation`.
+
+### Added (v0.5 Core)
 - **Selective Set Intersection**: A new, more exhaustive search strategy that replaces legacy tiered search. It scans the most selective cue list and uses O(1) probes to gather intersection data.
 - **Continuous Gradient Scoring**: Replaced discrete search tiers with a smooth scoring gradient based on recency and reinforcement frequency.
 - **Asynchronous Intelligence Pipeline**: Background job system for LLM-based fact extraction, cue proposal, and automatic alias discovery.
 - **Explainable AI**: Support for the `explain=true` flag in recall requests, providing detailed breakdowns of intersection, recency, and frequency components.
-- **Expanded Chunker Support**: Added native support for 14+ new formats:
-    - **Documents**: PDF, Word (DOCX), Excel (XLSX).
-    - **Data**: CSV, JSON, YAML, XML.
-    - **Languages**: HTML, CSS, PHP, Java, JavaScript, Go (in addition to Python, Rust, TS).
+- **Expanded Chunker Support & Structural Cues**: Recursive "Ground Truth" extraction for 17+ formats:
+    - **Recursive Code Extraction**: Python, Rust, TS, JS, Go, Java, PHP now use tree-sitter to capture nested functions, classes, and methods as grounded cues.
+    - **Markup & Styling**: HTML extracts IDs/classes at any depth; CSS captures selectors.
+    - **Structured Data**: CSV (headers), JSON/YAML (keys/indices), and XML (attributes/IDs) now provide full structural metadata.
+    - **Documents**: PDF, Word (DOCX), Excel (XLSX) text extraction.
 - **Binary Ingestion**: The agent now handles binary files gracefully, computing hashes and extracting text for ingestion.
 - **Multi-Tenant Isolation**: Full isolation between projects, including independent taxonomies, lexicons, and memory stores.
 - **Advanced Text Normalization**: Improved NLP normalization that better handles special characters and word boundaries.

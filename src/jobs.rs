@@ -192,8 +192,14 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>) {
              if let Some(config) = LlmConfig::from_env() {
                  info!("Job: Calling LLM for memory {} in project {}", memory_id, project_id);
                  
+                 let known_cues = if let Some(ctx) = provider.get_project(&project_id) {
+                     ctx.resolve_cues_from_text(&content)
+                 } else {
+                     Vec::new()
+                 };
+
                  // 2. Call LLM
-                 match propose_cues(&content, &config).await {
+                 match propose_cues(&content, &config, &known_cues).await {
                      Ok(proposed_cues) => {
                          if let Some(ctx) = provider.get_project(&project_id) {
                              // 3. Normalize & Validate

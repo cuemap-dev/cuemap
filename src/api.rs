@@ -23,6 +23,8 @@ pub struct AddMemoryRequest {
     cues: Vec<String>,
     #[serde(default)]
     metadata: Option<HashMap<String, serde_json::Value>>,
+    #[serde(default)]
+    pub disable_temporal_chunking: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -47,6 +49,12 @@ pub struct RecallRequest {
     min_intersection: Option<usize>,
     #[serde(default)]
     pub explain: bool,
+    #[serde(default)]
+    pub disable_pattern_completion: bool,
+    #[serde(default)]
+    pub disable_salience_bias: bool,
+    #[serde(default)]
+    pub disable_systems_consolidation: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +66,12 @@ pub struct RecallGroundedRequest {
     pub limit: usize,
     #[serde(default)]
     pub projects: Option<Vec<String>>,
+    #[serde(default)]
+    pub disable_pattern_completion: bool,
+    #[serde(default)]
+    pub disable_salience_bias: bool,
+    #[serde(default)]
+    pub disable_systems_consolidation: bool,
 }
 
 fn default_token_budget() -> u32 {
@@ -78,6 +92,33 @@ fn default_limit() -> usize {
 #[derive(Debug, Deserialize)]
 pub struct ReinforceRequest {
     cues: Vec<String>,
+}
+
+
+#[derive(Debug, Deserialize)]
+pub struct AddAliasRequest {
+    pub from: String,
+    pub to: String,
+    pub weight: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GetAliasRequest {
+    pub cue: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MergeAliasRequest {
+    pub cues: Vec<String>,
+    pub to: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AliasResponse {
+    pub id: String,
+    pub from: String,
+    pub to: String,
+    pub weight: f64,
 }
 
 
@@ -112,6 +153,8 @@ pub fn routes(project: std::sync::Arc<ProjectContext>, job_queue: Arc<JobQueue>,
         .route("/memories/:id", get(get_memory))
         .route("/stats", get(get_stats))
         .route("/recall/grounded", post(recall_grounded))
+        .route("/aliases", post(add_alias).get(get_aliases))
+        .route("/aliases/merge", post(merge_aliases))
         .with_state(EngineState::SingleTenant { 
             project,
             read_only,
@@ -138,6 +181,8 @@ pub fn routes_with_mt_engine(mt_engine: Arc<MultiTenantEngine>, job_queue: Arc<J
         .route("/projects", get(list_projects))
         .route("/recall/grounded", post(recall_grounded_mt))
         .route("/projects/:id", delete(delete_project))
+        .route("/aliases", post(add_alias_mt).get(get_aliases_mt))
+        .route("/aliases/merge", post(merge_aliases_mt))
         .with_state(EngineState::MultiTenant { 
             mt_engine,
             read_only,
@@ -185,7 +230,7 @@ async fn add_memory(
         // 2. Validate cues
         let report = validate_cues(normalized_cues, &project.taxonomy);
         
-        let memory_id = project.main.add_memory(req.content.clone(), report.accepted, req.metadata);
+        let memory_id = project.main.add_memory(req.content.clone(), report.accepted, req.metadata, req.disable_temporal_chunking);
         
         // Enqueue background jobs
         job_queue.enqueue(Job::TrainLexiconFromMemory {
@@ -245,13 +290,15 @@ async fn recall(
         
         // Expand aliases
         let expanded_cues = project.expand_query_cues(normalized_cues);
-        
         let results = project.main.recall_weighted(
             expanded_cues.clone(), 
             req.limit, 
             req.auto_reinforce, 
             req.min_intersection,
-            req.explain
+            req.explain,
+            req.disable_pattern_completion,
+            req.disable_salience_bias,
+            req.disable_systems_consolidation
         );
         
         let elapsed = start.elapsed();
@@ -386,13 +433,15 @@ async fn recall_grounded(
             normalized_cues.push(normalized);
         }
         let expanded_cues = project.expand_query_cues(normalized_cues);
-        
         let results = project.main.recall_weighted(
             expanded_cues.clone(), 
-            req.limit.max(20), // Get enough candidates for budgeting
+            req.limit.max(20),
             false, 
             None,
-            true
+            true,
+            req.disable_pattern_completion,
+            req.disable_salience_bias,
+            req.disable_systems_consolidation
         );
         
         // 2. Apply Budgeting Logic
@@ -421,6 +470,133 @@ async fn recall_grounded(
             "verified_context": context_block,
             "proof": proof,
             "engine_latency_ms": elapsed.as_secs_f64() * 1000.0
+        })))
+    } else {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Invalid state"})))
+    }
+}
+
+// Alias Handlers (Single Tenant)
+
+async fn add_alias(
+    State(state): State<EngineState>,
+    Json(req): Json<AddAliasRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if let EngineState::SingleTenant { project, read_only, .. } = state {
+        if read_only {
+            return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "Read-only"})));
+        }
+
+        let alias_id = uuid::Uuid::new_v4().to_string();
+        let content = serde_json::json!({
+            "from": req.from,
+            "to": req.to,
+            "downweight": req.weight.unwrap_or(0.85),
+            "status": "active",
+            "reason": "manual"
+        }).to_string();
+
+        let cues = vec![
+            "type:alias".to_string(),
+            format!("from:{}", req.from),
+            format!("to:{}", req.to),
+            "status:active".to_string(),
+            "reason:manual".to_string(),
+        ];
+
+        project.aliases.upsert_memory_with_id(
+            alias_id.clone(),
+            content,
+            cues,
+            None,
+            false // no reinforce
+        );
+
+        (StatusCode::OK, Json(serde_json::json!({"id": alias_id, "status": "created"})))
+    } else {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Invalid state"})))
+    }
+}
+
+async fn get_aliases(
+    State(state): State<EngineState>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if let EngineState::SingleTenant { project, .. } = state {
+        let cue = params.get("cue").cloned().unwrap_or_default();
+        if cue.is_empty() {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Missing 'cue' query param"})));
+        }
+
+        let query_cues = vec![
+            "type:alias".to_string(), 
+            format!("to:{}", cue),
+            "status:active".to_string()
+        ];
+        
+        let results = project.aliases.recall(query_cues, 50, false);
+        let mut aliases = Vec::new();
+        
+        for res in results {
+            if let Ok(data) = serde_json::from_str::<serde_json::Value>(&res.content) {
+                let from_match = data.get("from").and_then(|v| v.as_str()).map(|v| v == cue).unwrap_or(false);
+                let to_match = data.get("to").and_then(|v| v.as_str()).map(|v| v == cue).unwrap_or(false);
+                
+                if from_match || to_match {
+                    aliases.push(data);
+                }
+            }
+        }
+        
+        (StatusCode::OK, Json(serde_json::json!({"aliases": aliases})))
+    } else {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Invalid state"})))
+    }
+}
+
+async fn merge_aliases(
+    State(state): State<EngineState>,
+    Json(req): Json<MergeAliasRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if let EngineState::SingleTenant { project, read_only, .. } = state {
+        if read_only {
+            return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "Read-only"})));
+        }
+
+        let mut created_ids = Vec::new();
+
+        for from_cue in req.cues {
+            let alias_id = uuid::Uuid::new_v4().to_string();
+            let content = serde_json::json!({
+                "from": from_cue,
+                "to": req.to,
+                "downweight": 1.0,
+                "status": "active",
+                "reason": "manual_merge"
+            }).to_string();
+
+            let cues = vec![
+                "type:alias".to_string(),
+                format!("from:{}", from_cue),
+                format!("to:{}", req.to),
+                "status:active".to_string(),
+                "reason:manual_merge".to_string(),
+            ];
+
+            project.aliases.upsert_memory_with_id(
+                alias_id.clone(),
+                content,
+                cues,
+                None,
+                false
+            );
+            created_ids.push(alias_id);
+        }
+
+        (StatusCode::OK, Json(serde_json::json!({
+            "status": "merged", 
+            "target": req.to, 
+            "count": created_ids.len()
         })))
     } else {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Invalid state"})))
@@ -482,7 +658,7 @@ async fn add_memory_mt(
         // 2. Validate cues
         let report = validate_cues(normalized_cues, &ctx.taxonomy);
         
-        let memory_id = ctx.main.add_memory(req.content.clone(), report.accepted, req.metadata);
+        let memory_id = ctx.main.add_memory(req.content.clone(), report.accepted, req.metadata, req.disable_temporal_chunking);
         
         // Enqueue background jobs
         job_queue.enqueue(Job::TrainLexiconFromMemory {
@@ -557,13 +733,15 @@ async fn recall_mt(
                     
                     // Expand aliases
                     let expanded_cues = ctx.expand_query_cues(normalized_cues);
-                    
                     let results = ctx.main.recall_weighted(
                         expanded_cues.clone(), 
                         req.limit, 
                         false,
                         req.min_intersection,
-                        req.explain
+                        req.explain,
+                        req.disable_pattern_completion,
+                        req.disable_salience_bias,
+                        req.disable_systems_consolidation
                     );
                     
                     let json_results: Vec<serde_json::Value> = results
@@ -651,7 +829,10 @@ async fn recall_mt(
             req.limit, 
             req.auto_reinforce, 
             req.min_intersection,
-            req.explain
+            req.explain,
+            req.disable_pattern_completion,
+            req.disable_salience_bias,
+            req.disable_systems_consolidation
         );
         let elapsed = start.elapsed();
         
@@ -824,7 +1005,10 @@ async fn recall_grounded_mt(
             req.limit.max(20),
             false, 
             None,
-            true
+            true,
+            req.disable_pattern_completion,
+            req.disable_salience_bias,
+            req.disable_systems_consolidation
         );
         
         // 2. Apply Budgeting Logic
@@ -895,5 +1079,155 @@ async fn delete_project(
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "Not in multi-tenant mode"})),
         )
+    }
+}
+
+// Multi-tenant Alias Handlers
+
+async fn add_alias_mt(
+    State(state): State<EngineState>,
+    headers: HeaderMap,
+    Json(req): Json<AddAliasRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let project_id = match extract_project_id(&headers) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+
+    if let EngineState::MultiTenant { mt_engine, read_only, .. } = state {
+        if read_only {
+            return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "Read-only"})));
+        }
+
+        let ctx = mt_engine.get_or_create_project(project_id);
+        
+        let alias_id = uuid::Uuid::new_v4().to_string();
+        let content = serde_json::json!({
+            "from": req.from,
+            "to": req.to,
+            "downweight": req.weight.unwrap_or(0.85),
+            "status": "active",
+            "reason": "manual"
+        }).to_string();
+
+        let cues = vec![
+            "type:alias".to_string(),
+            format!("from:{}", req.from),
+            format!("to:{}", req.to),
+            "status:active".to_string(),
+            "reason:manual".to_string(),
+        ];
+
+        ctx.aliases.upsert_memory_with_id(
+            alias_id.clone(),
+            content,
+            cues,
+            None,
+            false 
+        );
+
+        (StatusCode::OK, Json(serde_json::json!({"id": alias_id, "status": "created"})))
+    } else {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Invalid state"})))
+    }
+}
+
+async fn get_aliases_mt(
+    State(state): State<EngineState>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let project_id = match extract_project_id(&headers) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+
+    if let EngineState::MultiTenant { mt_engine, .. } = state {
+        let ctx = mt_engine.get_or_create_project(project_id);
+        
+        let cue = params.get("cue").cloned().unwrap_or_default();
+        if cue.is_empty() {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Missing 'cue' query param"})));
+        }
+        
+        let query_cues = vec![
+            "type:alias".to_string(), 
+            format!("to:{}", cue),
+            "status:active".to_string()
+        ];
+        
+        let results = ctx.aliases.recall(query_cues, 50, false);
+        let mut aliases = Vec::new();
+        
+        for res in results {
+            if let Ok(data) = serde_json::from_str::<serde_json::Value>(&res.content) {
+                let from_match = data.get("from").and_then(|v| v.as_str()).map(|v| v == cue).unwrap_or(false);
+                let to_match = data.get("to").and_then(|v| v.as_str()).map(|v| v == cue).unwrap_or(false);
+                
+                if from_match || to_match {
+                    aliases.push(data);
+                }
+            }
+        }
+        
+        (StatusCode::OK, Json(serde_json::json!({"aliases": aliases})))
+    } else {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Invalid state"})))
+    }
+}
+
+async fn merge_aliases_mt(
+    State(state): State<EngineState>,
+    headers: HeaderMap,
+    Json(req): Json<MergeAliasRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let project_id = match extract_project_id(&headers) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+
+    if let EngineState::MultiTenant { mt_engine, read_only, .. } = state {
+        if read_only {
+            return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "Read-only"})));
+        }
+
+        let ctx = mt_engine.get_or_create_project(project_id);
+        let mut created_ids = Vec::new();
+
+        for from_cue in req.cues {
+            let alias_id = uuid::Uuid::new_v4().to_string();
+            let content = serde_json::json!({
+                "from": from_cue,
+                "to": req.to,
+                "downweight": 1.0, 
+                "status": "active",
+                "reason": "manual_merge"
+            }).to_string();
+
+            let cues = vec![
+                "type:alias".to_string(),
+                format!("from:{}", from_cue),
+                format!("to:{}", req.to),
+                "status:active".to_string(),
+                "reason:manual_merge".to_string(),
+            ];
+
+            ctx.aliases.upsert_memory_with_id(
+                alias_id.clone(),
+                content,
+                cues,
+                None,
+                false
+            );
+            created_ids.push(alias_id);
+        }
+
+        (StatusCode::OK, Json(serde_json::json!({
+            "status": "merged", 
+            "target": req.to, 
+            "count": created_ids.len()
+        })))
+    } else {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Invalid state"})))
     }
 }

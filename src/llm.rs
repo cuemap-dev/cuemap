@@ -151,11 +151,11 @@ impl LlmConfig {
     }
 }
 
-pub async fn propose_cues(content: &str, config: &LlmConfig) -> Result<Vec<String>, String> {
+pub async fn propose_cues(content: &str, config: &LlmConfig, known_cues: &[String]) -> Result<Vec<String>, String> {
     match config.provider.as_str() {
-        "ollama" => propose_cues_ollama(content, config).await,
-        "openai" => propose_cues_openai(content, config).await,
-        "google" => propose_cues_google(content, config).await,
+        "ollama" => propose_cues_ollama(content, config, known_cues).await,
+        "openai" => propose_cues_openai(content, config, known_cues).await,
+        "google" => propose_cues_google(content, config, known_cues).await,
         _ => Err(format!("Unsupported provider: {}", config.provider)),
     }
 }
@@ -277,10 +277,20 @@ pub fn parse_extraction_response(response_text: &str, content: &str) -> (String,
     (summary, cues)
 }
 
-async fn propose_cues_ollama(content: &str, config: &LlmConfig) -> Result<Vec<String>, String> {
-    let system_prompt = r#"You are a semantic tagging engine. Extract rich, queryable cues to enable powerful recall.
+async fn propose_cues_ollama(content: &str, config: &LlmConfig, known_cues: &[String]) -> Result<Vec<String>, String> {
+    let context_hint = if !known_cues.is_empty() {
+        format!(
+            "I have already identified these potential cues based on keywords: {:?}. Use them as a starting point.\n   CRITICAL: The system is deterministic. Your goal is SEMANTIC EXPANSION (synonyms, hypernyms) to aid recall.\n   Do NOT hallucinate unrelated concepts or go 'crazy'. Keep suggestions grounded in the content.",
+            known_cues
+        )
+    } else {
+        String::new()
+    };
+    
+    let system_prompt = format!(r#"You are a semantic tagging engine. Extract rich, queryable cues to enable powerful recall.
+{} 
 
-OUTPUT FORMAT (CRITICAL): {"cues": ["key:value", "key:value", ...]}
+OUTPUT FORMAT (CRITICAL): {{"cues": ["key:value", "key:value", ...]}}
 
 EXTRACT MULTIPLE CUE TYPES:
 1. Topic/Domain: What is this about? (topic:payments, topic:food, topic:health)
@@ -291,13 +301,13 @@ EXTRACT MULTIPLE CUE TYPES:
 
 EXAMPLES:
 Input: "I'm planning vegetarian meals for next week"
-Output: {"cues": ["intent:planning", "topic:meals", "diet:vegetarian", "subject:meal", "context:mealprep", "timeframe:weekly"]}
+Output: {{"cues": ["intent:planning", "topic:meals", "diet:vegetarian", "subject:meal", "context:mealprep", "timeframe:weekly"]}}
 
 Input: "Checkout is failing with payment errors"
-Output: {"cues": ["subject:checkout", "status:broken", "topic:payments", "type:error", "service:frontend", "intent:debugging"]}
+Output: {{"cues": ["subject:checkout", "status:broken", "topic:payments", "type:error", "service:frontend", "intent:debugging"]}}
 
 Input: "Looking for chicken breast alternatives"
-Output: {"cues": ["intent:shopping", "product:chicken", "context:alternatives", "category:meat", "topic:food"]}
+Output: {{"cues": ["intent:shopping", "product:chicken", "context:alternatives", "category:meat", "topic:food"]}}
 
 RULES:
 - Each cue: Strictly "lowercase_key:lowercase_value" format
@@ -305,7 +315,7 @@ RULES:
 - NO spaces or special characters in cues
 - Extract 5-8 diverse cues per memory
 - Include semantic neighbors (e.g., "meal" → also add "food", "recipe")
-- Return ONLY valid JSON"#;
+- Return ONLY valid JSON"#, context_hint);
 
     let url = format!("{}/api/generate", config.ollama_url);
     
@@ -396,18 +406,25 @@ pub fn parse_proposal_response(response_text: &str) -> Result<Vec<String>, Strin
     Ok(extracted_cues)
 }
 
-async fn propose_cues_openai(content: &str, config: &LlmConfig) -> Result<Vec<String>, String> {
+async fn propose_cues_openai(content: &str, config: &LlmConfig, known_cues: &[String]) -> Result<Vec<String>, String> {
     let api_key = config.api_key.as_ref().ok_or("OpenAI requires LLM_API_KEY")?;
     
-    let system_prompt = r#"You are a tagging engine for a deterministic memory system. Analyze the content and extract canonical cues.
-Output strictly JSON in this format: {"cues": ["key:value", "service:name", ...]}.
+    let context_hint = if !known_cues.is_empty() {
+        format!("Known cues (use as baseline): {:?}. EXPAND SEMANTICALLY but stay grounded.", known_cues)
+    } else {
+        String::new()
+    };
+    
+    let system_prompt = format!(r#"You are a tagging engine for a deterministic memory system. Analyze the content and extract canonical cues.
+{}
+Output strictly JSON in this format: {{"cues": ["key:value", "service:name", ...]}}.
 Rules:
 - Use k:v format
 - Keys must be broad categories (service, topic, lang, tool, error, status)
 - Values must be single tokens or short canonical identifiers
 - Precision is more important than completeness
 - Only extract cues directly implied by the text
-- No conversational text"#;
+- No conversational text"#, context_hint);
 
     let response = get_client()
         .post("https://api.openai.com/v1/chat/completions")
@@ -447,7 +464,7 @@ Rules:
     Ok(cues)
 }
 
-async fn propose_cues_google(content: &str, config: &LlmConfig) -> Result<Vec<String>, String> {
+async fn propose_cues_google(content: &str, config: &LlmConfig, known_cues: &[String]) -> Result<Vec<String>, String> {
     let api_key = config.api_key.as_ref().ok_or("Google requires LLM_API_KEY")?;
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
@@ -455,8 +472,8 @@ async fn propose_cues_google(content: &str, config: &LlmConfig) -> Result<Vec<St
     );
 
     let prompt = format!(
-        "Extract canonical cues (k:v format) from this content. Return JSON {{ \"cues\": [...] }}. Content: {}",
-        content
+        "Extract canonical cues (k:v format) from this content. Return JSON {{ \"cues\": [...] }}. Content: {}. Known cues: {:?} (Expand semantically but stay grounded)",
+        content, known_cues
     );
 
     let response = get_client()

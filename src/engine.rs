@@ -10,9 +10,11 @@ pub struct RecallResult {
     pub memory_id: String,
     pub content: String,
     pub score: f64,
+    pub match_integrity: f64,
     pub intersection_count: usize,
     pub recency_score: f64,
     pub reinforcement_score: f64,
+    pub salience_score: f64,
     pub metadata: HashMap<String, serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub explain: Option<serde_json::Value>,
@@ -22,6 +24,10 @@ pub struct RecallResult {
 pub struct CueMapEngine {
     memories: Arc<DashMap<String, Memory>>,
     cue_index: Arc<DashMap<String, OrderedSet>>,
+    // Pattern Completion: cue co-occurrence matrix
+    cue_co_occurrence: Arc<DashMap<String, DashMap<String, u64>>>,
+    // Temporal Chunking: track last event per session/project (using a dummy key for now or extending API)
+    last_events: Arc<DashMap<String, (String, f64, Vec<String>)>>,
 }
 
 impl CueMapEngine {
@@ -29,6 +35,8 @@ impl CueMapEngine {
         Self {
             memories: Arc::new(DashMap::new()),
             cue_index: Arc::new(DashMap::new()),
+            cue_co_occurrence: Arc::new(DashMap::new()),
+            last_events: Arc::new(DashMap::new()),
         }
     }
     
@@ -39,6 +47,8 @@ impl CueMapEngine {
         Self {
             memories: Arc::new(memories),
             cue_index: Arc::new(cue_index),
+            cue_co_occurrence: Arc::new(DashMap::new()), // Could be hydrated if we add persistence
+            last_events: Arc::new(DashMap::new()),
         }
     }
     
@@ -51,11 +61,40 @@ impl CueMapEngine {
         &self.cue_index
     }
     
+    fn update_cue_co_occurrence(&self, cues: &[String]) {
+        for i in 0..cues.len() {
+            let cue_a = cues[i].to_lowercase().trim().to_string();
+            if cue_a.is_empty() { continue; }
+            
+            for j in (i + 1)..cues.len() {
+                let cue_b = cues[j].to_lowercase().trim().to_string();
+                if cue_b.is_empty() || cue_a == cue_b { continue; }
+                
+                // Update A -> B
+                self.cue_co_occurrence
+                    .entry(cue_a.clone())
+                    .or_insert_with(DashMap::new)
+                    .entry(cue_b.clone())
+                    .and_modify(|c| *c += 1)
+                    .or_insert(1);
+                
+                // Update B -> A
+                self.cue_co_occurrence
+                    .entry(cue_b.clone())
+                    .or_insert_with(DashMap::new)
+                    .entry(cue_a.clone())
+                    .and_modify(|c| *c += 1)
+                    .or_insert(1);
+            }
+        }
+    }
+
     pub fn add_memory(
         &self,
         content: String,
         cues: Vec<String>,
         metadata: Option<HashMap<String, serde_json::Value>>,
+        disable_temporal_chunking: bool,
     ) -> String {
         let mut memory = Memory::new(content, metadata);
         let memory_id = memory.id.clone();
@@ -63,11 +102,54 @@ impl CueMapEngine {
         // Store cues in memory
         memory.cues = cues.clone();
         
+        // 1. Salience calculation (proxies)
+        // High cue density boost
+        let cue_density = if !memory.content.is_empty() {
+            (memory.cues.len() as f64) / (memory.content.len() as f64).sqrt()
+        } else {
+            0.0
+        };
+        memory.salience += cue_density;
+        
+        // Rare cue combinations boost (simulated by cue count for now)
+        if memory.cues.len() > 5 {
+            memory.salience += 0.5;
+        }
+
+        // 2. Temporal Chunking
+        let project_id = memory.metadata.get("project_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("default")
+            .to_string();
+        
+        if let Some(last_event) = self.last_events.get(&project_id) {
+            let (last_id, last_time, last_cues) = last_event.clone();
+            let now = memory.created_at;
+            
+            // Time proximity (< 5 mins) and High cue overlap (> 50%)
+            let time_diff = now - last_time;
+            let overlap = memory.cues.iter().filter(|c| last_cues.contains(c)).count();
+            let overlap_ratio = if !memory.cues.is_empty() {
+                (overlap as f64) / (memory.cues.len() as f64)
+            } else {
+                0.0
+            };
+            
+            if time_diff < 300.0 && overlap_ratio > 0.5 && !disable_temporal_chunking {
+                let episode_cue = format!("episode:{}", last_id);
+                memory.cues.push(episode_cue.clone());
+            }
+        }
+        self.last_events.insert(project_id, (memory_id.clone(), memory.created_at, memory.cues.clone()));
+
+        // 3. Update co-occurrence matrix
+        self.update_cue_co_occurrence(&memory.cues);
+        
         // Store memory
         self.memories.insert(memory_id.clone(), memory);
         
         // Index by cues
-        for cue in cues {
+        for cue in &cues {
             let cue_lower = cue.to_lowercase().trim().to_string();
             if !cue_lower.is_empty() {
                 self.cue_index
@@ -84,10 +166,14 @@ impl CueMapEngine {
         // Update last accessed
         if let Some(mut memory) = self.memories.get_mut(memory_id) {
             memory.touch();
+            memory.salience += 0.1; // Manual reinforcement boost
         } else {
             return false;
         }
         
+        // Update co-occurrence matrix with cues used for reinforcement
+        self.update_cue_co_occurrence(&cues);
+
         // Move to front for each cue
         for cue in cues {
             let cue_lower = cue.to_lowercase().trim().to_string();
@@ -145,7 +231,7 @@ impl CueMapEngine {
         self.memories.insert(id.clone(), memory);
         
         // Index by cues
-        for cue in cues {
+        for cue in &cues { // Iterate by reference to avoid move
             let cue_lower = cue.to_lowercase().trim().to_string();
             if !cue_lower.is_empty() {
                 self.cue_index
@@ -154,6 +240,9 @@ impl CueMapEngine {
                     .add(id.clone());
             }
         }
+        
+        // FIX: Update co-occurrence matrix for new memory
+        self.update_cue_co_occurrence(&cues);
         
         id
     }
@@ -187,7 +276,13 @@ impl CueMapEngine {
                 }
             }
             
-            true
+            // FIX: Update co-occurrence with extended cue set
+            // We pass ALL cues to reinforce associations between old and new cues
+            let all_cues = memory.cues.clone();
+            drop(memory); // Release lock before calling update (though update uses different map, safer)
+            self.update_cue_co_occurrence(&all_cues);
+            
+            return true;
         } else {
             false
         }
@@ -219,7 +314,7 @@ impl CueMapEngine {
             .map(|c| (c, 1.0))
             .collect();
             
-        self.recall_weighted(weighted_cues, limit, auto_reinforce, min_intersection, false)
+        self.recall_weighted(weighted_cues, limit, auto_reinforce, min_intersection, false, false, false, false)
     }
 
     pub fn recall_weighted(
@@ -229,35 +324,66 @@ impl CueMapEngine {
         auto_reinforce: bool,
         min_intersection: Option<usize>,
         explain: bool,
+        disable_pattern_completion: bool,
+        disable_salience_bias: bool,
+        disable_systems_consolidation: bool,
     ) -> Vec<RecallResult> {
         if query_cues.is_empty() {
             return Vec::new();
         }
         
-        // Normalize cues
-        let cues: Vec<(String, f64)> = query_cues
-            .into_iter()
-            .map(|(c, w)| (c.to_lowercase().trim().to_string(), w))
+        // Normalize primary cues
+        let mut active_cues: Vec<(String, f64)> = query_cues
+            .iter()
+            .map(|(c, w)| (c.to_lowercase().trim().to_string(), *w))
             .filter(|(c, _)| !c.is_empty() && self.cue_index.contains_key(c))
             .collect();
         
-        if cues.is_empty() {
+        if active_cues.is_empty() {
             return Vec::new();
         }
+
+        // 1. Pattern Completion (Hippocampal CA3)
+        // Find cues that strongly co-occur with the query cues
+        if !disable_pattern_completion {
+            let mut inferred_candidates: HashMap<String, u64> = HashMap::new();
+            for (cue, _) in &active_cues {
+                if let Some(co_map) = self.cue_co_occurrence.get(cue) {
+                for entry in co_map.iter() {
+                    let (inferred_cue, count) = entry.pair();
+                    // Skip if already in query
+                    if active_cues.iter().any(|(c, _)| c == inferred_cue) {
+                        continue;
+                    }
+                    *inferred_candidates.entry(inferred_cue.clone()).or_insert(0) += *count;
+                }
+            }
+        }
+
+        // Take top-K inferred cues and inject them with low weight
+            let mut inferred_list: Vec<(String, u64)> = inferred_candidates.into_iter().collect();
+            inferred_list.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+            
+            let pattern_completion_weight = 0.7; // Weight for inferred cues
+            for (inf_cue, _) in inferred_list.into_iter().take(5) {
+                active_cues.push((inf_cue, pattern_completion_weight));
+            }
+        }
         
-        // Consolidated search using Selective Set Intersection
-        let mut results = self.consolidated_search(&cues, limit, explain);
+        // 2. Consolidated search using Selective Set Intersection
+        let mut results = self.consolidated_search(&active_cues, limit, explain, disable_salience_bias, disable_systems_consolidation);
         
-        // Filter by minimum intersection if specified
+        // Filter by minimum intersection if specified (on primary cues only?)
+        // For now, simple retention.
         if let Some(min_int) = min_intersection {
             results.retain(|r| r.intersection_count >= min_int);
         }
         
-        // Auto-reinforce if enabled
+        // 3. Auto-reinforce if enabled (only primary cues)
         if auto_reinforce {
-            let just_cues: Vec<String> = cues.iter().map(|(c, _)| c.clone()).collect();
+            let primary_cues: Vec<String> = query_cues.iter().map(|(c, _)| c.clone()).collect();
             for result in &results {
-                self.reinforce_memory(&result.memory_id, just_cues.clone());
+                self.reinforce_memory(&result.memory_id, primary_cues.clone());
             }
         }
 
@@ -273,7 +399,7 @@ impl CueMapEngine {
         results
     }
     
-    fn consolidated_search(&self, query_cues: &[(String, f64)], _limit: usize, explain: bool) -> Vec<RecallResult> {
+    fn consolidated_search(&self, query_cues: &[(String, f64)], _limit: usize, explain: bool, disable_salience_bias: bool, disable_systems_consolidation: bool) -> Vec<RecallResult> {
         if query_cues.is_empty() {
             return Vec::new();
         }
@@ -332,10 +458,10 @@ impl CueMapEngine {
         }
 
         // 5. Score candidates
-        self.score_consolidated_candidates(candidates, explain)
+        self.score_consolidated_candidates(candidates, explain, disable_salience_bias, disable_systems_consolidation)
     }
 
-    fn score_consolidated_candidates(&self, candidates: Vec<(String, Vec<(usize, usize, f64)>, f64)>, explain: bool) -> Vec<RecallResult> {
+    fn score_consolidated_candidates(&self, candidates: Vec<(String, Vec<(usize, usize, f64)>, f64)>, explain: bool, disable_salience_bias: bool, disable_systems_consolidation: bool) -> Vec<RecallResult> {
         const MAX_REC_WEIGHT: f64 = 20.0;
         const MAX_FREQ_WEIGHT: f64 = 5.0;
         
@@ -343,6 +469,10 @@ impl CueMapEngine {
         
         for (memory_id, positions_info, total_weight) in candidates {
             if let Some(memory) = self.memories.get(&memory_id) {
+                // Skip consolidated summaries if disabled
+                if disable_systems_consolidation && memory.cues.iter().any(|c| c == "type:summary") {
+                    continue;
+                }
                 let mut total_recency = 0.0;
                 let mut total_w_rec = 0.0;
                 let mut total_w_freq = 0.0;
@@ -378,18 +508,42 @@ impl CueMapEngine {
                     0.0
                 };
                 
+                let salience_score = if disable_salience_bias {
+                    0.0
+                } else {
+                    memory.salience
+                };
                 let intersection_score = total_weight * 100.0;
-                let score = intersection_score + (recency_score * avg_w_rec) + (frequency_score * avg_w_freq);
                 
+                // Final score includes salience
+                let score = intersection_score + (recency_score * avg_w_rec) + (frequency_score * avg_w_freq) + (salience_score * 10.0);
+                
+                // Match integrity calculation
+                // 1. Intersection strength (relative to match count)
+                let intersection_strength = total_weight / match_count.max(1.0);
+                // 2. Context agreement: how many of the memory's cues matched the query
+                let context_agreement = if !memory.cues.is_empty() {
+                    match_count / (memory.cues.len() as f64)
+                } else {
+                    0.0
+                };
+                // 3. Reinforcement boost (capped)
+                let reinforcement_boost = (frequency_score / 2.0).min(1.0);
+                
+                let match_integrity = (intersection_strength * 0.5 + context_agreement * 0.3 + reinforcement_boost * 0.2).min(1.0);
+
                 let explain_data = if explain {
                     Some(serde_json::json!({
                         "intersection_weighted": total_weight,
                         "intersection_score": intersection_score,
                         "recency_component": recency_score,
                         "frequency_component": frequency_score,
+                        "salience_score": salience_score,
+                        "match_integrity": match_integrity,
                         "weights": {
                             "recency": avg_w_rec,
-                            "frequency": avg_w_freq
+                            "frequency": avg_w_freq,
+                            "salience": 10.0
                         },
                         "match_count": match_count
                     }))
@@ -401,9 +555,11 @@ impl CueMapEngine {
                     memory_id,
                     content: memory.content.clone(),
                     score,
+                    match_integrity,
                     intersection_count: match_count as usize,
                     recency_score,
                     reinforcement_score: frequency_score,
+                    salience_score,
                     metadata: memory.metadata.clone(),
                     explain: explain_data,
                 });
@@ -417,6 +573,98 @@ impl CueMapEngine {
         self.memories.get(memory_id).map(|m| m.clone())
     }
     
+    pub fn consolidate_memories(&self, cue_overlap_threshold: f64) -> Vec<(String, Vec<String>)> {
+        let mut to_merge = Vec::new();
+        let mut seen = HashSet::new();
+
+        // 1. Find overlapping memories
+        // This is a naive O(N^2) or O(N * C) approach, but we can limit it using cues
+        for entry in self.memories.iter() {
+            let (id_a, mem_a) = entry.pair();
+            if seen.contains(id_a) { continue; }
+            
+            let mut group = vec![id_a.clone()];
+            
+            // Use the first cue to find candidates
+            if let Some(first_cue) = mem_a.cues.first() {
+                if let Some(ordered_set) = self.cue_index.get(first_cue) {
+                    for id_b in ordered_set.get_recent(None) {
+                        if id_a == id_b || seen.contains(id_b) { continue; }
+                        
+                        if let Some(mem_b) = self.memories.get(id_b) {
+                            // Calculate Jaccard similarity of cues
+                            let cues_a: HashSet<_> = mem_a.cues.iter().collect();
+                            let cues_b: HashSet<_> = mem_b.cues.iter().collect();
+                            
+                            let intersection = cues_a.intersection(&cues_b).count();
+                            let union = cues_a.union(&cues_b).count();
+                            let similarity = (intersection as f64) / (union as f64);
+                            
+                            if similarity >= cue_overlap_threshold {
+                                group.push(id_b.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            
+            if group.len() > 1 {
+                for id in &group {
+                    seen.insert(id.clone());
+                }
+                to_merge.push(group);
+            }
+        }
+
+        let mut results = Vec::new();
+        // 2. Merge groups
+        for group in to_merge {
+            let mut combined_content = String::new();
+            let mut combined_cues = HashSet::new();
+            let mut total_reinforcement = 0;
+            let mut max_salience: f64 = 0.0;
+            
+            for id in &group {
+                if let Some(mem) = self.memories.get(id) {
+                    if !combined_content.is_empty() { combined_content.push_str("\n---\n"); }
+                    combined_content.push_str(&mem.content);
+                    for cue in &mem.cues { combined_cues.insert(cue.clone()); }
+                    total_reinforcement += mem.reinforcement_count;
+                    max_salience = max_salience.max(mem.salience);
+                }
+            }
+            
+            // We NO LONGER delete old memories. Consolidation is additive.
+            // Original memories are kept for trust and ground truth.
+            
+            // Add summary memory (keeping signal, reducing noise)
+            let mut summary_content = format!("[Consolidated Memory]\n{}", combined_content);
+            if summary_content.len() > 1000 {
+                summary_content.truncate(1000);
+                summary_content.push_str("... [truncated]");
+            }
+            
+            let mut metadata = HashMap::new();
+            metadata.insert("consolidated".to_string(), serde_json::json!(true));
+            metadata.insert("original_count".to_string(), serde_json::json!(group.len()));
+            
+            let mut cues_vec: Vec<String> = combined_cues.into_iter().collect();
+            cues_vec.push("type:summary".to_string());
+            
+            let new_id = self.add_memory(summary_content, cues_vec, Some(metadata), false);
+            
+            // Adjust properties
+            if let Some(mut new_mem) = self.memories.get_mut(&new_id) {
+                new_mem.reinforcement_count = total_reinforcement;
+                new_mem.salience = max_salience * 0.8; // Lower priority than fresh memories
+            }
+            
+            results.push((new_id, group));
+        }
+        
+        results
+    }
+
     pub fn get_stats(&self) -> HashMap<String, serde_json::Value> {
         let mut stats = HashMap::new();
         stats.insert(

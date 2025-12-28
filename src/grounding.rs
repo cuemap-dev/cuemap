@@ -9,6 +9,7 @@ pub struct SelectedItem {
     pub intersection_count: usize,
     pub recency_component: f64,
     pub reinforcement_component: f64,
+    pub match_integrity: f64,
     pub source: String,        // e.g., "commits", "logs", "policies"
     pub timestamp: String,     // ISO-8601
     pub estimated_tokens: u32,
@@ -71,10 +72,11 @@ impl GroundingEngine {
                     .to_string();
 
                 let why = format!(
-                    "Ranked #{} with score {:.2} ({} matches)",
+                    "Ranked #{} with score {:.2} ({} matches, integrity {:.2})",
                     selected.len() + 1,
                     result.score,
-                    result.intersection_count
+                    result.intersection_count,
+                    result.match_integrity
                 );
 
                 selected.push(SelectedItem {
@@ -84,6 +86,7 @@ impl GroundingEngine {
                     intersection_count: result.intersection_count,
                     recency_component: result.recency_score,
                     reinforcement_component: result.reinforcement_score,
+                    match_integrity: result.match_integrity,
                     source,
                     timestamp,
                     estimated_tokens: tokens,

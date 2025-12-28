@@ -75,12 +75,19 @@ impl ProjectContext {
                 "status:active".to_string(),
             ];
             
-            // Recall aliases (limit 8, auto_reinforce true)
-            let aliases = self.aliases.recall(alias_query, 8, true);
+            // Recall aliases (limit 8, auto_reinforce false to avoid noise)
+            let aliases = self.aliases.recall(alias_query, 8, false);
             
             for alias in aliases {
                 // Parse alias content to get target cue and weight
                 if let Ok(data) = serde_json::from_str::<Value>(&alias.content) {
+                     // STRICT FILTER: Check if 'from' matches the current cue exactly
+                     if let Some(from_val) = data.get("from").and_then(|v| v.as_str()) {
+                         if from_val != cue {
+                             continue;
+                         }
+                     }
+
                      if let Some(to_cue) = data.get("to").and_then(|v| v.as_str()) {
                          // Default downweight 0.85 if not specified
                          let downweight = data.get("downweight").and_then(|v| v.as_f64()).unwrap_or(0.85);

@@ -12,10 +12,16 @@ pub struct Memory {
     pub last_accessed: f64,
     #[serde(default)]
     pub reinforcement_count: u64,
+    #[serde(default = "default_salience")]
+    pub salience: f64,
     #[serde(default)]
     pub cues: Vec<String>,
     #[serde(default)]
     pub metadata: HashMap<String, serde_json::Value>,
+}
+
+fn default_salience() -> f64 {
+    1.0
 }
 
 impl Memory {
@@ -31,6 +37,7 @@ impl Memory {
             created_at: now,
             last_accessed: now,
             reinforcement_count: 0,
+            salience: 1.0,
             cues: Vec::new(),
             metadata: metadata.unwrap_or_default(),
         }

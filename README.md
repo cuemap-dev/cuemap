@@ -7,11 +7,31 @@
 CueMap implements a **Continuous Gradient Algorithm** inspired by biological memory:
 
 1.  **Intersection (Context Filter)**: Triangulates relevant memories by overlapping cues (e.g., `service:payments` + `error:500`).
-2.  **Recency (Signal Attenuation)**: Applies a continuous decay curve, prioritizing fresh data.
-3.  **Reinforcement (Hebbian Learning)**: Frequently accessed memories gain signal strength, staying "front of mind" even as they age.
-4.  **Self-Regulating Dynamics**: Uses a $\sigma = \sqrt{N}$ scaling factor to automatically balance Recency vs. Reinforcement as datasets grow from 10k to 10M+.
+2.  **Pattern Completion (Associative Recall)**: Automatically infers missing cues from co-occurrence history, enabling recall from partial inputs.
+3.  **Recency & Salience (Signal Dynamics)**: Balances fresh data with salient, high-signal events prioritized by the Amygdala-inspired salience module.
+4.  **Reinforcement (Hebbian Learning)**: Frequently accessed memories gain signal strength, staying "front of mind" even as they age.
+5.  **Autonomous Consolidation**: Periodically merges overlapping memories into summaries, mimicking systems consolidation to preserve signal while reducing noise.
 
 Built with Rust for maximum performance and reliability.
+
+## Brain-Inspired Advanced Recall (v0.5)
+
+CueMap v0.5 introduces deep biological inspiration into the deterministic recall engine:
+
+### 🧠 Hippocampal Pattern Completion
+Given partial cues, the engine recalls the whole memory by maintaining an incremental cue co-occurrence matrix. This expansion happens strictly at retrieval-time and can be toggled off via `disable_pattern_completion: true` for pure deterministic matching.
+
+### ⏱️ Temporal Episode Chunking
+Experiences are automatically chunked into episodes. Memories created in close temporal proximity with high cue overlap are tagged with `episode:<id>`, allowing the engine to recall entire "storylines" from a single member. Can be disabled per-request via `disable_temporal_chunking: true`.
+
+### 💎 Salience Bias (Amygdala)
+Not all memories are created equal. The engine calculates a **Salience Multiplier** based on cue density, reinforcement frequency, and rare cue combinations. Salient memories persist longer in the "warm" cache and rank higher than routine events. Can be disabled per-recall via `disable_salience_bias: true`.
+
+### 📉 Systems Consolidation
+Old, highly overlapping memories are periodically merged into summarized "gist" memories. This process is strictly additive: it keeps the original high-resolution memories intact as Ground Truth while creating new consolidated summaries to aid high-level recall. Can be toggled at retrieval via `disable_systems_consolidation: true`.
+
+### 🎯 Match Integrity
+Every recall result now includes a **Match Integrity** score. This internal diagnostic combines intersection strength, reinforcement history, and context agreement to tell you how structurally reliable a specific recall result is.
 
 ## Quick Start
 
@@ -65,10 +85,12 @@ On startup, if `--agent-dir` is provided, CueMap:
 ./target/release/cuemap-rust --agent-dir ~/projects/my-app
 
 # The agent will automatically:
-# 1. Chunk your Code (Python, Rust, JS/TS, Go, Java, PHP, HTML, CSS).
-# 2. Extract text from Documents (PDF, Word, Excel) and Data (JSON, CSV, YAML, XML).
-# 3. Use the local LLM to extract cues like 'name:Calculator', 'topic:auth'.
-# 4. Add them to CueMap instantly.
+# 1. Structural Chunking (Python, Rust, JS/TS, Go, Java, PHP, HTML, CSS).
+#    - Recursive tree-sitter extraction captures 'name:Calculator', 'selector:.btn', etc.
+# 2. Document & Data Parsing (PDF, Word, Excel, JSON, CSV, YAML, XML).
+#    - Extracts headers, keys, and metadata as grounded structural cues.
+# 3. LLM Fact Extraction to propose semantic cues like 'topic:auth'.
+# 4. Immediate ingestion into the memory store.
 ```
 
 
@@ -368,9 +390,39 @@ curl http://localhost:8080/memories/{id}
 ```
 
 ### Get Stats
-
 ```bash
 curl http://localhost:8080/stats
+```
+
+### Alias Management
+
+Manage synonyms and semantic mappings deterministically.
+
+#### Add Alias
+```bash
+curl -X POST http://localhost:8080/aliases \
+  -H "Content-Type: application/json" \
+  -d '{
+    "from": "pay",
+    "to": "service:payment",
+    "weight": 0.9
+  }'
+```
+
+#### Merge Aliases (Bulk)
+```bash
+curl -X POST http://localhost:8080/aliases/merge \
+  -H "Content-Type: application/json" \
+  -d '{
+    "cues": ["bill", "invoice", "statement"],
+    "to": "service:billing"
+  }'
+```
+
+#### Get Aliases
+```bash
+# Reverse lookup: Find all aliases for "service:payment"
+curl "http://localhost:8080/aliases?cue=service:payment"
 ```
 
 ### Relevance Compression Engine (v0.5)
