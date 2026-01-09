@@ -5,6 +5,8 @@ use crate::persistence::PersistenceManager;
 use crate::projects::ProjectContext;
 use crate::normalization::NormalizationConfig;
 use crate::taxonomy::Taxonomy;
+use crate::config::CueGenStrategy;
+use crate::semantic::SemanticEngine;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -28,15 +30,17 @@ pub struct ProjectStats {
 pub struct MultiTenantEngine {
     projects: Arc<DashMap<ProjectId, Arc<ProjectContext>>>,
     snapshots_dir: PathBuf,
+    cuegen_strategy: CueGenStrategy,
+    semantic_engine: SemanticEngine,
 }
 
 impl MultiTenantEngine {
     #[allow(dead_code)]
-    pub fn new() -> Self {
-        Self::with_snapshots_dir("./snapshots")
+    pub fn new(cuegen_strategy: CueGenStrategy, semantic_engine: SemanticEngine) -> Self {
+        Self::with_snapshots_dir("./snapshots", cuegen_strategy, semantic_engine)
     }
     
-    pub fn with_snapshots_dir<P: AsRef<Path>>(dir: P) -> Self {
+    pub fn with_snapshots_dir<P: AsRef<Path>>(dir: P, cuegen_strategy: CueGenStrategy, semantic_engine: SemanticEngine) -> Self {
         let snapshots_dir = dir.as_ref().to_path_buf();
         
         // Create snapshots directory if it doesn't exist
@@ -47,6 +51,8 @@ impl MultiTenantEngine {
         Self {
             projects: Arc::new(DashMap::new()),
             snapshots_dir,
+            cuegen_strategy,
+            semantic_engine,
         }
     }
     
@@ -59,6 +65,8 @@ impl MultiTenantEngine {
             let ctx = Arc::new(ProjectContext::new(
                 NormalizationConfig::default(),
                 Taxonomy::default(),
+                self.cuegen_strategy.clone(),
+                self.semantic_engine.clone(),
             ));
             self.projects.insert(project_id, ctx.clone());
             ctx
@@ -108,40 +116,86 @@ impl MultiTenantEngine {
         self.projects.insert(project_id, ctx);
     }
     
-    /// Save a project snapshot to disk
+    /// Save a project snapshot to disk (main, aliases, lexicon)
     pub fn save_project(&self, project_id: &ProjectId) -> Result<PathBuf, String> {
         let ctx = self.get_project(project_id)
             .ok_or_else(|| format!("Project '{}' not found", project_id))?;
         
-        let snapshot_path = self.snapshots_dir.join(format!("{}.bin", project_id));
-        // Only save main engine for now
-        PersistenceManager::save_to_path(&ctx.main, &snapshot_path)
-            .map_err(|e| format!("Failed to save project: {}", e))?;
+        // Save all 3 engines with suffixes
+        let main_path = self.snapshots_dir.join(format!("{}.bin", project_id));
+        let aliases_path = self.snapshots_dir.join(format!("{}_aliases.bin", project_id));
+        let lexicon_path = self.snapshots_dir.join(format!("{}_lexicon.bin", project_id));
         
-        Ok(snapshot_path)
+        PersistenceManager::save_to_path(&ctx.main, &main_path)
+            .map_err(|e| format!("Failed to save main engine: {}", e))?;
+        
+        PersistenceManager::save_to_path(&ctx.aliases, &aliases_path)
+            .map_err(|e| format!("Failed to save aliases engine: {}", e))?;
+        
+        PersistenceManager::save_to_path(&ctx.lexicon, &lexicon_path)
+            .map_err(|e| format!("Failed to save lexicon engine: {}", e))?;
+        
+        tracing::info!("Saved project '{}' (main + aliases + lexicon)", project_id);
+        
+        Ok(main_path)
     }
     
-    /// Load a project snapshot from disk
+    /// Load a project snapshot from disk (main, aliases, lexicon)
     pub fn load_project(&self, project_id: &ProjectId) -> Result<Arc<ProjectContext>, String> {
-        let snapshot_path = self.snapshots_dir.join(format!("{}.bin", project_id));
+        let main_path = self.snapshots_dir.join(format!("{}.bin", project_id));
+        let aliases_path = self.snapshots_dir.join(format!("{}_aliases.bin", project_id));
+        let lexicon_path = self.snapshots_dir.join(format!("{}_lexicon.bin", project_id));
         
-        if !snapshot_path.exists() {
+        if !main_path.exists() {
             return Err(format!("Snapshot for project '{}' not found", project_id));
         }
         
-        let (memories, cue_index) = PersistenceManager::load_from_path(&snapshot_path)
-            .map_err(|e| format!("Failed to load project: {}", e))?;
-        
-        // Create context and populate main engine
+        // Load main engine (required)
+        let (memories, cue_index) = PersistenceManager::load_from_path(&main_path)
+            .map_err(|e| format!("Failed to load main engine: {}", e))?;
         let main_engine = CueMapEngine::from_state(memories, cue_index);
+        
+        // Load aliases engine (optional - may not exist for older snapshots)
+        let aliases_engine = if aliases_path.exists() {
+            match PersistenceManager::load_from_path(&aliases_path) {
+                Ok((memories, cue_index)) => {
+                    tracing::debug!("Loaded aliases for project '{}'", project_id);
+                    CueMapEngine::from_state(memories, cue_index)
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load aliases for '{}': {}", project_id, e);
+                    CueMapEngine::new()
+                }
+            }
+        } else {
+            CueMapEngine::new()
+        };
+        
+        // Load lexicon engine (optional - may not exist for older snapshots)
+        let lexicon_engine = if lexicon_path.exists() {
+            match PersistenceManager::load_from_path(&lexicon_path) {
+                Ok((memories, cue_index)) => {
+                    tracing::debug!("Loaded lexicon for project '{}'", project_id);
+                    CueMapEngine::from_state(memories, cue_index)
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load lexicon for '{}': {}", project_id, e);
+                    CueMapEngine::new()
+                }
+            }
+        } else {
+            CueMapEngine::new()
+        };
         
         let ctx = Arc::new(ProjectContext {
             main: main_engine,
-            aliases: CueMapEngine::new(),
-            lexicon: CueMapEngine::new(),
+            aliases: aliases_engine,
+            lexicon: lexicon_engine,
             query_cache: DashMap::new(),
             normalization: NormalizationConfig::default(),
             taxonomy: Taxonomy::default(),
+            cuegen_strategy: self.cuegen_strategy.clone(),
+            semantic_engine: self.semantic_engine.clone(),
         });
         
         self.projects.insert(project_id.clone(), ctx.clone());

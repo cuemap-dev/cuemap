@@ -31,11 +31,18 @@ pub fn validate_cues(cues: Vec<String>, taxonomy: &Taxonomy) -> ValidationReport
     for cue in cues {
         // 1. Check format k:v
         let parts: Vec<&str> = cue.splitn(2, ':').collect();
+        // Allow cues without keys (plain strings) based on new requirements
+        if parts.len() == 1 {
+             // Accept plain cues, treating them as valid by default unless we implement a "plain cue" blocklist
+             accepted.push(cue);
+             continue;
+        }
+
         if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
             rejected.push(RejectedCue {
                 cue: cue.clone(),
                 code: "bad_format".to_string(),
-                detail: "Cue must be in 'key:value' format".to_string(),
+                detail: "Cue must be non-empty".to_string(),
             });
             continue;
         }

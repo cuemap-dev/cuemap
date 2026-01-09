@@ -2,16 +2,37 @@ use cuemap_rust::engine::CueMapEngine;
 use cuemap_rust::projects::ProjectContext;
 use cuemap_rust::normalization::NormalizationConfig;
 use cuemap_rust::taxonomy::Taxonomy;
+use cuemap_rust::config::CueGenStrategy;
+use cuemap_rust::semantic::SemanticEngine;
 use cuemap_rust::jobs::{Job, JobQueue, SingleTenantProvider};
 use std::sync::Arc;
 use std::time::Duration;
 use serde_json::Value;
+
+mod web_test;
+mod security_test;
+
+pub fn setup_test_project() -> (Arc<ProjectContext>, Arc<JobQueue>) {
+    let ctx = Arc::new(ProjectContext::new(
+        NormalizationConfig::default(),
+        Taxonomy::default(),
+        CueGenStrategy::default(),
+        SemanticEngine::new(None),
+    ));
+    
+    let provider = Arc::new(SingleTenantProvider { project: ctx.clone() });
+    let job_queue = JobQueue::new(provider);
+    
+    (ctx, Arc::new(job_queue))
+}
 
 #[tokio::test]
 async fn test_lexicon_resolution() {
     let ctx = Arc::new(ProjectContext::new(
         NormalizationConfig::default(),
         Taxonomy::default(),
+        CueGenStrategy::default(),
+        SemanticEngine::new(None),
     ));
     
     // Create a job queue for this project
@@ -21,7 +42,7 @@ async fn test_lexicon_resolution() {
     // 1. Add memory with cues
     let content = "The payments service is experiencing high latency.".to_string();
     let cues = vec!["service:payments".to_string(), "status:slow".to_string()];
-    let memory_id = ctx.main.add_memory(content.clone(), cues.clone(), None);
+    let memory_id = ctx.main.add_memory(content.clone(), cues.clone(), None, false);
 
     // 2. Manually trigger Lexicon training job (usually triggered by API)
     job_queue.enqueue(Job::TrainLexiconFromMemory {
@@ -45,6 +66,8 @@ async fn test_alias_expansion_and_weighting() {
     let ctx = Arc::new(ProjectContext::new(
         NormalizationConfig::default(),
         Taxonomy::default(),
+        CueGenStrategy::default(),
+        SemanticEngine::new(None),
     ));
 
     // 1. Setup an alias: "pay" -> "service:payments" (weight 0.85)
@@ -61,7 +84,7 @@ async fn test_alias_expansion_and_weighting() {
         "status:active".to_string(),
     ];
     
-    ctx.aliases.add_memory(alias_content, alias_cues, None);
+    ctx.aliases.add_memory(alias_content, alias_cues, None, false);
 
     // 2. Expand cues
     let query_cues = vec!["pay".to_string()];
@@ -74,10 +97,10 @@ async fn test_alias_expansion_and_weighting() {
 
     // 3. Verify weighting in recall
     // Add two memories: one for "pay", one for "service:payments"
-    let id_exact = ctx.main.add_memory("Direct pay".to_string(), vec!["pay".to_string()], None);
-    let id_aliased = ctx.main.add_memory("Payments service".to_string(), vec!["service:payments".to_string()], None);
+    let id_exact = ctx.main.add_memory("Direct pay".to_string(), vec!["pay".to_string()], None, false);
+    let id_aliased = ctx.main.add_memory("Payments service".to_string(), vec!["service:payments".to_string()], None, false);
 
-    let results = ctx.main.recall_weighted(expanded, 10, false, None, true);
+    let results = ctx.main.recall_weighted(expanded, 10, false, None, true, false, false, false);
 
     assert_eq!(results.len(), 2);
     // Exact match (weight 1.0) should be first
@@ -94,9 +117,9 @@ async fn test_alias_expansion_and_weighting() {
 async fn test_explain_output_structure() {
     let engine = CueMapEngine::new();
     
-    engine.add_memory("test".to_string(), vec!["a".to_string()], None);
+    engine.add_memory("test".to_string(), vec!["a".to_string()], None, false);
     
-    let results = engine.recall_weighted(vec![("a".to_string(), 1.0)], 10, false, None, true);
+    let results = engine.recall_weighted(vec![("a".to_string(), 1.0)], 10, false, None, true, false, false, false);
     
     assert!(!results.is_empty());
     let explain = results[0].explain.as_ref().expect("Explain should be present");
@@ -111,6 +134,8 @@ async fn test_alias_proposal_job() {
     let ctx = Arc::new(ProjectContext::new(
         NormalizationConfig::default(),
         Taxonomy::default(),
+        CueGenStrategy::default(),
+        SemanticEngine::new(None),
     ));
     
     let provider = Arc::new(SingleTenantProvider { project: ctx.clone() });
@@ -119,7 +144,7 @@ async fn test_alias_proposal_job() {
     // Create a scenario for alias discovery:
     // "prod" and "production" share 100% of memories
     for i in 0..25 {
-        ctx.main.add_memory(format!("Mem {}", i), vec!["prod".to_string(), "production".to_string()], None);
+        ctx.main.add_memory(format!("Mem {}", i), vec!["prod".to_string(), "production".to_string()], None, false);
     }
 
     // Trigger alias proposal job

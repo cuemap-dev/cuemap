@@ -140,7 +140,7 @@ impl PersistenceManager {
         Ok((memories, cue_index))
     }
     
-    /// List all snapshot files in a directory
+    /// List all snapshot files in a directory (main engines only, not aliases/lexicon)
     pub fn list_snapshots_in_dir(dir: &Path) -> Vec<String> {
         let mut snapshots = Vec::new();
         
@@ -148,7 +148,12 @@ impl PersistenceManager {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                    if filename.ends_with(".bin") && !filename.ends_with(".tmp") {
+                    // Only include main engine files, not aliases or lexicon
+                    if filename.ends_with(".bin") 
+                        && !filename.ends_with(".tmp")
+                        && !filename.ends_with("_aliases.bin")
+                        && !filename.ends_with("_lexicon.bin") 
+                    {
                         let project_id = filename.replace(".bin", "");
                         snapshots.push(project_id);
                     }

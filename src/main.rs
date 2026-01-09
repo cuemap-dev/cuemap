@@ -2,6 +2,9 @@ use cuemap_rust::projects::ProjectContext;
 use cuemap_rust::normalization::NormalizationConfig;
 use cuemap_rust::taxonomy::Taxonomy;
 use cuemap_rust::auth::AuthConfig;
+use cuemap_rust::config::CueGenStrategy;
+use cuemap_rust::semantic::SemanticEngine;
+use cuemap_rust::config;
 use cuemap_rust::*;
 use axum::Router;
 use clap::Parser;
@@ -43,6 +46,10 @@ struct Args {
     /// Agent throttle in milliseconds
     #[arg(long, default_value = "100")]
     agent_throttle: u64,
+
+    /// Cue generation strategy
+    #[arg(long, default_value = "default")]
+    cuegen: CueGenStrategy,
 }
 
 #[tokio::main]
@@ -79,8 +86,9 @@ async fn main() {
         None
     };
     
-
-    
+    // Initialize Semantic Engine (if using bundled data)
+    let semantic_engine = SemanticEngine::new(Some(Path::new(&args.data_dir)));
+    let cuegen_strategy = args.cuegen;
     // Initialize engine for single-tenant mode
     let project = if !args.multi_tenant {
         info!("Single-tenant mode");
@@ -101,16 +109,28 @@ async fn main() {
                             query_cache: dashmap::DashMap::new(),
                             normalization: NormalizationConfig::default(),
                             taxonomy: Taxonomy::default(),
+                            cuegen_strategy: cuegen_strategy.clone(),
+                            semantic_engine: semantic_engine.clone(),
                         })
                     }
                     Err(e) => {
                         warn!("Failed to load static snapshot: {}, starting fresh", e);
-                        Arc::new(ProjectContext::new(NormalizationConfig::default(), Taxonomy::default()))
+                        Arc::new(ProjectContext::new(
+                            NormalizationConfig::default(),
+                            Taxonomy::default(),
+                            cuegen_strategy.clone(),
+                            semantic_engine.clone(),
+                        ))
                     }
                 }
             } else {
                 warn!("No snapshot found at {:?}, starting fresh", snapshot_path);
-                Arc::new(ProjectContext::new(NormalizationConfig::default(), Taxonomy::default()))
+                Arc::new(ProjectContext::new(
+                    NormalizationConfig::default(), 
+                    Taxonomy::default(),
+                    cuegen_strategy.clone(),
+                    semantic_engine.clone(),
+                ))
             }
         } else if let Some(ref pm) = persistence {
             // Load from data directory
@@ -125,20 +145,37 @@ async fn main() {
                         query_cache: dashmap::DashMap::new(),
                         normalization: NormalizationConfig::default(),
                         taxonomy: Taxonomy::default(),
+                        cuegen_strategy: cuegen_strategy.clone(),
+                        semantic_engine: semantic_engine.clone(),
                     })
                 }
                 Err(e) => {
                     info!("Failed to load state: {}, starting fresh", e);
-                    Arc::new(ProjectContext::new(NormalizationConfig::default(), Taxonomy::default()))
+                    Arc::new(ProjectContext::new(
+                        NormalizationConfig::default(),
+                        Taxonomy::default(),
+                        cuegen_strategy.clone(),
+                        semantic_engine.clone(),
+                    ))
                 }
             }
         } else {
-            Arc::new(ProjectContext::new(NormalizationConfig::default(), Taxonomy::default()))
+            Arc::new(ProjectContext::new(
+                NormalizationConfig::default(),
+                Taxonomy::default(),
+                cuegen_strategy.clone(),
+                semantic_engine.clone(),
+            ))
         }
     } else {
         // Not used in multi-tenant mode, but we need a dummy value matching the type if we were using same variable.
         // But we can just use a dummy context.
-        Arc::new(ProjectContext::new(NormalizationConfig::default(), Taxonomy::default()))
+        Arc::new(ProjectContext::new(
+            NormalizationConfig::default(),
+            Taxonomy::default(),
+            cuegen_strategy.clone(),
+            semantic_engine.clone(),
+        ))
     };
     
     // Start background snapshots (skip if static mode)
@@ -162,7 +199,11 @@ async fn main() {
             format!("{}/snapshots", args.data_dir)
         };
         
-        let mt_engine = Arc::new(multi_tenant::MultiTenantEngine::with_snapshots_dir(&snapshots_dir));
+        let mt_engine = Arc::new(multi_tenant::MultiTenantEngine::with_snapshots_dir(
+            &snapshots_dir,
+            cuegen_strategy.clone(),
+            semantic_engine.clone(),
+        ));
         
         // Auto-load all available snapshots
         info!("Loading snapshots from: {}", snapshots_dir);

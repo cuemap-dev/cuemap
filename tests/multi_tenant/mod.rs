@@ -1,4 +1,6 @@
 use cuemap_rust::multi_tenant::*;
+use cuemap_rust::semantic::SemanticEngine;
+use cuemap_rust::config::CueGenStrategy;
 use std::fs;
 use tempfile::tempdir;
 
@@ -14,13 +16,13 @@ fn test_project_id_validation() {
 #[test]
 fn test_multi_tenant_isolation() {
     let dir = tempdir().unwrap();
-    let engine = MultiTenantEngine::with_snapshots_dir(dir.path());
+    let engine = MultiTenantEngine::with_snapshots_dir(dir.path(), CueGenStrategy::default(), SemanticEngine::new(None));
     
     let ctx1 = engine.get_or_create_project("proj1".to_string());
     let ctx2 = engine.get_or_create_project("proj2".to_string());
     
-    ctx1.main.add_memory("Project 1 content".to_string(), vec!["cue1".to_string()], None);
-    ctx2.main.add_memory("Project 2 content".to_string(), vec!["cue2".to_string()], None);
+    ctx1.main.add_memory("Project 1 content".to_string(), vec!["cue1".to_string()], None, false);
+    ctx2.main.add_memory("Project 2 content".to_string(), vec!["cue2".to_string()], None, false);
     
     // Proj1 should not see cue2
     assert_eq!(ctx1.main.recall(vec!["cue2".to_string()], 10, false).len(), 0);
@@ -40,9 +42,9 @@ fn test_snapshot_roundtrip() {
     let project_id = "persistence_test".to_string();
     
     {
-        let engine = MultiTenantEngine::with_snapshots_dir(&snapshots_dir);
+        let engine = MultiTenantEngine::with_snapshots_dir(&snapshots_dir, CueGenStrategy::default(), SemanticEngine::new(None));
         let ctx = engine.get_or_create_project(project_id.clone());
-        ctx.main.add_memory("persist me".to_string(), vec!["save:true".to_string()], None);
+        ctx.main.add_memory("persist me".to_string(), vec!["save:true".to_string()], None, false);
         
         // Save
         engine.save_project(&project_id).expect("Should save successfully");
@@ -50,7 +52,7 @@ fn test_snapshot_roundtrip() {
     
     // Restart engine
     {
-        let engine = MultiTenantEngine::with_snapshots_dir(&snapshots_dir);
+        let engine = MultiTenantEngine::with_snapshots_dir(&snapshots_dir, CueGenStrategy::default(), SemanticEngine::new(None));
         
         // Should be able to load
         let ctx = engine.load_project(&project_id).expect("Should load successfully");
@@ -64,7 +66,7 @@ fn test_snapshot_roundtrip() {
 #[test]
 fn test_delete_project() {
     let dir = tempdir().unwrap();
-    let engine = MultiTenantEngine::with_snapshots_dir(dir.path());
+    let engine = MultiTenantEngine::with_snapshots_dir(dir.path(), CueGenStrategy::default(), SemanticEngine::new(None));
     
     let project_id = "to_delete";
     engine.get_or_create_project(project_id.to_string());

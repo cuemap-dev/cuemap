@@ -18,7 +18,7 @@ fn test_project_persistence() {
     let ctx1 = store.get_or_create("proj_1");
     
     // Add a memory to ctx1
-    ctx1.main.add_memory("test".to_string(), vec!["cue".to_string()], None);
+    ctx1.main.add_memory("test".to_string(), vec!["cue".to_string()], None, false);
     
     // Get the same project again
     let ctx2 = store.get_or_create("proj_1");
@@ -33,8 +33,8 @@ fn test_context_isolation() {
     let ctx1 = store.get_or_create("proj_A");
     let ctx2 = store.get_or_create("proj_B");
     
-    ctx1.main.add_memory("A".to_string(), vec![], None);
-    ctx2.main.add_memory("B".to_string(), vec![], None);
+    ctx1.main.add_memory("A".to_string(), vec![], None, false);
+    ctx2.main.add_memory("B".to_string(), vec![], None, false);
     
     assert_eq!(ctx1.main.get_memories().len(), 1);
     assert_eq!(ctx2.main.get_memories().len(), 1);

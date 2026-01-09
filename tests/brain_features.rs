@@ -51,12 +51,15 @@ fn test_salience_bias() {
 fn test_match_integrity_scores() {
     let engine = CueMapEngine::new();
     
-    engine.add_memory("exact match".to_string(), vec!["a".to_string(), "b".to_string()], None, false);
-    engine.add_memory("partial match".to_string(), vec!["a".to_string(), "c".to_string(), "d".to_string(), "e".to_string()], None, false);
+    let id_exact = engine.add_memory("exact match".to_string(), vec!["a".to_string(), "b".to_string()], None, false);
+    let id_partial = engine.add_memory("partial match".to_string(), vec!["a".to_string(), "c".to_string(), "d".to_string(), "e".to_string()], None, false);
     
     let results = engine.recall(vec!["a".to_string(), "b".to_string()], 10, false);
     
-    assert!(results[0].match_integrity > results[1].match_integrity, "Exact match should have higher match integrity than partial match");
+    let res_exact = results.iter().find(|r| r.memory_id == id_exact).unwrap();
+    let res_partial = results.iter().find(|r| r.memory_id == id_partial).unwrap();
+    
+    assert!(res_exact.match_integrity > res_partial.match_integrity, "Exact match should have higher match integrity than partial match");
 }
 
 #[test]

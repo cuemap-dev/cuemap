@@ -133,6 +133,45 @@ pub struct LlmConfig {
 }
 
 impl LlmConfig {
+    pub fn from_strategy(strategy: &super::config::CueGenStrategy) -> Option<Self> {
+        match strategy {
+            super::config::CueGenStrategy::Default => None,
+            super::config::CueGenStrategy::Glove => None,
+            super::config::CueGenStrategy::Ollama => {
+                // Same defaults as env var fallback
+                 let model = env::var("LLM_MODEL").unwrap_or_else(|_| "mistral".to_string());
+                 let url = env::var("OLLAMA_URL").unwrap_or_else(|_| "http://localhost:11434".to_string());
+                 Some(Self {
+                     provider: "ollama".to_string(),
+                     model,
+                     api_key: None,
+                     ollama_url: url,
+                 })
+            },
+            super::config::CueGenStrategy::Openai => {
+                 let model = env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-3.5-turbo".to_string());
+                 let api_key = env::var("LLM_API_KEY").ok(); 
+                 // Note: If api_key is missing, job might fail later, but we return Some config to attempt it
+                 Some(Self {
+                     provider: "openai".to_string(),
+                     model,
+                     api_key,
+                     ollama_url: String::new(),
+                 })
+            },
+             super::config::CueGenStrategy::Google => {
+                 let model = env::var("LLM_MODEL").unwrap_or_else(|_| "gemini-pro".to_string());
+                 let api_key = env::var("LLM_API_KEY").ok();
+                 Some(Self {
+                     provider: "google".to_string(),
+                     model,
+                     api_key,
+                     ollama_url: String::new(),
+                 })
+            }
+        }
+    }
+
     pub fn from_env() -> Option<Self> {
         let enabled = env::var("LLM_ENABLED")
             .map(|v| v.to_lowercase() != "false")

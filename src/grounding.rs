@@ -68,8 +68,17 @@ impl GroundingEngine {
                 let timestamp = result.metadata
                     .get("timestamp")
                     .and_then(|v| v.as_str())
-                    .unwrap_or_else(|| "2025-01-01T00:00:00Z") // Fallback
-                    .to_string();
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| {
+                        // Format created_at (unix timestamp) as ISO 8601
+                        let secs = result.created_at as i64;
+                        let nanos = ((result.created_at - secs as f64) * 1_000_000_000.0) as u32;
+                        if let Some(dt) = chrono::DateTime::from_timestamp(secs, nanos) {
+                            dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+                        } else {
+                            "unknown".to_string()
+                        }
+                    });
 
                 let why = format!(
                     "Ranked #{} with score {:.2} ({} matches, integrity {:.2})",
@@ -124,7 +133,7 @@ impl GroundingEngine {
                 item.timestamp
             ));
         }
-        block.push_str("[/VERIFIED CONTEXT]\n\nRules:\n- Use only VERIFIED CONTEXT.\n- If the answer is not contained there, respond: \"Unknown\".\n- Cite sources by memory_id in brackets.");
+        block.push_str("[/VERIFIED CONTEXT]\n\nGuidelines:\n- Use the context above to personalize your response.\n- You may also use your general knowledge to provide a complete answer.\n- When citing specific memories, include the source ID in brackets.");
         block
     }
 }

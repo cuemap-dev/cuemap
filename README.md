@@ -33,6 +33,15 @@ Old, highly overlapping memories are periodically merged into summarized "gist" 
 ### Match Integrity
 Every recall result now includes a **Match Integrity** score. This internal diagnostic combines intersection strength, reinforcement history, and context agreement to tell you how structurally reliable a specific recall result is.
 
+### Global Context Expansion (New)
+The engine automatically computes a **Global Context Vector** for each memory using **GloVe Embeddings**. It calculates the mean embedding vector of the content and uses k-NN search to infer related semantic cues (e.g., "server crash" -> "outage"). This removes the need for explicit synonym tagging.
+
+### Semantic Bootstrapping (WordNet & Thesaurus)
+To bridge the gap between user queries and stored memories, CueMap integrates **WordNet** and **Thesaurus** lookups during cue generation. This allows the engine to propose synonym-rich cues, ensuring that a memory tagged with "payment" is retrievable via "transaction" or "billing".
+
+### Double Indexing (New)
+`key:value` cues are indexed under both the full string and the value. This means `name:ComputeTax` is searchable via `ComputeTax` or `tax`, bridging the gap between structured agent/chunker cues and natural language recall.
+
 ## Quick Start
 
 ### Build & Run
@@ -67,16 +76,25 @@ Options:
   --agent-throttle <MS>                Throttle rate for ingestion [default: 50ms]
 ```
 
+## Embedded Web UI (New)
+
+CueMap v0.5 now includes a lightweight, embedded visualization dashboard.
+
+- **Synapse Graph**: View your memory store as a force-directed graph. Nodes represent memories and cues; edges represent co-occurrence strength.
+- **Real-Time Inspector**: Debug queries, view score breakdowns, and inspect raw memory content.
+
+Access it directly from the binary at: `http://localhost:8080/ui`
+
 ## Self-Learning Agent (Zero-Friction Ingestion)
 
 CueMap v0.5 includes a **Self-Learning Agent** that automatically watches local directories, extracts structured "facts", and ingests them into your memory store.
 
 ### Automated Bootstrapping
 
-On startup, if `--agent-dir` is provided, CueMap:
-1.  **Ensures Ollama is Ready**: Automatically installs, spawns, and pulls the `mistral` model if needed.
-2.  **Full Initial Scan**: Walks the watched directory (respecting `.gitignore`) and ingests all documents/code.
-3.  **Real-Time Watching**: Monitors for file creations and modifications to keep the memory fresh.
+On startup, if `--agent-dir` is provided, CueMap initializes the **Self-Learning Agent**.
+1.  **Internal Engine (Fast)**: Uses the built-in Semantic Engine (GloVe/WordNet) for rapid cue generation.
+2.  **Ollama Integration (Deep)**: If `LLM_ENABLED=true` (default for Agent), it ensures Ollama/Mistral is ready for deep fact extraction from documents.
+3.  **Real-Time Watching**: Monitors for file creations and modifications.
 
 ### Example
 
@@ -171,6 +189,29 @@ curl -H "X-API-Key: wrong-key" http://localhost:8080/stats
 ```
 
 ### SDK Usage
+
+#### Python (LangChain Integration)
+
+Official support for LangChain is now available via `langchain-cuemap`.
+
+```bash
+pip install langchain-cuemap
+```
+
+```python
+from cuemap.langchain import CueMapStore
+
+# Drop-in replacement for any VectorStore
+store = CueMapStore(
+    url="http://localhost:8080",
+    # api_key="...", # optional
+)
+
+store.add_texts(["The payment gateway is down."], metadatas=[{"source": "slack"}])
+results = store.similarity_search("billing failure")
+```
+
+#### Standard SDKs
 
 Python:
 ```python
@@ -282,33 +323,34 @@ Stress tested with 400+ parallel operations:
 
 ### LLM Integration
 
-CueMap can automatically propose cues for your memories using LLMs.
+CueMap can automatically propose cues for your memories using **LLMs** or **Semantic Engine**.
 
-#### Built-in Local LLM (Default)
+#### Built-in Semantic Engine (Default)
 
-**No API keys required!** Uses [Ollama](https://ollama.ai) running locally:
+**No LLM required!** By default, CueMap uses its internal **Semantic Engine** (GloVe + WordNet) and **Global Context** to generate cues instantly.
 
 ```bash
-# 1. Install and start Ollama with Mistral
-ollama run mistral
-
-# 2. Start CueMap (auto-detects Ollama)
+# 1. Start CueMap (no Ollama needed)
 ./target/release/cuemap-rust
 
-# 3. Add memory without manual cues
+# 2. Add memory
 curl -X POST http://localhost:8080/memories \
   -H "Content-Type: application/json" \
   -d '{
     "content": "The payments service is down due to a timeout.",
     "cues": []
   }'
-# Background job will propose: ["service:payment", "error:timeout"]
+# Internal Engine proposes: ["payment", "timeout", "outage", "failure"]
 ```
 
+#### Optional: Local LLM (Ollama)
+
+For deeper reasoning or document summarization (especially with the Agent), you can enable Ollama:
+
 **Configuration**:
-- `LLM_ENABLED=true` (Set to `false` to disable all background LLM jobs for low-end machines)
-- `LLM_PROVIDER=ollama` (default, no env var needed)
-- `LLM_MODEL=mistral` (default)
+- `CUE_GEN_STRATEGY=default` (Uses internal Semantic Engine. Set to `ollama` or `openai` to force LLM usage).
+- `LLM_ENABLED=true` (Required for Agent fact extraction. Default for agent: true).
+- `LLM_PROVIDER=ollama` (Default *if* LLM Strategy is selected).
 - `OLLAMA_URL=http://localhost:11434` (default)
 
 #### Cloud LLMs (Bring Your Own Key)
@@ -340,7 +382,7 @@ curl -X POST http://localhost:8080/memories \
     "cues": ["api", "rate_limit", "policy"]
   }'
 
-# Auto-generate cues via LLM (if configured)
+# Auto-generate cues via semantic engine (default) or LLM (if configured)
 curl -X POST http://localhost:8080/memories \
   -H "Content-Type: application/json" \
   -d '{
@@ -455,6 +497,19 @@ curl -X POST http://localhost:8080/recall/grounded \
 }
 ```
 
+### Signed Memories (Immutable RAG)
+
+To prevent prompt injection and guarantee data provenance, grounded recall responses now include a cryptographic signature.
+
+The `verified_context` block is signed using HMAC-SHA256 (key: `CUEMAP_SECRET_KEY`). Clients can verify this signature to ensure the context hasn't been tampered with or fabricated by a man-in-the-middle or hallucinatory process before reaching the LLM.
+
+```json
+{
+  "verified_context": "...",
+  "signature": "sha256:9b2d..."
+}
+```
+
 ## System Architecture
 
 ### High-Level Overview
@@ -479,7 +534,8 @@ graph TB
     
     subgraph "Intelligence Layer"
         JOBS[Job Queue]
-        LLM[LLM Provider<br/>Ollama/OpenAI/Gemini]
+        SEMANTIC[**Semantic Engine**<br/>GloVe + WordNet + Thesaurus]
+        LLM[Optional LLM<br/>Ollama/OpenAI]
         NORM[Normalization]
         TAX[Taxonomy Validator]
     end

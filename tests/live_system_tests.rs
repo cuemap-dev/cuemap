@@ -29,7 +29,7 @@ async fn setup_live_system() -> (cuemap_rust::engine::CueMapEngine, Arc<JobQueue
     let taxonomy = Taxonomy::default();
 
     // ProjectContext::new() creates internal engines (main, lexicon, aliases)
-    let project = Arc::new(ProjectContext::new(normalization, taxonomy));
+    let project = Arc::new(ProjectContext::new(normalization, taxonomy, cuemap_rust::config::CueGenStrategy::default(), cuemap_rust::semantic::SemanticEngine::new(None)));
     
     // 4. Setup Job Queue
     let provider = Arc::new(SingleTenantProvider {
@@ -59,7 +59,7 @@ async fn test_live_async_ingestion_stability() {
         );
 
         // Enqueue LLM job
-        queue.enqueue(Job::LlmProposeCues {
+        queue.enqueue(Job::ProposeCues {
             project_id: "default".to_string(), // SingleTenantProvider ignores project_id, but we pass "default"
             memory_id: id,
             content,
@@ -93,7 +93,7 @@ async fn test_live_llm_integration() {
     
     engine.upsert_memory_with_id(id.to_string(), content.to_string(), vec!["type:incident".to_string()], None, false);
 
-    queue.enqueue(Job::LlmProposeCues {
+    queue.enqueue(Job::ProposeCues {
         project_id: "default".to_string(),
         memory_id: id.to_string(),
         content: content.to_string(),

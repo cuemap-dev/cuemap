@@ -14,11 +14,14 @@ use uuid::Uuid;
 
 #[derive(Debug)]
 pub enum Job {
-    LlmProposeCues { project_id: String, memory_id: String, content: String },
+    ProposeCues { project_id: String, memory_id: String, content: String },
     TrainLexiconFromMemory { project_id: String, memory_id: String },
     ProposeAliases { project_id: String },
     ExtractAndIngest { project_id: String, memory_id: String, content: String, file_path: String },
     VerifyFile { project_id: String, file_path: String, valid_memory_ids: Vec<String> },
+    UpdateGraph { project_id: String, memory_id: String },
+    ReinforceMemories { project_id: String, memory_ids: Vec<String>, cues: Vec<String> },
+    ReinforceLexicon { project_id: String, memory_ids: Vec<String>, cues: Vec<String> },
 }
 
 pub struct JobQueue {
@@ -165,80 +168,233 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>) {
                         return;
                     }
                     
-                    // Upsert into lexicon
-                    // For each canonical cue in memory.cues
-                    for canonical_cue in &memory.cues {
-                         if !is_lexicon_trainable(canonical_cue) {
-                             continue;
-                         }
-                         
-                         let lex_id = format!("cue:{}", canonical_cue);
-                         
-                         // The memory content in lexicon is the canonical cue string
-                         // The cues in lexicon are the tokens
-                         ctx.lexicon.upsert_memory_with_id(
-                             lex_id, 
-                             canonical_cue.clone(), 
-                             tokens.clone(), 
-                             None,
-                             false
-                         );
+                    let mut identity_count = 0;
+                    let mut synonym_count = 0;
+                    let mut sample_synonyms: Vec<String> = Vec::new();
+                    
+                    // REFACTOR: Avoid global N^2 association (pollution).
+                    // Instead of associating ALL tokens with ALL cues, we:
+                    // 1. Associate each token with ITSELF (Identity).
+                    // 2. Associate each token with its DIRECT synonyms (WordNet).
+                    // This ensures "favorite" predicts "dearie", but "favorite" does NOT predict "ample" (from "stuffed").
+                    
+                    for token in &tokens {
+                        if !is_lexicon_trainable(&token) {
+                            continue;
+                        }
+
+                        // 1. Train Identity: Token -> Token
+                        let lex_id = format!("cue:{}", token);
+                        ctx.lexicon.upsert_memory_with_id(
+                            lex_id.clone(),
+                            token.clone(),
+                            vec![token.clone()], // Triggered by itself
+                            None,
+                            false
+                        );
+                        identity_count += 1;
+
+                        // 2. Train Synonyms: Token -> Synonym
+                        // We use the SemanticEngine to find what this token expands to.
+                        // These are valid cues that should be triggered by this token.
+                        let expanded = ctx.semantic_engine.expand_wordnet(&token, &[token.clone()], 0.65, 3);
+                        
+                        for synonym in expanded {
+                            if !is_lexicon_trainable(&synonym) {
+                                continue;
+                            }
+                            // Upsert: Synonym triggered by Token
+                            let syn_id = format!("cue:{}", synonym);
+                            ctx.lexicon.upsert_memory_with_id(
+                                syn_id,
+                                synonym.clone(),
+                                vec![token.clone()],
+                                None,
+                                false
+                            );
+                            synonym_count += 1;
+                            if sample_synonyms.len() < 5 {
+                                sample_synonyms.push(format!("{}->{}", token, synonym));
+                            }
+                        }
+                    }
+                    
+                    // Log summary
+                    if identity_count > 0 || synonym_count > 0 {
+                        let sample_str = if !sample_synonyms.is_empty() {
+                            format!(" (e.g. {})", sample_synonyms.join(", "))
+                        } else {
+                            String::new()
+                        };
+                        info!("Job: Lexicon trained {} identity + {} synonym mappings for memory {}{}", 
+                            identity_count, synonym_count, memory_id, sample_str);
                     }
                 }
             }
         }
-        Job::LlmProposeCues { project_id, memory_id, content } => {
-             // 1. Check if LLM is configured
-             if let Some(config) = LlmConfig::from_env() {
-                 info!("Job: Calling LLM for memory {} in project {}", memory_id, project_id);
+        Job::ProposeCues { project_id, memory_id, content } => {
+             if let Some(ctx) = provider.get_project(&project_id) {
+                 info!("Job: Proposing cues for memory {} in project {} (strategy: {:?})", memory_id, project_id, ctx.cuegen_strategy);
                  
-                 let known_cues = if let Some(ctx) = provider.get_project(&project_id) {
-                     ctx.resolve_cues_from_text(&content)
-                 } else {
-                     Vec::new()
-                 };
+                 // 1. Resolve known cues (Lexicon recall)
+                 let (mut known_cues, _) = ctx.resolve_cues_from_text(&content);
+                 
+                 // 2. Bootstrap if needed (for static strategies to have something to expand)
+                 // If we have very few cues, add raw tokens to allow expansion
+                 if known_cues.len() < 3 {
+                     let tokens = crate::nl::tokenize_to_cues(&content);
+                     // Take top key phrases/tokens
+                     for token in tokens.into_iter().take(10) {
+                         if !known_cues.contains(&token) {
+                             known_cues.push(token);
+                         }
+                     }
+                 }
+                 
+                 // Track cues by source for detailed logging
+                 let mut wordnet_cues: Vec<String> = Vec::new();
+                 let mut glove_cues: Vec<String> = Vec::new();
+                 let mut context_cues: Vec<String> = Vec::new();
+                 let mut llm_cues: Vec<String> = Vec::new();
+                 
+                 // IDF Filtering: Identify expansion candidates (rare cues only)
+                 let total = ctx.total_memories();
+                 // Threshold: 10% of corpus, minimum 20 memories.
+                 let threshold = (total as f64 * 0.1).max(20.0) as usize;
 
-                 // 2. Call LLM
-                 match propose_cues(&content, &config, &known_cues).await {
-                     Ok(proposed_cues) => {
-                         if let Some(ctx) = provider.get_project(&project_id) {
-                             // 3. Normalize & Validate
-                             let mut normalized_cues = Vec::new();
-                             for cue in proposed_cues {
-                                 let (normalized, _) = normalize_cue(&cue, &ctx.normalization);
-                                 normalized_cues.push(normalized);
-                             }
-                             
-                             let report = validate_cues(normalized_cues, &ctx.taxonomy);
-                             
-                             // 4. Attach accepted cues
-                             if !report.accepted.is_empty() {
-                                 ctx.main.attach_cues(&memory_id, report.accepted.clone());
-                                 info!("Job: Attached {} cues to memory {}", report.accepted.len(), memory_id);
-                                 
-                                 // 5. Retrain lexicon with new cues
-                                 let tokens = crate::nl::tokenize_to_cues(&content);
-                                 if !tokens.is_empty() {
-                                     for canonical_cue in report.accepted {
-                                         if !is_lexicon_trainable(&canonical_cue) {
-                                             continue;
-                                         }
-                                         
-                                         let lex_id = format!("cue:{}", canonical_cue);
-                                         ctx.lexicon.upsert_memory_with_id(
-                                             lex_id, 
-                                             canonical_cue, 
-                                             tokens.clone(), 
-                                             None,
-                                             false
-                                         );
-                                     }
-                                 }
+                 // PERF/QUALITY: Use raw tokens for expansion to avoid Lexicon Pollution loop.
+                 // We only expand what is explicitly in the content.
+                 // Filter by IDF to skip common words (e.g. "the").
+                 let tokens = crate::nl::tokenize_to_cues(&content);
+                 let expansion_candidates: Vec<String> = tokens.iter()
+                     .filter(|c| ctx.get_cue_frequency(c) <= threshold)
+                     .cloned()
+                     .collect();
+                 
+                 
+                 // 3. Static Semantic Expansion (Always on - WordNet)
+                 let wn_result = ctx.semantic_engine.expand_wordnet(&content, &expansion_candidates, 0.65, 3);
+                 wordnet_cues.extend(wn_result);
+                 
+                // 4. Strategy Specific Expansion
+                match ctx.cuegen_strategy {
+                    CueGenStrategy::Default => {
+                        // Minimal strategy: Only WordNet (handled below always-on)
+                        // No extra expansion.
+                    },
+                    CueGenStrategy::Glove => {
+                        // GloVe Expansion (Nearest Neighbors of Cues)
+                        let glove_result = ctx.semantic_engine.expand_glove(&content, &expansion_candidates);
+                        glove_cues.extend(glove_result);
+                        
+                        // Global Context Expansion (Nearest Neighbors of Context Vector)
+                        let context_result = ctx.semantic_engine.expand_global_context(&content);
+                        context_cues.extend(context_result);
+                    },
+                     CueGenStrategy::Ollama | CueGenStrategy::Openai | CueGenStrategy::Google => {
+                         // LLM Expansion
+                         if let Some(config) = LlmConfig::from_strategy(&ctx.cuegen_strategy) {
+                             match propose_cues(&content, &config, &known_cues).await {
+                                 Ok(result) => llm_cues.extend(result),
+                                 Err(e) => error!("Job: LLM failed: {}", e),
                              }
                          }
-                     },
-                     Err(e) => {
-                         error!("Job: LLM failed: {}", e);
+                     }
+                 }
+                 
+                 // Log source breakdown before normalization
+                 let log_sample = |name: &str, cues: &[String]| {
+                     if !cues.is_empty() {
+                         let sample: Vec<_> = cues.iter().take(5).collect();
+                         let suffix = if cues.len() > 5 { format!(" (+{} more)", cues.len() - 5) } else { String::new() };
+                         info!("  └─ {}: {:?}{}", name, sample, suffix);
+                     }
+                 };
+                 
+                 log_sample("WordNet", &wordnet_cues);
+                 log_sample("GloVe", &glove_cues);
+                 log_sample("Context", &context_cues);
+                 log_sample("LLM", &llm_cues);
+                 
+
+                 
+                 // Merge all proposed cues with deduplication and filtering
+                 let mut seen = HashSet::new();
+                 let mut proposed_cues = Vec::new();
+                 
+                 let filter_and_add = |cues: Vec<String>, seen: &mut HashSet<String>, out: &mut Vec<String>| {
+                     for cue in cues {
+                         let lower = cue.to_lowercase();
+
+                         // Skip very short cues
+                         if lower.len() < 3 {
+                             continue;
+                         }
+                         // Skip duplicates
+                         if seen.contains(&lower) {
+                             continue;
+                         }
+                         seen.insert(lower);
+                         out.push(cue);
+                     }
+                 };
+                 
+                 filter_and_add(wordnet_cues, &mut seen, &mut proposed_cues);
+                 filter_and_add(glove_cues, &mut seen, &mut proposed_cues);
+                 filter_and_add(context_cues, &mut seen, &mut proposed_cues);
+                 filter_and_add(llm_cues, &mut seen, &mut proposed_cues);
+                 
+                 // Cap total proposed cues to prevent explosion
+                 const MAX_PROPOSED_CUES: usize = 10;
+                 if proposed_cues.len() > MAX_PROPOSED_CUES {
+                     proposed_cues.truncate(MAX_PROPOSED_CUES);
+                     debug!("Job: Truncated proposed cues to {}", MAX_PROPOSED_CUES);
+                 }
+                 
+                 // 5. Merge, Normalize & Validate
+                 let mut normalized_cues = Vec::new();
+                 for cue in proposed_cues {
+                     let (normalized, _) = normalize_cue(&cue, &ctx.normalization);
+                     normalized_cues.push(normalized);
+                 }
+                 
+                 let report = validate_cues(normalized_cues, &ctx.taxonomy);
+                 
+                 // 6. Attach accepted cues
+                 if !report.accepted.is_empty() {
+                     ctx.main.attach_cues(&memory_id, report.accepted.clone());
+                     let sample: Vec<_> = report.accepted.iter().take(8).collect();
+                     let suffix = if report.accepted.len() > 8 { format!(" (+{} more)", report.accepted.len() - 8) } else { String::new() };
+                     info!("Job: Attached {} cues to memory {}: {:?}{}", report.accepted.len(), memory_id, sample, suffix);
+                     
+                     // 7. Retrain lexicon with new cues
+                     let tokens = crate::nl::tokenize_to_cues(&content);
+                     if !tokens.is_empty() {
+                         for canonical_cue in report.accepted {
+                             if !is_lexicon_trainable(&canonical_cue) {
+                                 continue;
+                             }
+                             
+                              let lex_id = format!("cue:{}", canonical_cue);
+                              
+                              // Filter out identity mappings
+                              let filtered_tokens: Vec<String> = tokens.iter()
+                                  .filter(|t| t.as_str() != canonical_cue.as_str() && !canonical_cue.contains(t.as_str()))
+                                  .cloned()
+                                  .collect();
+                                  
+                              if filtered_tokens.is_empty() {
+                                  continue;
+                              }
+
+                              ctx.lexicon.upsert_memory_with_id(
+                                  lex_id, 
+                                  canonical_cue, 
+                                  filtered_tokens, 
+                                  None,
+                                  false
+                              );
+                         }
                      }
                  }
              }
@@ -433,6 +589,32 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>) {
                       }
                   }
              }
+        }
+        Job::UpdateGraph { project_id, memory_id } => {
+            if let Some(ctx) = provider.get_project(&project_id) {
+                if let Some(memory) = ctx.main.get_memories().get(&memory_id) {
+                    let cues = memory.cues.clone();
+                    // Async update of the co-occurrence matrix
+                    ctx.main.update_cue_co_occurrence(&cues);
+                    debug!("Job: Updated graph connectivity for {} cues (memory: {})", cues.len(), memory_id);
+                }
+            }
+        }
+        Job::ReinforceMemories { project_id, memory_ids, cues } => {
+            if let Some(ctx) = provider.get_project(&project_id) {
+                for memory_id in &memory_ids {
+                    ctx.main.reinforce_memory(memory_id, cues.clone());
+                }
+                info!("Job: Reinforced {} memories with {} cues", memory_ids.len(), cues.len());
+            }
+        }
+        Job::ReinforceLexicon { project_id, memory_ids, cues } => {
+            if let Some(ctx) = provider.get_project(&project_id) {
+                for memory_id in &memory_ids {
+                    ctx.lexicon.reinforce_memory(memory_id, cues.clone());
+                }
+                info!("Job: Reinforced {} lexicon entries with {} cues", memory_ids.len(), cues.len());
+            }
         }
     }
 }

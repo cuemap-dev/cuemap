@@ -4,13 +4,12 @@ use std::collections::HashMap;
 #[test]
 fn test_format_validation() {
     let taxonomy = Taxonomy::default();
-    let cues = vec!["valid:cue".to_string(), "invalid".to_string(), "incomplete:".to_string()];
+    let cues = vec!["valid:cue".to_string(), "plain".to_string(), "incomplete:".to_string()];
     let report = validate_cues(cues, &taxonomy);
 
-    assert_eq!(report.accepted, vec!["valid:cue"]);
-    assert_eq!(report.rejected.len(), 2);
-    assert_eq!(report.rejected[0].code, "bad_format");
-    assert_eq!(report.rejected[1].code, "bad_format");
+    assert_eq!(report.accepted, vec!["valid:cue", "plain"]);
+    assert_eq!(report.rejected.len(), 1);
+    assert_eq!(report.rejected[0].code, "bad_format"); // incomplete:
 }
 
 #[test]

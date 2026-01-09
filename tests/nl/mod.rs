@@ -3,9 +3,9 @@ use cuemap_rust::nl::*;
 #[test]
 fn test_tokenizer_basic() {
     let tokens = tokenize_to_cues("The quick brown fox");
-    assert!(tokens.contains(&"tok:quick".to_string()));
-    assert!(tokens.contains(&"tok:fox".to_string()));
-    assert!(tokens.contains(&"phr:quick_brown".to_string()));
+    assert!(tokens.contains(&"quick".to_string()));
+    assert!(tokens.contains(&"fox".to_string()));
+    assert!(tokens.contains(&"quick_brown".to_string()));
 }
 
 #[test]

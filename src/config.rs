@@ -23,3 +23,12 @@ pub const ALIAS_SIZE_SIMILARITY_MAX_RATIO: f64 = 0.10;
 pub const ALIAS_OVERLAP_THRESHOLD: f64 = 0.90;
 pub const ALIAS_SAMPLE_SIZE: usize = 512;
 
+#[derive(Clone, Debug, Default, PartialEq, clap::ValueEnum)]
+pub enum CueGenStrategy {
+    #[default]
+    Default,  // Minimal expansion (WordNet / Synonyms only)
+    Glove,    // Deep semantic expansion (GloVe + WordNet)
+    Ollama,   // Local Ollama with Mistral (+ WordNet)
+    Openai,   // OpenAI ChatGPT (+ WordNet)
+    Google,   // Google Gemini (+ WordNet)
+}
