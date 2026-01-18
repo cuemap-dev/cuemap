@@ -55,6 +55,9 @@ struct Args {
     /// Disable periodic snapshots (for benchmarking)
     #[arg(long, default_value = "false")]
     disable_snapshots: bool,
+    /// Enable autonomous systems consolidation (daily job)
+    #[arg(long, default_value = "false")]
+    enable_consolidation: bool,
 }
 
 #[tokio::main]
@@ -149,11 +152,40 @@ async fn main() {
             warn!("Periodic snapshots and shutdown save are DISABLED (Multi-Tenant).");
         }
     }
+
     
 
     
     let provider: Arc<dyn jobs::ProjectProvider> = mt_engine.clone();
     let job_queue = Arc::new(jobs::JobQueue::new(provider, args.disable_bg_jobs));
+
+    // Start autonomous systems consolidation if enabled
+    if args.enable_consolidation {
+        let engine = mt_engine.clone();
+        let queue = job_queue.clone(); 
+        tokio::spawn(async move {
+            info!("Systems Consolidation: Enabled (running daily)");
+            let mut interval = tokio::time::interval(Duration::from_secs(86400)); // 24 hours
+            // Skip immediate first tick
+            interval.tick().await; 
+            
+            loop {
+                interval.tick().await;
+                info!("Systems Consolidation: Starting daily cycle...");
+                
+                let projects = engine.list_projects();
+                for proj_stats in projects {
+                    let job = jobs::Job::ConsolidateMemories { 
+                        project_id: proj_stats.project_id.clone() 
+                    };
+                    // Enqueue job without blocking
+                    queue.enqueue(job).await;
+                }
+            }
+        });
+    } else {
+        info!("Systems Consolidation: Disabled (default)");
+    }
     
     let mt_engine = mt_engine;
     

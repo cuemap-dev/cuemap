@@ -2,7 +2,7 @@
 
 All notable changes to the CueMap Rust Engine will be documented in this file.
 
-## [0.6.0] - 2026-01-15
+## [0.6.0] - 2026-01-18
 
 ### Added
 - **Embedded Web UI**: A web UI is now embedded into the engine, accessible at `http://localhost:8080/ui`. The UI provides a modern interface to ingest a URL, file or text content, perform recalls and manage your lexicon. It features a physics-based graph visualization of your memory and lexicon.
@@ -11,6 +11,10 @@ All notable changes to the CueMap Rust Engine will be documented in this file.
 - **More formats for Self-Learning Agent**: The engine now supports more formats for self-learning agent, including social media exports from WhatsApp and Instagram, as well as Google Takeout exports of Chrome and YouTube.
 - **Lexicon Management API**: Native support for manual lexicon management.
 - **Relevance Compression for LLMs via Grounded Recall API**: The engine now supports relevance compression for LLMs via grounded recall API, which returns a context string containing related memories to the query while taking into account the token budget given by the user.
+
+### Removed
+- **Single Tenant Mode**: The engine now runs as a multi-tenant application by default, each with its own memory store, lexicons and aliases.
+- **Cue Expansion with Google or OpenAI models**: To keep the deterministic nature of the engine, cue expansion is now only done using WordNet. GloVe and Ollama support exists but is not enabled by default.
 
 
 ---

@@ -677,10 +677,10 @@ impl CueMapEngine {
 
                     *inferred_candidates.entry(inferred_cue.clone()).or_insert(0) += *count;
                 }
+                }
             }
-        }
 
-        // Take top-K inferred cues and inject them with low weight
+            // Take top-K inferred cues and inject them with low weight
             let mut inferred_list: Vec<(String, u64)> = inferred_candidates.into_iter().collect();
             inferred_list.sort_unstable_by(|a, b| b.1.cmp(&a.1));
             

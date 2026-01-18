@@ -6,7 +6,7 @@
 
 CueMap implements a **Continuous Gradient Algorithm** inspired by biological memory:
 
-1.  **Intersection (Context Filter)**: Triangulates relevant memories by overlapping cues (e.g., `service:payments` + `error:500`).
+1.  **Intersection (Context Filter)**: Triangulates relevant memories by overlapping cues
 2.  **Pattern Completion (Associative Recall)**: Automatically infers missing cues from co-occurrence history, enabling recall from partial inputs.
 3.  **Recency & Salience (Signal Dynamics)**: Balances fresh data with salient, high-signal events prioritized by the Amygdala-inspired salience module.
 4.  **Reinforcement (Hebbian Learning)**: Frequently accessed memories gain signal strength, staying "front of mind" even as they age.
@@ -14,9 +14,9 @@ CueMap implements a **Continuous Gradient Algorithm** inspired by biological mem
 
 Built with Rust for maximum performance and reliability.
 
-## Brain-Inspired Advanced Recall (v0.5)
+## Brain-Inspired Advanced Recall
 
-CueMap v0.5 introduces deep biological inspiration into the deterministic recall engine:
+CueMap introduces deep biological inspiration into the deterministic recall engine:
 
 ### Hippocampal Pattern Completion
 Given partial cues, the engine recalls the whole memory by maintaining an incremental cue co-occurrence matrix. This expansion happens strictly at retrieval-time and can be toggled off via `disable_pattern_completion: true` for pure deterministic matching.
@@ -33,14 +33,9 @@ Old, highly overlapping memories are periodically merged into summarized "gist" 
 ### Match Integrity
 Every recall result now includes a **Match Integrity** score. This internal diagnostic combines intersection strength, reinforcement history, and context agreement to tell you how structurally reliable a specific recall result is.
 
-### Global Context Expansion (New)
-The engine automatically computes a **Global Context Vector** for each memory using **GloVe Embeddings**. It calculates the mean embedding vector of the content and uses k-NN search to infer related semantic cues (e.g., "server crash" -> "outage"). This removes the need for explicit synonym tagging.
-
 ### Semantic Bootstrapping (WordNet & Thesaurus)
-To bridge the gap between user queries and stored memories, CueMap integrates **WordNet** and **Thesaurus** lookups during cue generation. This allows the engine to propose synonym-rich cues, ensuring that a memory tagged with "payment" is retrievable via "transaction" or "billing".
+To bridge the gap between user queries and stored memories, CueMap integrates **WordNet** lookups during cue generation. This allows the engine to propose synonym-rich cues, ensuring that a memory tagged with "payment" is retrievable via "transaction" or "billing".
 
-### Double Indexing (New)
-`key:value` cues are indexed under both the full string and the value. This means `name:ComputeTax` is searchable via `ComputeTax` or `tax`, bridging the gap between structured agent/chunker cues and natural language recall.
 
 ## Quick Start
 
@@ -83,13 +78,13 @@ Options:
 
 CueMap includes a lightweight, embedded visualization dashboard with real-time insights.
 
-### Features (v0.6)
+### Features
 
 - **Live Ingestion Dashboard**: Two-column graph view showing Memory and Lexicon growth in real-time with auto-refresh.
 - **Synapse Graph**: Force-directed graph visualization with auto-zoom-to-fit. Nodes represent memories and cues; edges show co-occurrence.
 - **Real-Time Inspector**: Debug queries, view score breakdowns, and inspect raw memory content.
-- **Project Selector**: Switch between projects via header dropdown (persists via URL query params).
-- **Stats Overlay**: Memory and cue counts displayed as translucent overlays on graph views.
+- **Lexicon Management**: Manually wire the "brain" with new cue connections or unwire cues that are no longer related.
+- **Project Selector**: Switch between projects via header dropdown
 
 Access it directly at: `http://localhost:8080/ui` (requires running with `--features ui`)
 
@@ -99,7 +94,7 @@ Run the UI separately from the engine for faster iteration:
 
 ```bash
 # Terminal 1: Run Rust Engine
-cargo run -- --data-dir ./data
+cargo run
 
 # Terminal 2: Run Vite Dev Server (hot-reloading)
 cd web_ui && npm run dev
@@ -110,13 +105,13 @@ The Vite config proxies all API requests to the engine on port 8080.
 
 ## Self-Learning Agent (Zero-Friction Ingestion)
 
-CueMap v0.5 includes a **Self-Learning Agent** that automatically watches local directories, extracts structured "facts", and ingests them into your memory store.
+CueMap includes a **Self-Learning Agent** that automatically watches local directories, extracts structured "facts", and ingests them into your memory store.
 
 ### Automated Bootstrapping
 
 On startup, if `--agent-dir` is provided, CueMap initializes the **Self-Learning Agent**.
-1.  **Internal Engine (Fast)**: Uses the built-in Semantic Engine (GloVe/WordNet) for rapid cue generation.
-2.  **Ollama Integration (Deep)**: If `LLM_ENABLED=true` (default for Agent), it ensures Ollama/Mistral is ready for deep fact extraction from documents.
+1.  **Internal Engine (Fast)**: Uses the built-in Semantic Engine (WordNet) for rapid cue generation.
+2.  **Ollama Integration (Deep)**: If `LLM_ENABLED=true`, it ensures Ollama is ready with chosen model for deep fact extraction from documents.
 3.  **Real-Time Watching**: Monitors for file creations and modifications.
 
 ### Example
@@ -129,11 +124,10 @@ On startup, if `--agent-dir` is provided, CueMap initializes the **Self-Learning
 # 1. Structural Chunking (Python, Rust, JS/TS, Go, Java, PHP, HTML, CSS).
 #    - Recursive tree-sitter extraction captures 'name:Calculator', 'selector:.btn', etc.
 # 2. Document & Data Parsing (PDF, Word, Excel, JSON, CSV, YAML, XML).
-#    - Extracts headers, keys, and metadata as grounded structural cues.
-# 3. LLM Fact Extraction to propose semantic cues like 'topic:auth'.
-# 4. Immediate ingestion into the memory store.
+#    - Extracts headers, keys, and metadata as grounded structural cues, in addition to cues inferred from content.
+# 3. LLM Fact Extraction (optional) to propose semantic cues.
+# 4. Immediate ingestion into the memory store. 
 ```
-
 
 ## Project Management & Persistence
 
@@ -166,7 +160,6 @@ curl -X POST http://localhost:8080/memories \
 
 # Stop server (Ctrl+C) - auto-saves all projects
 # Restart server - auto-loads all projects
-
 # Data persists across restarts!
 ```
 
@@ -177,7 +170,7 @@ Snapshots are automatically managed:
 - **Loaded**: On server startup
 - **Location**: `./data/snapshots/` (configurable via `--data-dir`)
 - **Format**: Bincode binary
-- **Files**: `{project-id}.bin` (one file per project)
+- **Files**: `{project-id}.bin`, `{project-id_lexicon}.bin`, `{project-id_aliases}.bin`
 
 ## Authentication
 
@@ -214,27 +207,6 @@ curl -H "X-API-Key: wrong-key" -H "X-Project-ID: default" http://localhost:8080/
 ```
 
 ### SDK Usage
-
-#### Python (LangChain Integration)
-
-Official support for LangChain is now available via `langchain-cuemap`.
-
-```bash
-pip install langchain-cuemap
-```
-
-```python
-from cuemap.langchain import CueMapStore
-
-# Drop-in replacement for any VectorStore
-store = CueMapStore(
-    url="http://localhost:8080",
-    # api_key="...", # optional
-)
-
-store.add_texts(["The payment gateway is down."], metadatas=[{"source": "slack"}])
-results = store.similarity_search("billing failure")
-```
 
 #### Standard SDKs
 
@@ -312,28 +284,12 @@ Tested on realistic workloads with Zipfian distribution (80% of operations hit 2
 - ✅ **5 GB RAM for 10M memories** (production-tested)
 - ✅ **Linear scaling** with dataset size
 
-### Correctness Tests
-
-Validated on 120+ test scenarios:
-- ✅ **Recency**: 30/30 (100%) - Recent memories prioritized
-- ✅ **Intersection**: 30/30 (100%) - Multi-cue matching works
-- ✅ **Reinforcement**: 20/20 (100%) - Move-to-front operation
-- ✅ **Multi-Cue**: 20/20 (100%) - Complex queries
-- ✅ **Noise Filtering**: 20/20 (100%) - Irrelevant memories filtered
-
-### Concurrent Performance
-
-Stress tested with 400+ parallel operations:
-- ✅ **100% success rate** under concurrent load
-- ✅ **100% recall accuracy** with parallel reads/writes
-- ✅ **Lock-free operations** with DashMap
-
 ## Architecture
 
 ### Core Components
 
 - **Axum**: Minimal overhead async web framework
-- **DashMap**: Lock-free concurrent hash map (32 shards)
+- **DashMap**: Lock-free concurrent hash map (128 shards)
 - **IndexSet**: O(1) move-to-front operations
 - **Bincode**: Fast binary serialization for persistence
 
@@ -348,17 +304,17 @@ Stress tested with 400+ parallel operations:
 
 ### LLM Integration
 
-CueMap can automatically propose cues for your memories using **LLMs** or **Semantic Engine**.
+CueMap can automatically propose cues for your memories using **Semantic Engine** or **LLMs**
 
 #### Built-in Semantic Engine (Default)
 
-**No LLM required!** By default, CueMap uses its internal **Semantic Engine** (GloVe + WordNet) and **Global Context** to generate cues instantly.
+**No LLM required!** By default, CueMap uses its internal **Semantic Engine** (WordNet) and **Global Context** to generate cues instantly.
 
 ```bash
 # 1. Start CueMap (no Ollama needed)
 ./target/release/cuemap-rust
 
-# 2. Add memory
+# 2. Add memory in natural language
 curl -X POST http://localhost:8080/memories \
   -H "X-Project-ID: default" \
   -H "Content-Type: application/json" \
@@ -366,38 +322,23 @@ curl -X POST http://localhost:8080/memories \
     "content": "The payments service is down due to a timeout.",
     "cues": []
   }'
-# Internal Engine proposes: ["payment", "timeout", "outage", "failure"]
+# Internal Engine proposes: ["payment", "service", "timeout", "outage", "failure", "payment_service", ...]
 ```
 
 #### Optional: Local LLM (Ollama)
 
-For deeper reasoning or document summarization (especially with the Agent), you can enable Ollama:
+For deeper reasoning or document summarization, you can enable Ollama:
 
 **Configuration**:
-- `CUE_GEN_STRATEGY=default` (Uses internal Semantic Engine. Set to `ollama` or `openai` to force LLM usage).
-- `LLM_ENABLED=true` (Required for Agent fact extraction. Default for agent: true).
+- `CUE_GEN_STRATEGY=default` (Uses internal Semantic Engine. Set to `ollama` to force LLM usage).
+- `LLM_ENABLED=true|false` (Default: false)
 - `LLM_PROVIDER=ollama` (Default *if* LLM Strategy is selected).
 - `OLLAMA_URL=http://localhost:11434` (default)
 
-#### Cloud LLMs (Bring Your Own Key)
 
-##### OpenAI
-```bash
-export LLM_PROVIDER=openai
-export LLM_MODEL=gpt-3.5-turbo
-export LLM_API_KEY=your-key
-./target/release/cuemap-rust
-```
+## API Reference
 
-##### Google Gemini
-```bash
-export LLM_PROVIDER=google
-export LLM_MODEL=gemini-1.5-flash
-export LLM_API_KEY=your-key
-./target/release/cuemap-rust
-```
-
-### Add Memory (with Async NL & LLM)
+### Add Memory
 
 ```bash
 # Basic manual cues
@@ -428,8 +369,7 @@ curl -X POST http://localhost:8080/recall \
   -H "Content-Type: application/json" \
   -d '{
     "cues": ["api", "rate_limit"],
-    "limit": 10,
-    "auto_reinforce": false
+    "limit": 10
   }'
 ```
 
@@ -456,6 +396,7 @@ curl -X PATCH http://localhost:8080/memories/{id}/reinforce \
     "cues": ["important", "urgent"]
   }'
 ```
+Reinforcement is used to boost the relevance of a memory. It is a way to tell CueMap that a memory is important and should be recalled more often. It's on by default but you can manually reinforce a memory through API.
 
 ### Get Memory
 
@@ -501,9 +442,88 @@ curl -X POST http://localhost:8080/aliases/merge \
 curl -H "X-Project-ID: default" "http://localhost:8080/aliases?cue=service:payment"
 ```
 
-### Relevance Compression Engine (v0.5)
+### Project Management
 
-The "Hallucination Guardrail" module. Deterministically greedy-fills a token budget with the highest-scoring memories and produces a verifiable context block for LLM prompt injection.
+#### Create Project
+```bash
+curl -X POST http://localhost:8080/projects \
+  -H "Content-Type: application/json" \
+  -d '{"project_id": "my-project"}'
+```
+
+#### List Projects
+```bash
+curl http://localhost:8080/projects
+```
+
+#### Delete Project
+```bash
+curl -X DELETE "http://localhost:8080/projects/default"
+```
+
+### Lexicon Management
+
+#### Inspect Cue
+View incoming (tokens mapping to this cue) and outgoing (synonyms/hypernyms) edges.
+```bash
+curl "http://localhost:8080/lexicon/inspect/service:payment"
+```
+
+#### Wire Token (Manual Connection)
+Manually connect a token to a canonical cue.
+```bash
+curl -X POST http://localhost:8080/lexicon/wire \
+  -H "Content-Type: application/json" \
+  -d '{
+    "token": "stripe",
+    "canonical": "service:payment"
+  }'
+```
+
+#### Unwire/Delete Entry
+Remove a specific token from the lexicon.
+```bash
+curl -X DELETE "http://localhost:8080/lexicon/entry/cue:stripe"
+```
+
+#### View Synonyms
+Get all synonyms for a cue.
+```bash
+curl "http://localhost:8080/lexicon/synonyms/service:payment"
+```
+
+### Ingestion
+
+#### Ingest URL
+Extract content from a web page and ingest it.
+```bash
+curl -X POST http://localhost:8080/ingest/url \
+  -H "X-Project-ID: default" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://example.com"
+  }'
+```
+
+#### Ingest Raw Content
+Ingest text directly, simulating a file.
+```bash
+curl -X POST http://localhost:8080/ingest/content \
+  -H "X-Project-ID: default" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "content": "The quick brown fox jumps over the lazy dog.",
+    "filename": "fox.txt"
+  }'
+```
+
+#### Ingest File (Multipart)
+Upload a file for processing by the Agent (supports Text, PDF, JSON, etc. if Agent is configured).
+```bash
+curl -X POST http://localhost:8080/ingest/file \
+  -H "X-Project-ID: default" \
+  --form "file=@/path/to/document.pdf"
+```
 
 #### Grounded Recall (Budgeted)
 
@@ -517,6 +537,8 @@ curl -X POST http://localhost:8080/recall/grounded \
     "limit": 10
   }'
 ```
+
+The "Hallucination Guardrail" module. Deterministically greedy-fills a token budget with the highest-scoring memories and produces a verifiable context block for LLM prompt injection.
 
 **Response**:
 ```json
@@ -546,194 +568,204 @@ The `verified_context` block is signed using HMAC-SHA256 (key: `CUEMAP_SECRET_KE
 
 ## System Architecture
 
-### High-Level Overview
+### 1. High-Level Overview
 
 ```mermaid
 graph TB
-    subgraph "Ingestion & Integration"
-        CLIENT[Client APIs/SDKs]
-        AGENT[Self-Learning Agent<br/>FS Watcher + Chunker]
+    subgraph "Clients"
+        SDK[Python/TS SDKs]
+        CURL[HTTP Clients]
+        UI[Web UI]
     end
     
-    subgraph "API & Security"
-        API[Axum HTTP Server]
-        AUTH[Authentication]
+    subgraph "API Layer"
+        AXUM[Axum HTTP Server]
+        AUTH[Auth Middleware]
     end
     
-    subgraph "Core Engines (v0.5 Brain-Inspired)"
-        MAIN[Main Engine<br/>Patterns + Salience + Consolidation]
-        LEXICON[Lexicon Engine<br/>Token → Cue Mapping]
-        ALIASES[Alias Engine<br/>Synonym Definitions]
+    subgraph "Multi-Tenant Core"
+        MT[MultiTenantEngine]
+        MAIN[CueMap Engine<br/>DashMap + IndexSet]
+        LEX[Lexicon Engine<br/>Token → Cue]
+        ALIAS[Alias Engine<br/>Synonyms]
     end
     
-    subgraph "Intelligence Layer"
-        JOBS[Job Queue]
-        SEMANTIC[**Semantic Engine**<br/>GloVe + WordNet + Thesaurus]
-        LLM[Optional LLM<br/>Ollama/OpenAI]
-        NORM[Normalization]
-        TAX[Taxonomy Validator]
+    subgraph "Background Processing"
+        QUEUE[Job Queue<br/>MPSC 1000]
+        SESSION[Session Manager<br/>Buffered Ingestion]
+        SCHED[Scheduler<br/>24h Consolidation]
     end
     
-    subgraph "Storage"
-        PERSIST[Persistence Layer<br/>Bincode Snapshots]
+    subgraph "Intelligence"
+        NL[NL Tokenizer<br/>Lemmatization + RAKE]
+        SEMANTIC[Semantic Engine<br/>WordNet]
+        LLM[Optional LLM<br/>Ollama]
     end
     
-    CLIENT -->|HTTP| AUTH
-    AGENT -->|Job: ExtractAndIngest| JOBS
-    AUTH -->|Validated| API
-    API -->|Write/Query| MAIN
-    API -->|Enqueue Jobs| JOBS
+    subgraph "Persistence"
+        PERSIST[Bincode Snapshots]
+    end
     
-    MAIN -.->|Auto-save| PERSIST
-    PERSIST -.->|Load on Start| MAIN
+    SDK --> AXUM
+    CURL --> AXUM
+    UI --> AXUM
+    AXUM --> AUTH --> MT
     
-    JOBS -->|Train Lexicon| LEXICON
-    JOBS -->|Propose Cues| LLM
-    JOBS -->|Discover Aliases| ALIASES
+    MT --> MAIN
+    MT --> LEX
+    MT --> ALIAS
     
-    API -->|Resolve NL Text| LEXICON
-    API -->|Expand Cues| ALIASES
+    AXUM --> QUEUE
+    SESSION --> QUEUE
+    SCHED -.-> QUEUE
     
-    LLM -->|Proposed Cues| NORM
-    NORM -->|Validated| TAX
-    TAX -->|Accepted| MAIN
+    QUEUE --> SEMANTIC
+    QUEUE --> LLM
+    QUEUE --> LEX
+    
+    MAIN <-.-> PERSIST
+    LEX <-.-> PERSIST
     
     style MAIN fill:#4CAF50
-    style LEXICON fill:#2196F3
-    style ALIASES fill:#FF9800
-    style JOBS fill:#9C27B0
-    style AGENT fill:#E91E63
+    style LEX fill:#2196F3
+    style ALIAS fill:#FF9800
+    style QUEUE fill:#9C27B0
 ```
 
-### Write Flow (Add Memory)
+### 2. Write Flow (POST /memories)
 
 ```mermaid
 sequenceDiagram
-    participant Client
-    participant API
-    participant Norm as Normalization
+    participant C as Client
+    participant API as API Handler
+    participant NL as NL Tokenizer
+    participant Norm as Normalizer
     participant Tax as Taxonomy
-    participant Main as Main Engine
-    participant Jobs as Job Queue
-    participant Lex as Lexicon
-    participant LLM
+    participant Main as CueMap Engine
+    participant Q as Job Queue
     
-    Client->>API: POST /memories<br/>{content, cues}
+    C->>API: POST /memories<br/>{content, cues[]}
     
-    API->>Norm: Normalize cues
-    Norm-->>API: Normalized cues
+    alt cues[] is empty
+        API->>NL: tokenize_to_cues(content)
+        NL-->>API: ["payment", "timeout", ...]
+    end
     
-    API->>Tax: Validate cues
-    Tax-->>API: {accepted, rejected}
+    API->>Norm: normalize_cue(each)
+    Norm-->>API: normalized cues
     
-    API->>Main: Add memory<br/>(Temporal Chunking Applied)
+    API->>Tax: validate_cues(cues)
+    Tax-->>API: {accepted[], rejected[]}
+    
+    API->>Main: add_memory(content, accepted)
     Main-->>API: memory_id
     
-    API-->>Client: 200 OK {id, status}
-    Note over Client,API: ✅ Fast synchronous response
+    API-->>C: 200 {id, cues, latency_ms}
+    Note over C,API: ✅ Synchronous ~1ms
     
-    par Background Processing
-        API->>Jobs: Enqueue TrainLexicon
-        API->>Jobs: Enqueue LlmProposeCues
-        Note over Main: Systems Consolidation check
+    par Buffered Background Jobs
+        API->>Q: Buffer ProposeCues
+        API->>Q: Buffer TrainLexicon
+        API->>Q: Buffer UpdateGraph
     end
     
-    Note over Jobs,LLM: ⏳ Asynchronous intelligence
-    
-    Jobs->>Lex: Tokenize content<br/>Link tokens → cues
-    Lex-->>Jobs: Updated
-    
-    Jobs->>LLM: Analyze content
-    LLM-->>Jobs: Proposed cues
-    
-    Jobs->>Norm: Normalize proposed
-    Jobs->>Tax: Validate proposed
-    Jobs->>Main: Attach accepted cues
+    Note over Q: Jobs processed after<br/>ingestion session completes
 ```
 
-### Read Flow (Recall)
+### 3. Read Flow (POST /recall)
 
 ```mermaid
 sequenceDiagram
-    participant Client
-    participant API
+    participant C as Client
+    participant API as API Handler
     participant Lex as Lexicon
     participant Alias as Alias Engine
-    participant Main as Main Engine
+    participant Main as CueMap Engine
+    participant Q as Job Queue
     
-    Client->>API: POST /recall<br/>{query_text?, cues?, explain?}
+    C->>API: POST /recall<br/>{query_text?, cues[], limit}
     
-    alt Natural Language Query
-        API->>Lex: Resolve tokens to cues
-        Lex-->>API: ["service:payment", "error:timeout"]
+    alt query_text provided
+        API->>Lex: resolve_cues_from_text(query)
+        Lex-->>API: resolved_cues[]
     end
     
-    API->>API: Normalize & Deduplicate
+    API->>API: Merge & Normalize cues
     
-    API->>Alias: Expand cues with aliases
-    Alias-->>API: Weighted cue list
+    API->>Alias: expand_query_cues(cues)
+    Alias-->>API: weighted_cues[(cue, weight)]
     
-    API->>Main: Recall weighted (Salience Bias applied)
+    API->>Main: recall_weighted(cues, limit, options)
+    Main->>Main: Pattern Completion (CA3)
+    Main->>Main: Salience Bias
+    Main->>Main: Score & Rank
     
-    Main->>Main: 1. Gather candidates (Selective Set Intersection)
-    Main->>Main: 2. Pattern Completion (Hippocampal CA3 expansion)
-    Main->>Main: 3. Final Scoring (Intersection + Recency + Reinforcement)
+    Main-->>API: RecallResult[]
     
-    Main-->>API: Scored results + Match Integrity + Explain?
+    opt auto_reinforce = true
+        API->>Q: Enqueue ReinforceMemories
+        API->>Q: Enqueue ReinforceLexicon
+    end
     
-    API-->>Client: {results, explain, engine_latency}
-    
-    Note over Client,Main: ✅ Sub-millisecond P99 latency
+    API-->>C: {results, explain?, latency_ms}
+    Note over C,Main: ✅ P99 < 1ms
 ```
 
-### Background Job Pipeline
+### 4. Background Job Pipeline
 
 ```mermaid
-graph LR
-    subgraph "Manual & Event Triggers"
-        J1[TrainLexicon]
-        J2[LlmProposeCues]
-        J3[ProposeAliases]
-        J4["Ingest & Verify (Agent)"]
+graph TB
+    subgraph "Job Sources"
+        WRITE[POST /memories]
+        RECALL[POST /recall]
+        AGENT[Self-Learning Agent]
+        TIMER[24h Scheduler]
     end
     
-    subgraph "Job Queue"
-        Q[MPSC Channel<br/>1000 capacity]
+    subgraph "Job Types"
+        J1[ProposeCues]
+        J2[TrainLexiconFromMemory]
+        J3[UpdateGraph]
+        J4[ReinforceMemories]
+        J5[ReinforceLexicon]
+        J6[ProposeAliases]
+        J7[ExtractAndIngest]
+        J8[VerifyFile]
+        J9[ConsolidateMemories]
     end
     
-    subgraph "Worker Logic"
-        W[Async Worker Task]
+    subgraph "Processing"
+        SESSION[Session Manager<br/>Buffers during ingestion]
+        QUEUE[MPSC Queue<br/>Async Worker]
     end
     
-    subgraph "Engine Side-Effects"
-        O1[Lexicon Updated]
-        O2[Cues Attached]
-        O3[Aliases Proposed]
-        O4[Prune Stale Memories]
+    subgraph "Side Effects"
+        E1[Lexicon Trained]
+        E2[Cues Attached]
+        E3[Graph Updated]
+        E4[Memories Reinforced]
+        E5[Overlaps Merged]
+        E6[Aliases Discovered]
     end
     
-    J1 -->|Enqueue| Q
-    J2 -->|Enqueue| Q
-    J3 -->|Enqueue| Q
-    J4 -->|Enqueue| Q
+    WRITE --> J1 & J2 & J3
+    RECALL --> J4 & J5
+    AGENT --> J7 & J8
+    TIMER --> J9
     
-    Q -->|Dequeue| W
+    J1 & J2 & J3 --> SESSION
+    SESSION --> QUEUE
+    J4 & J5 & J6 --> QUEUE
+    J7 & J8 --> QUEUE
+    J9 --> QUEUE
     
-    W -->|Execute| O1
-    W -->|Execute| O2
-    W -->|Execute| O3
-    W -->|Execute| O4
+    QUEUE --> E1 & E2 & E3 & E4 & E5 & E6
     
-    O1 -.->|Used in| NL[NL Query Resolution]
-    O2 -.->|Improves| REC[Recall Accuracy]
-    O3 -.->|Used in| EXP[Cue Expansion]
-    
-    style Q fill:#9C27B0
-    style W fill:#673AB7
-    style O1 fill:#2196F3
-    style O2 fill:#4CAF50
-    style O3 fill:#FF9800
-    style O4 fill:#F44336
+    style QUEUE fill:#9C27B0
+    style SESSION fill:#673AB7
+    style E1 fill:#2196F3
+    style E2 fill:#4CAF50
+    style E5 fill:#F44336
 ```
 
 ## Advanced Capabilities
@@ -905,7 +937,7 @@ Intersection + Recency scoring:
 The Lexicon **adapts to your domain's semantics** automatically. No manual disambiguation rules needed!
 
 ### Weighted Recall & Aliasing
-Not all matches are equal. CueMap v0.5 introduces a sophisticated weighting engine:
+Not all matches are equal. CueMap introduces a sophisticated weighting engine:
 
 *   **Native Aliasing**: Define synonyms like `payments-service` → `service:payments`.
 *   **Weighted Intersection**: Unlike standard tag stores, CueMap calculates scores based on signal strength. A direct cue match counts as 1.0, while an alias might count as 0.85. This ensures that exact terminology always ranks higher than loose synonyms.
@@ -913,11 +945,11 @@ Not all matches are equal. CueMap v0.5 introduces a sophisticated weighting engi
 ### Asynchronous Intelligence Pipeline
 Writes are instantaneous. Intelligence is eventual.
 
-*   **Non-Blocking API**: `POST /memories` returns a success ID immediately.
+*   **Non-Blocking API**: `POST /memories` returns a success ID with basic and cleaned cues.
 *   **Background Jobs**:
-    *   **Normalization**: Inputs are standardized (lowercase, trim, regex rewrites) to prevent data fragmentation.
-    *   **Taxonomy Validation**: Enforces a strictly defined schema (e.g., keys must be `service`, `topic`, `lang`). Garbage in, nothing out.
+    *   **Cue Expansion**: Memory cues are expanded with WordNet synonyms and antonyms.
     *   **LLM Enrichment**: If configured, an LLM (OpenAI/Gemini) analyzes the content in the background to propose additional canonical cues, which are then validated and attached.
+    *   **Lexicon Training**: The Lexicon is trained in the background to learn from the new memories.
     *   **Alias Discovery**: A background scanner periodically analyzes the cue index to find cues with >90% memory overlap (set similarity). If "prod" and "production" point to the same memories, the system proposes "prod" as a weighted alias (0.95) for "production", automatically merging their signal in future searches.
 
 ### Explainable AI
@@ -945,54 +977,7 @@ Debug your search relevance with the `explain=true` flag.
 }
 ```
 
-## Production Features
 
-### Persistence
-
-- **Bincode snapshots**: 10x faster than JSON
-- **Background saves**: Every 60s (configurable)
-- **Atomic writes**: Temp file + rename pattern
-- **Graceful shutdown**: SIGINT/SIGTERM handlers
-
-### Authentication
-
-```bash
-export CUEMAP_API_KEY="your-secret-key"
-./target/release/cuemap-rust
-```
-
-### Multi-Tenancy
-
-```bash
-./target/release/cuemap-rust --multi-tenant
-
-# Use project-specific headers
-curl -X POST http://localhost:8080/memories \
-  -H "X-Project-ID: my-project" ...
-```
-
-## Monitoring
-
-### Health Check
-
-```bash
-curl http://localhost:8080/
-```
-
-### Statistics
-
-```bash
-curl http://localhost:8080/stats | jq .
-```
-
-Returns:
-```json
-{
-  "total_memories": 1000000,
-  "total_cues": 1418,
-  "cues": ["user", "system", "data", ...]
-}
-```
 
 ## License
 

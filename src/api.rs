@@ -58,10 +58,6 @@ pub struct RecallRequest {
     pub disable_salience_bias: bool,
     #[serde(default)]
     pub disable_systems_consolidation: bool,
-    /// When true, uses O(limit) recall_intersection for ~1ms latency.
-    /// No pattern completion, no scoring - just direct index lookup.
-    #[serde(default)]
-    pub fast_mode: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,10 +163,14 @@ pub struct WireLexiconRequest {
     pub canonical: String,
 }
 
-/// Request for POST /ingest/url - ingest content from a URL
 #[derive(Debug, Deserialize)]
 pub struct IngestUrlRequest {
     pub url: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateProjectRequest {
+    pub project_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -195,8 +195,7 @@ pub fn routes(mt_engine: Arc<MultiTenantEngine>, job_queue: Arc<JobQueue>, auth_
         .route("/memories/:id/reinforce", patch(reinforce_memory))
         .route("/memories/:id", get(get_memory).delete(delete_memory))
         .route("/stats", get(get_stats))
-        .route("/projects", get(list_projects))
-
+        .route("/projects", get(list_projects).post(create_project))
         .route("/recall/grounded", post(recall_grounded))
         .route("/projects/:id", delete(delete_project))
         .route("/aliases", post(add_alias).get(get_aliases))
@@ -455,21 +454,16 @@ async fn recall(
                     // Expand aliases (only for original tokens)
                     let expanded_cues = ctx.expand_query_cues(normalized_cues, &original_tokens);
                     
-                    // Use fast O(1) recall when fast_mode is enabled
-                    let results = if req.fast_mode {
-                        ctx.main.recall_intersection(expanded_cues.clone(), req.limit)
-                    } else {
-                        ctx.main.recall_weighted(
-                            expanded_cues.clone(), 
-                            req.limit, 
-                            false,
-                            req.min_intersection,
-                            req.explain,
-                            req.disable_pattern_completion,
-                            req.disable_salience_bias,
-                            req.disable_systems_consolidation
-                        )
-                    };
+                    let results = ctx.main.recall_weighted(
+                        expanded_cues.clone(), 
+                        req.limit, 
+                        false,
+                        req.min_intersection,
+                        req.explain,
+                        req.disable_pattern_completion,
+                        req.disable_salience_bias,
+                        req.disable_systems_consolidation
+                    );
                     
                     let json_results: Vec<serde_json::Value> = results
                         .iter()
@@ -904,6 +898,41 @@ async fn list_projects(
     let EngineState { mt_engine, .. } = state;
     let projects = mt_engine.list_projects();
     (StatusCode::OK, Json(serde_json::json!({ "projects": projects })))
+}
+
+async fn create_project(
+    State(state): State<EngineState>,
+    Json(req): Json<CreateProjectRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let EngineState { mt_engine, read_only, .. } = state;
+    if read_only {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "Read-only mode"})));
+    }
+
+    if !validate_project_id(&req.project_id) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Invalid project ID format"})));
+    }
+
+    // Check if exists first to return 409 Conflict logic if desired, or just idempotent OK
+    // get_or_create_project is idempotent, but we might want to be explicit.
+    // For now, let's just use get_or_create_project and return 200 OK or 201 Created.
+    // Actually, if we want to mimic "create", 201 is good.
+    
+    match mt_engine.get_or_create_project(req.project_id.clone()) {
+        Ok(_) => {
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "status": "created", 
+                    "project_id": req.project_id 
+                })),
+            )
+        },
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": e})),
+        ),
+    }
 }
 
 async fn delete_project(

@@ -22,6 +22,7 @@ pub enum Job {
     UpdateGraph { project_id: String, memory_id: String },
     ReinforceMemories { project_id: String, memory_ids: Vec<String>, cues: Vec<String> },
     ReinforceLexicon { project_id: String, memory_ids: Vec<String>, cues: Vec<String> },
+    ConsolidateMemories { project_id: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,11 +285,16 @@ pub struct JobQueue {
 // Abstraction to access projects regardless of mode
 pub trait ProjectProvider: Send + Sync + 'static {
     fn get_project(&self, project_id: &str) -> Option<Arc<ProjectContext>>;
+    fn save_project(&self, project_id: &str) -> Result<(), String>;
 }
 
 impl ProjectProvider for MultiTenantEngine {
     fn get_project(&self, project_id: &str) -> Option<Arc<ProjectContext>> {
         self.get_project(&project_id.to_string())
+    }
+    
+    fn save_project(&self, project_id: &str) -> Result<(), String> {
+        self.save_project(&project_id.to_string()).map(|_| ())
     }
 }
 
@@ -932,6 +938,21 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>) {
                 debug!("Job: Reinforced {} lexicon entries with {} cues", memory_ids.len(), cues.len());
             }
         }
+        Job::ConsolidateMemories { project_id } => {
+            if let Some(ctx) = provider.get_project(&project_id) {
+                info!("Starting autonomous consolidation for project '{}'", project_id);
+                let merged = ctx.main.consolidate_memories(0.9); // 90% overlap threshold
+                if !merged.is_empty() {
+                        info!("Consolidation: Merged {} overlapping groups in project '{}'", merged.len(), project_id);
+                        // Save snapshot after significant change
+                        if let Err(e) = provider.save_project(&project_id) {
+                            error!("Failed to save project '{}' after consolidation: {}", project_id, e);
+                        }
+                } else {
+                    debug!("Consolidation: No overlapping memories found for '{}'", project_id);
+                }
+            }
+        }
+        }
     }
-}
 

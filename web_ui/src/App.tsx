@@ -18,7 +18,6 @@ function App() {
   const [results, setResults] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
   const [latency, setLatency] = useState(0);
-  const [fastMode, setFastMode] = useState(false);
   const [projectsList, setProjectsList] = useState<any[]>([]);
   const [stats, setStats] = useState<{ total_memories: number; total_cues: number } | null>(null);
 
@@ -54,12 +53,26 @@ function App() {
   const handleCreateProject = () => {
     const id = prompt("Enter new Project ID (alphanumeric, 3-64 chars):");
     if (id && /^[a-zA-Z0-9-_]{3,64}$/.test(id)) {
-      // Optimistically add to list and select it
-      // In multi-tenant mode, project is created on first write, but we can switch context immediately
-      if (!projectsList.some(p => p.project_id === id)) {
-        setProjectsList(prev => [...prev, { project_id: id }]);
-      }
-      handleProjectChange(id);
+      fetch('/projects', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_id: id })
+      })
+        .then(async (res) => {
+          if (res.ok) {
+            if (!projectsList.some(p => p.project_id === id)) {
+              setProjectsList(prev => [...prev, { project_id: id }]);
+            }
+            handleProjectChange(id);
+          } else {
+            const data = await res.json();
+            alert(`Failed to create project: ${data.error || 'Unknown error'}`);
+          }
+        })
+        .catch(err => {
+          console.error(err);
+          alert("Network error creating project");
+        });
     } else if (id) {
       alert("Invalid Project ID. Use 3-64 alphanumeric characters, hyphens, or underscores.");
     }
@@ -84,8 +97,7 @@ function App() {
         body: JSON.stringify({
           query_text: query,
           limit: 5,
-          explain: true,
-          fast_mode: fastMode
+          explain: true
         })
       });
       const data = await res.json();
@@ -243,27 +255,6 @@ function App() {
                       boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)'
                     }}
                   />
-                  <button
-                    type="button"
-                    onClick={() => setFastMode(!fastMode)}
-                    title={fastMode ? "Fast Mode: O(1) Lookup (Exact Match)" : "Normal Mode: Semantic Search + Pattern Completion"}
-                    style={{
-                      padding: '0 16px',
-                      borderRadius: '8px',
-                      background: fastMode ? '#eab308' : '#334155',
-                      border: 'none',
-                      color: 'white',
-                      cursor: 'pointer',
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      gap: '6px',
-                      transition: 'all 0.2s',
-                      fontWeight: 500
-                    }}>
-                    <span style={{ fontSize: '1.2rem' }}>⚡</span>
-                    {fastMode ? 'Fast' : 'Normal'}
-                  </button>
                   <button type="submit" disabled={loading} style={{
                     padding: '0 24px',
                     borderRadius: '8px',
