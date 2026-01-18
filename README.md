@@ -710,7 +710,6 @@ sequenceDiagram
     end
     
     API-->>C: {results, explain?, latency_ms}
-    Note over C,Main: ✅ P99 < 1ms
 ```
 
 ### 4. Background Job Pipeline
