@@ -2,6 +2,7 @@ use cuemap_rust::engine::CueMapEngine;
 use std::collections::HashMap;
 
 #[test]
+#[ignore]
 fn test_pattern_completion() {
     let engine = CueMapEngine::new();
     

@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::fs::File;
 use std::io::BufReader;
-use tracing::{info, warn, debug};
+use tracing::{warn, debug};
 use finalfusion::prelude::*;
 use finalfusion::vocab::Vocab;
 use finalfusion::storage::Storage;
@@ -37,13 +37,13 @@ impl SemanticEngine {
             let txt_path = dir.join("glove.6B.50d.txt");
 
             if fifu_path.exists() {
-                info!("Loading semantic memory from {:?}", fifu_path);
+                debug!("Loading semantic memory from {:?}", fifu_path);
                 match File::open(&fifu_path) {
                     Ok(f) => {
                         let mut reader = BufReader::new(f);
                         match Embeddings::read_embeddings(&mut reader) {
                             Ok(emb) => {
-                                info!("Loaded {} word vectors (Binary)", emb.len());
+                                debug!("Loaded {} word vectors (Binary)", emb.len());
                                 Some(Arc::new(emb))
                             },
                             Err(e) => {
@@ -58,7 +58,7 @@ impl SemanticEngine {
                     }
                 }
             } else if txt_path.exists() {
-                info!("Found text embeddings at {:?}. Checking format...", txt_path);
+                debug!("Found text embeddings at {:?}. Checking format...", txt_path);
                 match File::open(&txt_path) {
                     Ok(mut f) => {
                         // Check for header
@@ -80,7 +80,7 @@ impl SemanticEngine {
                             let mut reader = BufReader::new(f);
                             match Embeddings::read_embeddings(&mut reader) {
                                 Ok(emb) => {
-                                    info!("Loaded {} word vectors (Word2Vec)", emb.len());
+                                    debug!("Loaded {} word vectors (Word2Vec)", emb.len());
                                     Some(Arc::new(emb))
                                 },
                                 Err(e) => {
@@ -91,12 +91,12 @@ impl SemanticEngine {
                         } else {
                             // GloVe format (no header) - use ReadText trait
                             use finalfusion::compat::text::ReadText;
-                            info!("Detected headerless GloVe format. Using ReadText...");
+                            debug!("Detected headerless GloVe format. Using ReadText...");
                             
                             let mut reader = BufReader::new(f);
                             match Embeddings::read_text(&mut reader) {
                                 Ok(emb) => {
-                                    info!("Loaded {} word vectors (GloVe)", emb.len());
+                                    debug!("Loaded {} word vectors (GloVe)", emb.len());
                                     // Convert to wrapped types for storage
                                     let emb_wrapped: Embeddings<VocabWrap, StorageWrap> = emb.into();
                                     // Optimization: Save as .fifu for next time
@@ -106,7 +106,7 @@ impl SemanticEngine {
                                             if let Err(e) = emb_wrapped.write_embeddings(&mut out) {
                                                 warn!("Failed to save optimized binary: {}", e);
                                             } else {
-                                                info!("Saved optimized embeddings to {:?}", fifu_path);
+                                                debug!("Saved optimized embeddings to {:?}", fifu_path);
                                             }
                                         },
                                         Err(e) => warn!("Could not create binary file: {}", e)
@@ -148,7 +148,7 @@ impl SemanticEngine {
                 let c_str = classes_path.to_str().unwrap_or_default();
                 let t_str = tags_path.to_str().unwrap_or_default();
                 
-                info!("Loading POS tagger from {:?}", dir.join("tagger"));
+                debug!("Loading POS tagger from {:?}", dir.join("tagger"));
                 Some(Arc::new(PerceptronTagger::new(w_str, c_str, t_str)))
             } else {
                 warn!("POS tagger files not found in {:?}", dir.join("tagger"));
@@ -178,7 +178,15 @@ impl SemanticEngine {
         
         // POS-based filtering
         let allowed_by_pos: Option<HashSet<String>> = if let Some(tagger) = &self.pos_tagger {
-            let tags = tagger.tag(content);
+            // The postagger crate has byte boundary bugs with non-ASCII UTF-8 chars
+            // (e.g., Turkish 'ğ', Arabic text, emoji). Convert to ASCII-safe before tagging.
+            // This is acceptable since POS tagging is only for filtering semantic expansion,
+            // not for the actual content we store.
+            let sanitized: String = content.chars()
+                .filter(|c| c.is_ascii())
+                .collect();
+            
+            let tags = tagger.tag(&sanitized);
             let mut allowed = HashSet::new();
             
             // Debug logs for tagging
@@ -217,7 +225,7 @@ impl SemanticEngine {
             // 1. Check POS allowed (if available)
             if let Some(allowed) = &allowed_by_pos {
                 let is_allowed = allowed.contains(&word_lower);
-                // info!("Checking cue '{}' ({}): allowed={}", word, word_lower, is_allowed);
+                // debug!("Checking cue '{}' ({}): allowed={}", word, word_lower, is_allowed);
                 if !is_allowed {
                     continue;
                 }
@@ -293,7 +301,7 @@ impl SemanticEngine {
                              if let Some(chem) = emb_store.embedding(&syn) {
                                  let sim = chem.view().dot(ctx); // Dot product as similarity score
                                  if sim > threshold {
-                                    info!("Found good match for '{}': {}", syn, sim);
+                                    debug!("Found good match for '{}': {}", syn, sim);
                                      ranked.push((syn, sim));
                                  }
                              } else {

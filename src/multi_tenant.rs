@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
 
 pub type ProjectId = String;
 
@@ -56,12 +56,18 @@ impl MultiTenantEngine {
         }
     }
     
-    pub fn get_or_create_project(&self, project_id: ProjectId) -> Arc<ProjectContext> {
+    pub fn get_or_create_project(&self, project_id: ProjectId) -> Result<Arc<ProjectContext>, String> {
         if let Some(ctx) = self.projects.get(&project_id) {
-            ctx.clone()
+            ctx.touch();
+            Ok(ctx.clone())
         } else {
+            // TODO remove for prod release
+            // Check global pool limit (Max 10 for sandbox)
+            if self.projects.len() >= 10 {
+                return Err("Capacity reached. Please try again in 5 minutes.".to_string());
+            }
+
             // Create new project with default config
-            // TODO: Load config from disk if available
             let ctx = Arc::new(ProjectContext::new(
                 NormalizationConfig::default(),
                 Taxonomy::default(),
@@ -69,8 +75,65 @@ impl MultiTenantEngine {
                 self.semantic_engine.clone(),
             ));
             self.projects.insert(project_id, ctx.clone());
-            ctx
+            Ok(ctx)
         }
+    }
+    
+    /// Spawns a background thread to reap inactive projects
+    pub fn start_reaper(&self, interval: Duration, timeout: Duration) {
+        let engine = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                let count = engine.cleanup_inactive_projects(timeout.as_secs());
+                if count > 0 {
+                    tracing::info!("Reaper: purged {} inactive projects", count);
+                }
+            }
+        });
+    }
+    
+    /// Spawns a background thread to periodically save all project snapshots
+    pub fn start_periodic_snapshots(&self, interval: Duration) {
+        let engine = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                let results = engine.save_all();
+                let saved = results.iter().filter(|(_, r)| r.is_ok()).count();
+                let failed = results.iter().filter(|(_, r)| r.is_err()).count();
+                
+                if saved > 0 {
+                    tracing::debug!("Periodic snapshot: saved {} projects", saved);
+                }
+                if failed > 0 {
+                    tracing::warn!("Periodic snapshot: failed to save {} projects", failed);
+                }
+            }
+        });
+    }
+
+    pub fn cleanup_inactive_projects(&self, timeout_secs: u64) -> usize {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+            
+        let mut count = 0;
+        // DashMap's retain allows removal during iteration
+        self.projects.retain(|id, ctx| {
+            let last = ctx.get_last_activity();
+            if now - last > timeout_secs {
+                tracing::info!("Reaping inactive project '{}'", id);
+                count += 1;
+                false // remove
+            } else {
+                true // keep
+            }
+        });
+        count
     }
     
     pub fn get_project(&self, project_id: &ProjectId) -> Option<Arc<ProjectContext>> {
@@ -108,12 +171,6 @@ impl MultiTenantEngine {
     
     pub fn delete_project(&self, project_id: &ProjectId) -> bool {
         self.projects.remove(project_id).is_some()
-    }
-    
-    /// Insert a pre-loaded project engine (for static loading)
-    #[allow(dead_code)]
-    pub fn insert_project(&self, project_id: ProjectId, ctx: Arc<ProjectContext>) {
-        self.projects.insert(project_id, ctx);
     }
     
     /// Save a project snapshot to disk (main, aliases, lexicon)
@@ -196,6 +253,12 @@ impl MultiTenantEngine {
             taxonomy: Taxonomy::default(),
             cuegen_strategy: self.cuegen_strategy.clone(),
             semantic_engine: self.semantic_engine.clone(),
+            last_activity: std::sync::atomic::AtomicU64::new(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+            ),
         });
         
         self.projects.insert(project_id.clone(), ctx.clone());
@@ -207,8 +270,10 @@ impl MultiTenantEngine {
     pub fn save_all(&self) -> HashMap<String, Result<PathBuf, String>> {
         let mut results = HashMap::new();
         
-        for entry in self.projects.iter() {
-            let project_id = entry.key().clone();
+        // Collect IDs to avoid holding lock during save (prevent re-entrancy deadlock)
+        let project_ids: Vec<String> = self.projects.iter().map(|e| e.key().clone()).collect();
+        
+        for project_id in project_ids {
             let result = self.save_project(&project_id);
             results.insert(project_id, result);
         }

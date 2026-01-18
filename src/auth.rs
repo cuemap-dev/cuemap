@@ -1,5 +1,4 @@
 //! Authentication middleware for API key validation.
-
 use axum::{
     extract::{Request, State},
     http::{HeaderMap, StatusCode},
@@ -72,12 +71,10 @@ pub async fn auth_middleware(
     request: Request,
     next: Next,
 ) -> Result<Response, impl IntoResponse> {
-    // Skip auth if not required
     if !auth_config.require_auth {
         return Ok(next.run(request).await);
     }
     
-    // Extract API key from header
     let api_key = headers
         .get("X-API-Key")
         .and_then(|v| v.to_str().ok());

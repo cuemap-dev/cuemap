@@ -4,7 +4,6 @@ pub mod ingester;
 
 use crate::jobs::JobQueue;
 use crate::jobs::ProjectProvider;
-use crate::llm::LlmConfig;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -13,7 +12,6 @@ use tracing::{info, warn};
 pub struct AgentConfig {
     pub watch_dir: String,
     pub throttle_ms: u64,
-    pub llm: LlmConfig,
 }
 
 pub struct Agent {
@@ -35,7 +33,6 @@ impl Agent {
             job_queue,
         )));
 
-        // Create watcher that pipes events to ingester
         let watcher = watcher::Watcher::new(config.watch_dir.clone(), ingester.clone())
             .map_err(|e| format!("Failed to create watcher: {}", e))?;
 
@@ -50,7 +47,6 @@ impl Agent {
         info!("Agent started.");
         // Watcher runs in its own thread/task locally managed
         
-        // Trigger initial scan
         let ingester = self.ingester.clone();
         tokio::spawn(async move {
             let mut ingester = ingester.lock().await;
@@ -59,4 +55,9 @@ impl Agent {
             }
         });
     }
+
+    pub fn get_ingester(&self) -> Arc<Mutex<ingester::Ingester>> {
+        self.ingester.clone()
+    }
 }
+

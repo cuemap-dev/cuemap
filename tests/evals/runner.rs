@@ -1,5 +1,5 @@
-use crate::engine::CueMapEngine;
-use crate::evals::{GoldenTrace, NormalizedRecall};
+use cuemap_rust::engine::CueMapEngine;
+use super::{GoldenTrace, NormalizedRecall};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;

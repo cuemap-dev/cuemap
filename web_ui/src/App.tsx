@@ -1,25 +1,73 @@
 import React, { useState } from 'react';
-import { Search, Brain, BookOpen } from 'lucide-react';
+import { Search, Brain, BookOpen, Upload } from 'lucide-react';
 import GraphVisualizer from './components/GraphVisualizer';
 import Inspector from './components/Inspector';
 import LexiconSurgeon from './components/LexiconSurgeon';
+import SandboxWelcome from './components/SandboxWelcome';
+import IngestionScreen from './components/IngestionScreen';
 import './App.css';
 
-type Tab = 'recall' | 'lexicon';
+type Tab = 'ingest' | 'recall' | 'lexicon';
 
 function App() {
-  const [activeTab, setActiveTab] = useState<Tab>('recall');
+  const [projectId, setProjectId] = useState<string | null>(() => {
+    return new URLSearchParams(window.location.search).get('project');
+  });
+  const [activeTab, setActiveTab] = useState<Tab>('ingest');
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
   const [latency, setLatency] = useState(0);
+  const [fastMode, setFastMode] = useState(false);
+  const [projectsList, setProjectsList] = useState<any[]>([]);
+  const [stats, setStats] = useState<{ total_memories: number; total_cues: number } | null>(null);
+
+  // Fetch projects on mount
+  React.useEffect(() => {
+    fetch('/projects')
+      .then(res => res.json())
+      .then(data => setProjectsList(data.projects || []))
+      .catch(console.error);
+  }, []);
+
+  // Fetch stats when entering recall or changing project
+  React.useEffect(() => {
+    if (activeTab === 'recall') {
+      const headers: Record<string, string> = {};
+      if (projectId) headers['X-Project-ID'] = projectId;
+
+      fetch('/stats', { headers })
+        .then(res => res.json())
+        .then(data => setStats(data))
+        .catch(console.error);
+    }
+  }, [activeTab, projectId, results]); // Refresh on results change (after search/ingest)
+
+  const handleStartSandbox = async (id: string) => {
+    setProjectId(id);
+    setActiveTab('ingest'); // Start with ingestion after sandbox creation
+    const url = new URL(window.location.href);
+    url.searchParams.set('project', id);
+    window.history.pushState({}, '', url);
+
+    // Refresh projects list to include the new sandbox project
+    try {
+      const res = await fetch('/projects');
+      const data = await res.json();
+      setProjectsList(data.projects || []);
+    } catch (err) {
+      console.error('Failed to refresh projects:', err);
+    }
+  };
+
+  const handleIngestionComplete = () => {
+    setActiveTab('recall');
+  };
 
   const handleSearch = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
     try {
-      const params = new URLSearchParams(window.location.search);
-      const projectId = params.get('project');
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
       if (projectId) {
         headers['X-Project-ID'] = projectId;
@@ -31,7 +79,8 @@ function App() {
         body: JSON.stringify({
           query_text: query,
           limit: 5,
-          explain: true
+          explain: true,
+          fast_mode: fastMode
         })
       });
       const data = await res.json();
@@ -47,12 +96,56 @@ function App() {
   // Extract memory IDs for highlighting with rank
   const highlightedMemoryMap = new Map(results.map((r, index) => [r.memory_id, index + 1]));
 
+  if (!projectId) {
+    return <SandboxWelcome onStart={handleStartSandbox} />;
+  }
+
   return (
     <div className="app-container">
       {/* 1. Header Row with Tabs */}
       <header className="app-header">
         <h1>CueMap <span className="beta-tag">BRAIN</span></h1>
+
+        {/* Project Selector */}
+        <div className="project-selector" style={{ marginLeft: '20px' }}>
+          <select
+            value={projectId || ''}
+            onChange={(e) => handleStartSandbox(e.target.value)}
+            style={{
+              padding: '6px 12px',
+              borderRadius: '6px',
+              background: '#334155',
+              color: 'white',
+              border: '1px solid #475569',
+              fontSize: '0.9rem'
+            }}
+          >
+            <option value="" disabled>Select Project</option>
+            {projectsList.map((p: any) => (
+              <option key={p.project_id} value={p.project_id}>{p.project_id}</option>
+            ))}
+          </select>
+        </div>
+
         <nav style={{ display: 'flex', gap: '8px', marginLeft: 'auto' }}>
+          <button
+            onClick={() => setActiveTab('ingest')}
+            style={{
+              padding: '8px 16px',
+              borderRadius: '6px',
+              border: 'none',
+              background: activeTab === 'ingest' ? '#22c55e' : 'transparent',
+              color: activeTab === 'ingest' ? 'white' : '#94a3b8',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              fontSize: '0.9rem',
+              fontWeight: 500
+            }}
+          >
+            <Upload size={18} /> Ingest
+          </button>
           <button
             onClick={() => setActiveTab('recall')}
             style={{
@@ -92,9 +185,14 @@ function App() {
         </nav>
       </header>
 
-      {activeTab === 'recall' ? (
+      {activeTab === 'ingest' && (
+        <main className="app-main" style={{ flex: 1, overflow: 'auto' }}>
+          <IngestionScreen projectId={projectId} onComplete={handleIngestionComplete} />
+        </main>
+      )}
+
+      {activeTab === 'recall' && (
         <>
-          {/* 2. Search Row (Top) */}
           <div className="search-bar-container">
             <form onSubmit={handleSearch} style={{ display: 'flex', gap: '10px', width: '100%' }}>
               <input
@@ -114,6 +212,27 @@ function App() {
                   boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)'
                 }}
               />
+              <button
+                type="button"
+                onClick={() => setFastMode(!fastMode)}
+                title={fastMode ? "Fast Mode: O(1) Lookup (Exact Match)" : "Normal Mode: Semantic Search + Pattern Completion"}
+                style={{
+                  padding: '0 16px',
+                  borderRadius: '8px',
+                  background: fastMode ? '#eab308' : '#334155',
+                  border: 'none',
+                  color: 'white',
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: '6px',
+                  transition: 'all 0.2s',
+                  fontWeight: 500
+                }}>
+                <span style={{ fontSize: '1.2rem' }}>⚡</span>
+                {fastMode ? 'Fast' : 'Normal'}
+              </button>
               <button type="submit" disabled={loading} style={{
                 padding: '0 24px',
                 borderRadius: '8px',
@@ -133,8 +252,26 @@ function App() {
 
           {/* 3. Main Content Row (Graph + Results) */}
           <main className="app-main split-view">
-            <div className="graph-pane">
+            <div className="graph-pane" style={{ position: 'relative' }}>
               <GraphVisualizer highlightedMemoryMap={highlightedMemoryMap} />
+
+              {/* Stats Overlay */}
+              {stats && (
+                <div style={{
+                  position: 'absolute',
+                  top: '10px',
+                  left: '10px',
+                  background: 'rgba(15, 23, 42, 0.9)',
+                  padding: '8px 12px',
+                  borderRadius: '6px',
+                  fontSize: '0.75rem',
+                  color: '#94a3b8',
+                  pointerEvents: 'none', // Allow clicks to pass through to graph
+                  border: '1px solid rgba(148, 163, 184, 0.1)'
+                }}>
+                  {stats.total_memories.toLocaleString()} memories · {stats.total_cues.toLocaleString()} cues
+                </div>
+              )}
             </div>
 
             <div className="results-pane">
@@ -142,9 +279,11 @@ function App() {
             </div>
           </main>
         </>
-      ) : (
+      )}
+
+      {activeTab === 'lexicon' && (
         <main className="app-main" style={{ flex: 1 }}>
-          <LexiconSurgeon />
+          <LexiconSurgeon projectId={projectId} />
         </main>
       )}
     </div>
@@ -152,3 +291,4 @@ function App() {
 }
 
 export default App;
+

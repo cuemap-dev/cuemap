@@ -18,8 +18,8 @@ fn test_multi_tenant_isolation() {
     let dir = tempdir().unwrap();
     let engine = MultiTenantEngine::with_snapshots_dir(dir.path(), CueGenStrategy::default(), SemanticEngine::new(None));
     
-    let ctx1 = engine.get_or_create_project("proj1".to_string());
-    let ctx2 = engine.get_or_create_project("proj2".to_string());
+    let ctx1 = engine.get_or_create_project("proj1".to_string()).unwrap();
+    let ctx2 = engine.get_or_create_project("proj2".to_string()).unwrap();
     
     ctx1.main.add_memory("Project 1 content".to_string(), vec!["cue1".to_string()], None, false);
     ctx2.main.add_memory("Project 2 content".to_string(), vec!["cue2".to_string()], None, false);
@@ -43,7 +43,7 @@ fn test_snapshot_roundtrip() {
     
     {
         let engine = MultiTenantEngine::with_snapshots_dir(&snapshots_dir, CueGenStrategy::default(), SemanticEngine::new(None));
-        let ctx = engine.get_or_create_project(project_id.clone());
+        let ctx = engine.get_or_create_project(project_id.clone()).unwrap();
         ctx.main.add_memory("persist me".to_string(), vec!["save:true".to_string()], None, false);
         
         // Save
@@ -69,7 +69,7 @@ fn test_delete_project() {
     let engine = MultiTenantEngine::with_snapshots_dir(dir.path(), CueGenStrategy::default(), SemanticEngine::new(None));
     
     let project_id = "to_delete";
-    engine.get_or_create_project(project_id.to_string());
+    let _ = engine.get_or_create_project(project_id.to_string()).unwrap();
     
     assert!(engine.get_project(&project_id.to_string()).is_some());
     assert!(engine.delete_project(&project_id.to_string()));

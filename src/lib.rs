@@ -13,7 +13,6 @@ pub mod jobs;
 pub mod llm;
 pub mod agent;
 pub mod grounding;
-pub mod evals;
 pub mod semantic;
 pub mod web;
 pub mod crypto;

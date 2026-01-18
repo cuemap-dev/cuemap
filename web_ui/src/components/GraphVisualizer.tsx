@@ -155,6 +155,12 @@ const GraphVisualizer: React.FC<GraphProps> = ({ highlightedMemoryMap }) => {
                 linkWidth={1}
 
                 backgroundColor="#0f172a"
+
+                onEngineStop={() => {
+                    if (fgRef.current) {
+                        fgRef.current.zoomToFit(400, 50);
+                    }
+                }}
             />
         </div>
     );

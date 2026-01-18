@@ -1,10 +1,10 @@
-use crate::config::*;
 use crate::structures::{Memory, OrderedSet};
 use dashmap::DashMap;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RecallResult {
@@ -32,7 +32,10 @@ pub struct CueMapEngine {
     last_events: Arc<DashMap<String, (String, f64, Vec<String>)>>,
     // Performance: Atomic counter to avoid DashMap::len() contention
     memory_count: Arc<AtomicUsize>,
+    // Performance: Atomic counter for cues
+    cue_count: Arc<AtomicUsize>,
 }
+
 
 impl CueMapEngine {
     pub fn new() -> Self {
@@ -42,21 +45,28 @@ impl CueMapEngine {
             cue_co_occurrence: Arc::new(DashMap::new()),
             last_events: Arc::new(DashMap::new()),
             memory_count: Arc::new(AtomicUsize::new(0)),
+            cue_count: Arc::new(AtomicUsize::new(0)),
         }
     }
+
     
     pub fn from_state(
         memories: DashMap<String, Memory>,
         cue_index: DashMap<String, OrderedSet>,
     ) -> Self {
         let count = memories.len();
+        let cue_count_val = cue_index.len();
         let engine = Self {
             memories: Arc::new(memories),
             cue_index: Arc::new(cue_index),
+
             cue_co_occurrence: Arc::new(DashMap::new()), 
             last_events: Arc::new(DashMap::new()),
             memory_count: Arc::new(AtomicUsize::new(count)),
+            cue_count: Arc::new(AtomicUsize::new(cue_count_val)),
+
         };
+
 
         // Rehydrate co-occurrence matrix from existing memories
         // This ensures the graph and pattern completion work after restart
@@ -171,20 +181,61 @@ impl CueMapEngine {
             if cue_lower.is_empty() { continue; }
 
             // 1. Index full cue
+            // 1. Index full cue
+            if !self.cue_index.contains_key(&cue_lower) {
+                 self.cue_count.fetch_add(1, Ordering::Relaxed);
+            }
             self.cue_index
                 .entry(cue_lower.clone())
                 .or_insert_with(OrderedSet::new)
                 .add(memory_id.clone());
+
+            // For now, let's just accept that `cue_count` might be slightly off if we don't track it perfectly,
+            // OR we fix it by not using DashMap::len() for stats.
             
-            // 2. Index value if k:v (unless flat)
-            if let Some((_, value)) = cue_lower.split_once(':') {
-                if !value.is_empty() {
-                    self.cue_index
-                        .entry(value.to_string())
-                        .or_insert_with(OrderedSet::new)
-                        .add(memory_id.clone());
-                }
+            // Re-think: Is `cue_index.len()` actually O(N)?
+            // DashMap::len() locks all shards to sum them up. Yes.
+            
+            // Correct approach: increment only if we add a NEW key.
+            // But we already have the entry lock.
+            // If the set was empty (newly created), it's a new cue?
+            // No, OrderedSet::new() creates empty.
+            // Basic logic: if we call `or_insert_with`, and it runs the closure, it's new.
+            // But `entry` returns a RefMut, we don't know if closure ran.
+            
+            // Alternative: check if key exists first? No, race condition.
+            // Alternative 2: Trust DashMap::len() is slow, but maybe we only need it occasionally?
+            // No, UI calls it every 10s.
+            
+            // Let's implement roughly correct counting:
+            // We can't easily know if it's a new key without checking.
+            // Let's use `if !self.cue_index.contains_key(...)` fast check? No races.
+            
+            // Wait, we are inside `add_memory` which is basically single-writer per memory...
+            // But concurrent add_memories happen.
+            
+            // Let's just use `cue_index.len()` inside `new/from_state`, 
+            // and checking `if self.cue_index.insert(...)` returns None?
+            // But we use `entry().or_insert()`.
+            
+            // OK, let's change logic to:
+            if !self.cue_index.contains_key(&cue_lower) {
+                 self.cue_count.fetch_add(1, Ordering::Relaxed);
             }
+             self.cue_index.entry(cue_lower.clone()).or_insert_with(OrderedSet::new).add(memory_id.clone());
+             
+             // 2. Index value
+             if let Some((_, value)) = cue_lower.split_once(':') {
+                 if !value.is_empty() {
+                     let val_str = value.to_string();
+                      if !self.cue_index.contains_key(&val_str) {
+                         self.cue_count.fetch_add(1, Ordering::Relaxed);
+                      }
+                      self.cue_index.entry(val_str).or_insert_with(OrderedSet::new).add(memory_id.clone());
+                 }
+             }
+
+
         }
         
         memory_id
@@ -236,6 +287,12 @@ impl CueMapEngine {
                  // 1. Remove from full cue entry
                  if let Some(mut entry) = self.cue_index.get_mut(&cue_lower) {
                      entry.remove(memory_id);
+                     if entry.is_empty() {
+                         drop(entry); // Release RefMut to allow removal
+                         if self.cue_index.remove(&cue_lower).is_some() {
+                             self.cue_count.fetch_sub(1, Ordering::Relaxed);
+                         }
+                     }
                  }
                  
                  // 2. Remove from value entry
@@ -243,9 +300,16 @@ impl CueMapEngine {
                      if !value.is_empty() {
                          if let Some(mut entry) = self.cue_index.get_mut(value) {
                              entry.remove(memory_id);
+                             if entry.is_empty() {
+                                 drop(entry);
+                                 if self.cue_index.remove(value).is_some() {
+                                     self.cue_count.fetch_sub(1, Ordering::Relaxed);
+                                 }
+                             }
                          }
                      }
                  }
+
              }
             true
         } else {
@@ -289,7 +353,9 @@ impl CueMapEngine {
         memory.id = id.clone();
         memory.cues = cues.clone();
         
-        self.memories.insert(id.clone(), memory);
+        if self.memories.insert(id.clone(), memory).is_none() {
+            self.memory_count.fetch_add(1, Ordering::Relaxed);
+        }
         
         // Index by cues (Double Indexing)
         for cue in &cues { // Iterate by reference to avoid move
@@ -297,20 +363,29 @@ impl CueMapEngine {
             if cue_lower.is_empty() { continue; }
             
             // 1. Index full cue
+            let cue_lower_clone = cue_lower.clone();
+            if !self.cue_index.contains_key(&cue_lower_clone) {
+                 self.cue_count.fetch_add(1, Ordering::Relaxed);
+            }
             self.cue_index
-                .entry(cue_lower.clone())
+                .entry(cue_lower_clone)
                 .or_insert_with(OrderedSet::new)
                 .add(id.clone());
             
             // 2. Index value
             if let Some((_, value)) = cue_lower.split_once(':') {
                 if !value.is_empty() {
+                    let val_str = value.to_string();
+                    if !self.cue_index.contains_key(&val_str) {
+                         self.cue_count.fetch_add(1, Ordering::Relaxed);
+                    }
                     self.cue_index
-                        .entry(value.to_string())
+                        .entry(val_str)
                         .or_insert_with(OrderedSet::new)
                         .add(id.clone());
                 }
             }
+
         }
         
         // FIX: Update co-occurrence matrix for new memory
@@ -343,20 +418,29 @@ impl CueMapEngine {
                 if cue_lower.is_empty() { continue; }
                 
                 // 1. Index full cue
+                let cue_lower_clone = cue_lower.clone();
+                if !self.cue_index.contains_key(&cue_lower_clone) {
+                     self.cue_count.fetch_add(1, Ordering::Relaxed);
+                }
                 self.cue_index
-                    .entry(cue_lower.clone())
+                    .entry(cue_lower_clone)
                     .or_insert_with(OrderedSet::new)
                     .add(memory_id.to_string());
                 
                 // 2. Index value
                 if let Some((_, value)) = cue_lower.split_once(':') {
                     if !value.is_empty() {
+                        let val_str = value.to_string();
+                         if !self.cue_index.contains_key(&val_str) {
+                             self.cue_count.fetch_add(1, Ordering::Relaxed);
+                         }
                         self.cue_index
-                            .entry(value.to_string())
+                            .entry(val_str)
                             .or_insert_with(OrderedSet::new)
                             .add(memory_id.to_string());
                     }
                 }
+
             }
             
             // FIX: Update co-occurrence with extended cue set
@@ -398,6 +482,79 @@ impl CueMapEngine {
             .collect();
             
         self.recall_weighted(weighted_cues, limit, auto_reinforce, min_intersection, false, false, false, false)
+    }
+
+    /// O(limit) recall using intersection-first strategy.
+    /// Only scans the smallest cue list up to `limit` items, probes others in O(1).
+    /// Returns results in recency order - no expensive sorting.
+    /// Best for: simple keyword queries where speed > perfect ranking.
+    pub fn recall_intersection(&self, query_cues: Vec<(String, f64)>, limit: usize) -> Vec<RecallResult> {
+        if query_cues.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+
+        // 1. Normalize and collect cue sets with sizes
+        let mut cue_sets: Vec<(String, f64, dashmap::mapref::one::Ref<String, OrderedSet>)> = Vec::new();
+        for (cue, weight) in &query_cues {
+            let cue_lower = cue.to_lowercase();
+            let cue_trimmed = cue_lower.trim().to_string();
+            if cue_trimmed.is_empty() { continue; }
+            
+            if let Some(ordered_set) = self.cue_index.get(&cue_trimmed) {
+                cue_sets.push((cue_trimmed, *weight, ordered_set));
+            }
+        }
+
+        if cue_sets.is_empty() {
+            return Vec::new();
+        }
+
+        // 2. Sort by set size - smallest (most selective) first
+        cue_sets.sort_by(|a, b| a.2.len().cmp(&b.2.len()));
+
+        // 3. Iterate ONLY the smallest cue's list, up to limit items
+        let (_driver_cue, driver_weight, driver_set) = &cue_sets[0];
+        let other_sets = &cue_sets[1..];
+        
+        let mut results = Vec::with_capacity(limit);
+        let scan_limit = driver_set.len().min(limit * 10); // Scan 10x limit to find enough intersections
+        
+        for memory_id in driver_set.get_recent(Some(scan_limit)) {
+            // 4. O(1) probes into other cue sets
+            let mut total_weight = *driver_weight;
+            let mut match_count = 1;
+            
+            for (_other_cue, other_weight, other_set) in other_sets {
+                if other_set.get_index_of(memory_id).is_some() {
+                    total_weight += other_weight;
+                    match_count += 1;
+                }
+            }
+
+            // 5. Fetch memory and build result
+            if let Some(memory) = self.memories.get(memory_id) {
+                results.push(RecallResult {
+                    memory_id: memory_id.clone(),
+                    content: memory.content.clone(),
+                    score: total_weight * 100.0, // Simple intersection-based score
+                    match_integrity: (match_count as f64) / (cue_sets.len() as f64),
+                    intersection_count: match_count,
+                    recency_score: 1.0,
+                    reinforcement_score: memory.reinforcement_count as f64,
+                    salience_score: memory.salience,
+                    created_at: memory.created_at,
+                    metadata: memory.metadata.clone(),
+                    explain: None,
+                });
+
+                // 6. Early termination when limit reached
+                if results.len() >= limit {
+                    break;
+                }
+            }
+        }
+
+        results
     }
 
     /// Fast O(1) lookup for lexicon-style queries.
@@ -503,6 +660,21 @@ impl CueMapEngine {
                     if active_cues.iter().any(|(c, _)| c == inferred_cue) {
                         continue;
                     }
+                    
+                    // FIX: Skip metadata/structural cues in pattern completion inference
+                    // We only want to infer semantic synonyms (e.g. "food" -> "diet"), 
+                    // not structural context (e.g. "food" -> "domain:youtube")
+                    if inferred_cue.contains(':') {
+                        continue;
+                    }
+
+                    // FIX: Skip superstring inferences (Compounding)
+                    // If we query "health", don't infer "surgo_health" or "gut_health".
+                    // We want Lateral Expansion (synonyms), not Vertical Expansion (specialization).
+                    if inferred_cue.contains(cue) {
+                        continue;
+                    }
+
                     *inferred_candidates.entry(inferred_cue.clone()).or_insert(0) += *count;
                 }
             }
@@ -512,7 +684,10 @@ impl CueMapEngine {
             let mut inferred_list: Vec<(String, u64)> = inferred_candidates.into_iter().collect();
             inferred_list.sort_unstable_by(|a, b| b.1.cmp(&a.1));
             
-            let pattern_completion_weight = 0.7; // Weight for inferred cues
+            // FIX: Drastically lower inference weight (0.7 -> 0.1).
+            // Inferred cues are "suggestions", they must NEVER overpower explicit query terms.
+            // Even with high IDF, an inferred cue should be a tie-breaker, not a driver.
+            let pattern_completion_weight = 0.1; 
             for (inf_cue, _) in inferred_list.into_iter().take(5) {
                 active_cues.push((inf_cue, pattern_completion_weight));
             }
@@ -547,16 +722,25 @@ impl CueMapEngine {
         results
     }
     
-    fn consolidated_search(&self, query_cues: &[(String, f64)], _limit: usize, explain: bool, disable_salience_bias: bool, disable_systems_consolidation: bool) -> Vec<RecallResult> {
+    fn consolidated_search(&self, query_cues: &[(String, f64)], limit: usize, explain: bool, disable_salience_bias: bool, disable_systems_consolidation: bool) -> Vec<RecallResult> {
         if query_cues.is_empty() {
             return Vec::new();
         }
 
-        // 1. Gather cue data
-        let mut cue_data = Vec::with_capacity(query_cues.len());
+        // 1. Gather cue data with set sizes for sorting
+        let mut cue_data: Vec<(String, f64, dashmap::mapref::one::Ref<String, OrderedSet>)> = Vec::with_capacity(query_cues.len());
+        let total_memories = self.memories.len() as f64;
+        
         for (cue, weight) in query_cues {
             if let Some(ordered_set) = self.cue_index.get(cue) {
-                cue_data.push((cue.clone(), *weight, ordered_set));
+                // IDF Weighting: Penalize common cues (e.g. "youtube"), boost rare ones (e.g. "gut")
+                let df = ordered_set.len() as f64;
+                // ln(N / df) is standard IDF. We add 1 to df to avoid division by zero (though unlikely for existing key)
+                // We ensure a minimum weight of 0.1 so cues don't disappear entirely
+                let idf = (total_memories / (df + 1.0)).ln().max(0.1);
+                let adjusted_weight = weight * idf;
+                
+                cue_data.push((cue.clone(), adjusted_weight, ordered_set));
             }
         }
 
@@ -564,17 +748,26 @@ impl CueMapEngine {
             return Vec::new();
         }
 
+        // OPTIMIZATION 1: Sort by set size (smallest first)
+        // Processing rarer cues first produces fewer candidates to probe
+        cue_data.sort_by(|a, b| a.2.len().cmp(&b.2.len()));
+
+        // OPTIMIZATION 2: Adaptive scan limit based on requested limit
+        // For limit=5, we don't need to scan 10k items per cue
+        // Scale: limit * 100, capped at 2000 for safety
+        let adaptive_scan_limit = (limit * 100).min(2000);
+
         // 2. Perform Union-based search with O(1) Probing
-        // We iterate through EVERY cue's list up to MAX_DRIVER_SCAN to ensure partial matches are found.
         let mut candidates = Vec::new();
         let mut seen_memories = HashSet::new();
 
         for (cue_idx, (_cue, _weight, set)) in cue_data.iter().enumerate() {
-            let scan_limit = std::cmp::min(set.len(), MAX_DRIVER_SCAN);
+            // Use adaptive limit instead of MAX_DRIVER_SCAN
+            let scan_limit = std::cmp::min(set.len(), adaptive_scan_limit);
             let items = set.get_recent(Some(scan_limit));
 
             for (pos_rev, memory_id) in items.iter().enumerate() {
-                // If we've already processed this memory from a previous (likely more selective or relevant) cue, skip it
+                // If we've already processed this memory from a previous cue, skip it
                 if seen_memories.contains(*memory_id) {
                     continue;
                 }
@@ -584,11 +777,11 @@ impl CueMapEngine {
                 let mut positions_info = Vec::with_capacity(cue_data.len());
 
                 // 3. For each NEW candidate, probe ALL query cue lists to get full intersection data
-                for (other_idx, (_other_cue, other_weight, other_set)) in cue_data.iter().enumerate() {
+                for (other_idx, (other_cue, other_weight, other_set)) in cue_data.iter().enumerate() {
                     // Optimization: if it's the current set we're iterating, we know it's there
                     if other_idx == cue_idx {
                         total_weight += *other_weight;
-                        positions_info.push((pos_rev, other_set.len(), *other_weight));
+                        positions_info.push((pos_rev, other_set.len(), *other_weight, other_cue.clone()));
                         continue;
                     }
 
@@ -596,7 +789,7 @@ impl CueMapEngine {
                     if let Some(oldest_idx) = other_set.get_index_of(memory_id) {
                         total_weight += *other_weight;
                         let recency_pos = (other_set.len() - 1) - oldest_idx;
-                        positions_info.push((recency_pos, other_set.len(), *other_weight));
+                        positions_info.push((recency_pos, other_set.len(), *other_weight, other_cue.clone()));
                     }
                 }
 
@@ -609,7 +802,7 @@ impl CueMapEngine {
         self.score_consolidated_candidates(candidates, explain, disable_salience_bias, disable_systems_consolidation)
     }
 
-    fn score_consolidated_candidates(&self, candidates: Vec<(String, Vec<(usize, usize, f64)>, f64)>, explain: bool, disable_salience_bias: bool, disable_systems_consolidation: bool) -> Vec<RecallResult> {
+    fn score_consolidated_candidates(&self, candidates: Vec<(String, Vec<(usize, usize, f64, String)>, f64)>, explain: bool, disable_salience_bias: bool, disable_systems_consolidation: bool) -> Vec<RecallResult> {
         const MAX_REC_WEIGHT: f64 = 20.0;
         const MAX_FREQ_WEIGHT: f64 = 5.0;
         
@@ -627,21 +820,18 @@ impl CueMapEngine {
                 
                 let match_count = positions_info.len() as f64;
 
-                for (pos, list_len, weight) in positions_info {
-                    let pos_f64 = pos as f64;
-                    let list_len_f64 = list_len as f64;
+                for (pos, list_len, _weight, _cue_name) in &positions_info {
+                    let pos_f64 = *pos as f64;
+                    let list_len_f64 = *list_len as f64;
                     let sigma = list_len_f64.sqrt();
                     let ratio = pos_f64 / sigma;
                     
                     let w_rec = MAX_REC_WEIGHT / (ratio + 1.0);
                     let w_freq = 1.0 + (MAX_FREQ_WEIGHT * (1.0 - (1.0 / (ratio + 1.0))));
                     
-                    let mut recency_component = 1.0 / (pos_f64 + 1.0);
-                    if pos == 0 {
-                        recency_component += 1.0;
-                    }
+                    let recency_component = 1.0 / (pos_f64 + 1.0);
                     
-                    total_recency += recency_component * weight; // Weigh the recency contribution
+                    total_recency += recency_component; // Independent of IDF weight
                     total_w_rec += w_rec;
                     total_w_freq += w_freq;
                 }
@@ -693,7 +883,8 @@ impl CueMapEngine {
                             "frequency": avg_w_freq,
                             "salience": 10.0
                         },
-                        "match_count": match_count
+                        "match_count": match_count,
+                        "matched_cues": positions_info.iter().map(|(_, _, _, name)| name.clone()).collect::<Vec<_>>()
                     }))
                 } else {
                     None
@@ -827,6 +1018,7 @@ impl CueMapEngine {
             memories.truncate(limit);
         }
 
+        // 2. Add memories and their directly connected cues
         for mem in &memories {
             if !added_nodes.contains(&mem.id) {
                 // Truncate content for label
@@ -862,29 +1054,49 @@ impl CueMapEngine {
             }
         }
         
-        // 2. Add cue-cue edges from co-occurrence
-        for node in &nodes {
-             if node["group"] == "cue" {
-                 let cue_label = node["label"].as_str().unwrap();
-                 if let Some(co_map) = self.cue_co_occurrence.get(cue_label) {
-                      for entry in co_map.iter() {
-                          let (other_cue, count) = entry.pair();
-                          let other_id = format!("cue:{}", other_cue);
-                          
-                          // Only visualize connection if both are in the graph to avoid explosion
-                          if added_nodes.contains(&other_id) {
-                              // Avoid double links: only add if A < B
-                              if cue_label < other_cue.as_str() {
-                                  links.push(serde_json::json!({
-                                      "source": format!("cue:{}", cue_label),
-                                      "target": other_id,
-                                      "value": (*count as f64).min(5.0) // Cap strength
-                                  }));
+        // 3. Add cue-cue edges from co-occurrence (With budget)
+        // Prevent O(N^2) explosion by capping total links
+        let max_total_links = 10_000;
+        if links.len() < max_total_links {
+            let mut co_links = Vec::new();
+            
+            for node in &nodes {
+                 if node["group"] == "cue" {
+                     let cue_label = node["label"].as_str().unwrap();
+                     if let Some(co_map) = self.cue_co_occurrence.get(cue_label) {
+                          for entry in co_map.iter() {
+                              let (other_cue, count) = entry.pair();
+                              let other_id = format!("cue:{}", other_cue);
+                              
+                              // Only visualize connection if both are in the graph to avoid explosion
+                              if added_nodes.contains(&other_id) {
+                                  // Avoid double links: only add if A < B
+                                  if cue_label < other_cue.as_str() {
+                                      let weight = (*count as f64).min(5.0);
+                                      co_links.push((
+                                          format!("cue:{}", cue_label),
+                                          other_id,
+                                          weight
+                                      ));
+                                  }
                               }
                           }
-                      }
+                     }
                  }
-             }
+            }
+            
+            // Sort by weight descending (prioritize strong connections)
+            co_links.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+            
+            // Take what fits in budget
+            let remaining = max_total_links.saturating_sub(links.len());
+            for (source_id, target_id, weight) in co_links.into_iter().take(remaining) {
+                links.push(serde_json::json!({
+                    "source": source_id,
+                    "target": target_id,
+                    "value": weight
+                }));
+            }
         }
 
         serde_json::json!({
@@ -897,15 +1109,16 @@ impl CueMapEngine {
         let mut stats = HashMap::new();
         stats.insert(
             "total_memories".to_string(),
-            serde_json::json!(self.memories.len()),
+            serde_json::json!(self.memory_count.load(Ordering::Relaxed)),
         );
         stats.insert(
             "total_cues".to_string(),
-            serde_json::json!(self.cue_index.len()),
+            serde_json::json!(self.cue_count.load(Ordering::Relaxed)),
         );
+
         
-        let cues: Vec<String> = self.cue_index.iter().map(|e| e.key().clone()).collect();
-        stats.insert("cues".to_string(), serde_json::json!(cues));
+        // REMOVED: potentially massive 'cues' list
+        // stats.insert("cues".to_string(), serde_json::json!(cues));
         
         stats
     }

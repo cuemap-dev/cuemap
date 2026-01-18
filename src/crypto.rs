@@ -2,6 +2,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use hex;
 use std::env;
+use subtle::ConstantTimeEq;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -26,9 +27,7 @@ impl CryptoEngine {
 
     pub fn verify(&self, content: &str, signature: &str) -> bool {
         let expected = self.sign(content);
-        // Use constant time comparison if possible, but for this demo standard string compare is okay-ish
-        // dependent on threat model. Ideally use subtle::ConstantTimeEq.
-        // For now, simple string compare.
-        expected == signature
+        // Constant-time comparison to prevent timing attacks
+        expected.as_bytes().ct_eq(signature.as_bytes()).into()
     }
 }

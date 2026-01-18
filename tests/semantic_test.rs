@@ -12,7 +12,7 @@ mod tests {
         // The implementation skips exact value match, so we look for synonyms
         let known_cues = vec!["topic:payment".to_string()];
         
-        let expanded = engine.expand_wordnet("dummy content", &known_cues);
+        let expanded = engine.expand_wordnet("dummy content", &known_cues, 0.6, 5);
         
         println!("Expanded: {:?}", expanded);
         
@@ -33,7 +33,7 @@ mod tests {
         let engine = SemanticEngine::new(None);
         let known_cues = vec!["category:fruit".to_string()];
         
-        let expanded = engine.expand_wordnet("dummy", &known_cues);
+        let expanded = engine.expand_wordnet("dummy", &known_cues, 0.6, 5);
         
         // With new flat-cue logic, the key is NOT preserved.
         // Input: "category:fruit" -> Word: "fruit" -> Synonyms: "pomelo", etc.

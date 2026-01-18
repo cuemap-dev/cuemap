@@ -20,7 +20,7 @@ pub struct ValidationReport {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct RejectedCue {
     pub cue: String,
-    pub code: String,   // "bad_format" | "unknown_key" | "unknown_value"
+    pub code: String,
     pub detail: String,
 }
 
@@ -51,16 +51,6 @@ pub fn validate_cues(cues: Vec<String>, taxonomy: &Taxonomy) -> ValidationReport
         let value = parts[1];
 
         // 2. Check allowed keys (if restricted)
-        // If allowed_keys is empty, we assume NO restriction on keys (open taxonomy)
-        // UNLESS the user explicitly wants a closed taxonomy by default.
-        // The plan implies explicit allowlist. If allowed_keys is NOT empty, we enforce it.
-        // If it IS empty, we might still want to enforce it if the user intends a strict schema.
-        // However, usually empty list means "nothing allowed" in a strict system.
-        // Let's assume strict: if allowed_keys is populated, key must be in it.
-        // If allowed_keys is empty, we'll assume everything is allowed (open) OR nothing is allowed.
-        // Given the context of "taxonomy validator", usually it's permissive by default unless configured.
-        // But the prompt says "Taxonomy... allowed_keys".
-        // Let's implement: If allowed_keys is NOT empty, key MUST be present.
         if !taxonomy.allowed_keys.is_empty() && !taxonomy.allowed_keys.contains(&key.to_string()) {
             rejected.push(RejectedCue {
                 cue: cue.clone(),

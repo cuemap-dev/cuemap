@@ -12,7 +12,6 @@ pub mod setup {
      use super::*;
 
      pub fn check_and_install_ollama() -> bool {
-         // 1. Check if installed
          let status = Command::new("which")
              .arg("ollama")
              .output();
@@ -23,7 +22,6 @@ pub mod setup {
          
          info!("Ollama not found. Attempting to install via brew...");
          
-         // 2. Install via brew
          let install = Command::new("brew")
              .arg("install")
              .arg("ollama")
@@ -54,21 +52,17 @@ pub mod setup {
 
          let client = get_client();
          let base_url = config.ollama_url.trim_end_matches("/");
-         let health_url = format!("{}", base_url); // Checking root often returns 200 OK "Ollama is running"
-
-         // 3. Check if running
+         let health_url = format!("{}", base_url);
          let is_running = client.get(&health_url).send().await.is_ok();
          
          if !is_running {
              info!("Ollama is not running. Starting server...");
-             // Spawn in background
              let _ = Command::new("ollama")
                  .arg("serve")
                  .stdout(Stdio::null())
                  .stderr(Stdio::null())
                  .spawn();
                  
-             // Wait for it to come up
              info!("Waiting for Ollama to start...");
              for _ in 0..10 {
                  tokio::time::sleep(Duration::from_secs(1)).await;
@@ -79,8 +73,6 @@ pub mod setup {
              }
          }
          
-         // 4. Check/Pull Model
-         // Check if model exists
          let tags_url = format!("{}/api/tags", base_url);
          if let Ok(resp) = client.get(&tags_url).send().await {
              if let Ok(body) = resp.json::<serde_json::Value>().await {
@@ -91,7 +83,6 @@ pub mod setup {
                      
                  if !model_exists {
                      info!("Model '{}' not found. Pulling... (this make take a while)", config.model);
-                     // Using Command to pull so we can inherit stdout and show progress
                      let pull = Command::new("ollama")
                          .arg("pull")
                          .arg(&config.model)
@@ -126,7 +117,7 @@ fn get_client() -> &'static Client {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
-    pub provider: String, // "ollama" | "openai" | "google"
+    pub provider: String, // "ollama"
     pub model: String,
     pub api_key: Option<String>, // Optional for local providers like Ollama
     pub ollama_url: String, // Ollama endpoint (default: http://localhost:11434)
@@ -147,27 +138,6 @@ impl LlmConfig {
                      api_key: None,
                      ollama_url: url,
                  })
-            },
-            super::config::CueGenStrategy::Openai => {
-                 let model = env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-3.5-turbo".to_string());
-                 let api_key = env::var("LLM_API_KEY").ok(); 
-                 // Note: If api_key is missing, job might fail later, but we return Some config to attempt it
-                 Some(Self {
-                     provider: "openai".to_string(),
-                     model,
-                     api_key,
-                     ollama_url: String::new(),
-                 })
-            },
-             super::config::CueGenStrategy::Google => {
-                 let model = env::var("LLM_MODEL").unwrap_or_else(|_| "gemini-pro".to_string());
-                 let api_key = env::var("LLM_API_KEY").ok();
-                 Some(Self {
-                     provider: "google".to_string(),
-                     model,
-                     api_key,
-                     ollama_url: String::new(),
-                 })
             }
         }
     }
@@ -183,17 +153,9 @@ impl LlmConfig {
 
         // Default to Ollama (local, no API key required)
         let provider = env::var("LLM_PROVIDER").unwrap_or_else(|_| "ollama".to_string());
-        
-        let (model, api_key, ollama_url) = if provider == "ollama" {
-            let model = env::var("LLM_MODEL").unwrap_or_else(|_| "mistral".to_string());
-            let url = env::var("OLLAMA_URL").unwrap_or_else(|_| "http://localhost:11434".to_string());
-            (model, None, url)
-        } else {
-            let model = env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-3.5-turbo".to_string());
-            let api_key = env::var("LLM_API_KEY").ok();
-            (model, api_key, "http://localhost:11434".to_string())
-        };
-        
+        let model = env::var("LLM_MODEL").unwrap_or_else(|_| "mistral".to_string());
+        let api_key = env::var("LLM_API_KEY").ok();
+        let ollama_url = env::var("OLLAMA_URL").unwrap_or_else(|_| "http://localhost:11434".to_string());
         Some(Self {
             provider,
             model,
@@ -206,12 +168,11 @@ impl LlmConfig {
 pub async fn propose_cues(content: &str, config: &LlmConfig, known_cues: &[String]) -> Result<Vec<String>, String> {
     match config.provider.as_str() {
         "ollama" => propose_cues_ollama(content, config, known_cues).await,
-        "openai" => propose_cues_openai(content, config, known_cues).await,
-        "google" => propose_cues_google(content, config, known_cues).await,
         _ => Err(format!("Unsupported provider: {}", config.provider)),
     }
 }
 
+// Deprecated, but keeping for compatibility/reference
 pub async fn extract_facts(content: &str, config: &LlmConfig) -> Result<(String, Vec<String>), String> {
     // Only implemented for Ollama for this milestone
     match config.provider.as_str() {
@@ -220,6 +181,7 @@ pub async fn extract_facts(content: &str, config: &LlmConfig) -> Result<(String,
     }
 }
 
+// Deprecated, but keeping for compatibility/reference
 async fn extract_facts_ollama(content: &str, config: &LlmConfig) -> Result<(String, Vec<String>), String> {
     let system_prompt = r#"You are a Knowledge Extraction Agent. 
 Convert the raw file chunk into a structured memory for an agentic database.
@@ -267,6 +229,7 @@ Keep summary factual and dense."#;
     Ok(parse_extraction_response(response_text, content))
 }
 
+// Deprecated, but keeping for compatibility/reference
 pub fn parse_extraction_response(response_text: &str, content: &str) -> (String, Vec<String>) {
     // Parse JSON
     let mut summary = String::new();
@@ -329,6 +292,7 @@ pub fn parse_extraction_response(response_text: &str, content: &str) -> (String,
     (summary, cues)
 }
 
+// Deprecated, but keeping for compatibility/reference
 async fn propose_cues_ollama(content: &str, config: &LlmConfig, known_cues: &[String]) -> Result<Vec<String>, String> {
     let context_hint = if !known_cues.is_empty() {
         format!(
@@ -458,114 +422,3 @@ pub fn parse_proposal_response(response_text: &str) -> Result<Vec<String>, Strin
     Ok(extracted_cues)
 }
 
-async fn propose_cues_openai(content: &str, config: &LlmConfig, known_cues: &[String]) -> Result<Vec<String>, String> {
-    let api_key = config.api_key.as_ref().ok_or("OpenAI requires LLM_API_KEY")?;
-    
-    let context_hint = if !known_cues.is_empty() {
-        format!("Known cues (use as baseline): {:?}. EXPAND SEMANTICALLY but stay grounded.", known_cues)
-    } else {
-        String::new()
-    };
-    
-    let system_prompt = format!(r#"You are a tagging engine for a deterministic memory system. Analyze the content and extract canonical cues.
-{}
-Output strictly JSON in this format: {{"cues": ["key:value", "service:name", ...]}}.
-Rules:
-- Use k:v format
-- Keys must be broad categories (service, topic, lang, tool, error, status)
-- Values must be single tokens or short canonical identifiers
-- Precision is more important than completeness
-- Only extract cues directly implied by the text
-- No conversational text"#, context_hint);
-
-    let response = get_client()
-        .post("https://api.openai.com/v1/chat/completions")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .json(&json!({
-            "model": config.model,
-            "messages": [
-                { "role": "system", "content": system_prompt },
-                { "role": "user", "content": content }
-            ],
-            "response_format": { "type": "json_object" }
-        }))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    if !response.status().is_success() {
-        let text = response.text().await.unwrap_or_default();
-        return Err(format!("OpenAI API error: {}", text));
-    }
-
-    let body: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
-    
-    let cues_json = body["choices"][0]["message"]["content"]
-        .as_str()
-        .ok_or("Invalid response format")?;
-        
-    let parsed: serde_json::Value = serde_json::from_str(cues_json).map_err(|e| e.to_string())?;
-    
-    let cues = parsed["cues"]
-        .as_array()
-        .ok_or("Missing 'cues' array")?
-        .iter()
-        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-        .collect();
-        
-    Ok(cues)
-}
-
-async fn propose_cues_google(content: &str, config: &LlmConfig, known_cues: &[String]) -> Result<Vec<String>, String> {
-    let api_key = config.api_key.as_ref().ok_or("Google requires LLM_API_KEY")?;
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-        config.model, api_key
-    );
-
-    let prompt = format!(
-        "Extract canonical cues (k:v format) from this content. Return JSON {{ \"cues\": [...] }}. Content: {}. Known cues: {:?} (Expand semantically but stay grounded)",
-        content, known_cues
-    );
-
-    let response = get_client()
-        .post(&url)
-        .json(&json!({
-            "contents": [{
-                "parts": [{ "text": prompt }]
-            }]
-        }))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    if !response.status().is_success() {
-        let text = response.text().await.unwrap_or_default();
-        return Err(format!("Google API error: {}", text));
-    }
-
-    let body: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
-    
-    // Parse Gemini response structure (simplified)
-    let text = body["candidates"][0]["content"]["parts"][0]["text"]
-        .as_str()
-        .ok_or("Invalid Gemini response")?;
-    
-    // Gemini often includes markdown code blocks ```json ... ```
-    let clean_text = text
-        .trim()
-        .trim_start_matches("```json")
-        .trim_start_matches("```")
-        .trim_end_matches("```");
-        
-    let parsed: serde_json::Value = serde_json::from_str(clean_text).map_err(|e| e.to_string())?;
-    
-    let cues = parsed["cues"]
-        .as_array()
-        .ok_or("Missing 'cues' array")?
-        .iter()
-        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-        .collect();
-        
-    Ok(cues)
-}

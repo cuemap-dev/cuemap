@@ -1,5 +1,5 @@
-use crate::engine::CueMapEngine;
-use crate::evals::runner::{Eval, EvalResult};
+use cuemap_rust::engine::CueMapEngine;
+use super::super::runner::{Eval, EvalResult};
 
 pub struct ParaphraseInvarianceEval {
     pub query1: Vec<String>,

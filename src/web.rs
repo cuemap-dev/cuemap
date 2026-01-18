@@ -1,3 +1,4 @@
+#[cfg(feature = "ui")]
 use rust_embed::RustEmbed;
 use axum::{
     http::{header, StatusCode, Uri},
@@ -5,9 +6,29 @@ use axum::{
     body::Body,
 };
 
+#[cfg(feature = "ui")]
 #[derive(RustEmbed)]
 #[folder = "web_ui/dist"]
 pub struct Assets;
+
+#[cfg(not(feature = "ui"))]
+pub struct Assets;
+
+#[cfg(not(feature = "ui"))]
+pub struct EmbeddedFile {
+    pub data: std::borrow::Cow<'static, [u8]>,
+}
+
+#[cfg(not(feature = "ui"))]
+impl Assets {
+    pub fn get(_path: &str) -> Option<EmbeddedFile> {
+        None
+    }
+    
+    pub fn iter() -> impl Iterator<Item = std::borrow::Cow<'static, str>> {
+        std::iter::empty()
+    }
+}
 
 pub struct StaticFile<T>(pub T);
 

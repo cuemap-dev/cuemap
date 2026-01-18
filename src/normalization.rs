@@ -62,18 +62,6 @@ pub fn normalize_cue(raw: &str, config: &NormalizationConfig) -> (String, Normal
         }
     }
 
-    // 4. Fix Duplicated Prefixes (e.g., "key:value:value" -> "key:value")
-    // This handles cases where rewrite rules or LLM output might accidentally double-prefix
-    let parts: Vec<&str> = current.split(':').collect();
-    if parts.len() >= 3 && parts[1] == parts[2] && !parts[1].is_empty() {
-        // Reconstruct without the duplicated part
-        // We keep parts[0] (key) and then parts[2..] (value onwards)
-        let mut new_parts = vec![parts[0]];
-        new_parts.extend_from_slice(&parts[2..]);
-        current = new_parts.join(":");
-        applied_rules.push("dedupe_prefix".to_string());
-    }
-
     (
         current.clone(),
         NormalizeTrace {

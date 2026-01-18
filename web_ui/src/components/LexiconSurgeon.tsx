@@ -43,7 +43,11 @@ interface LexiconGraphResponse {
     total_entries: number;
 }
 
-const LexiconSurgeon: React.FC = () => {
+interface LexiconSurgeonProps {
+    projectId: string;
+}
+
+const LexiconSurgeon: React.FC<LexiconSurgeonProps> = ({ projectId }) => {
     const [searchCue, setSearchCue] = useState('');
     const [data, setData] = useState<LexiconInspectResponse | null>(null);
     const [loading, setLoading] = useState(false);
@@ -66,8 +70,7 @@ const LexiconSurgeon: React.FC = () => {
             }
 
             try {
-                const params = new URLSearchParams(window.location.search);
-                const projectId = params.get('project');
+                
                 const headers: Record<string, string> = {};
                 if (projectId) {
                     headers['X-Project-ID'] = projectId;
@@ -128,8 +131,6 @@ const LexiconSurgeon: React.FC = () => {
     useEffect(() => {
         const loadFullGraph = async () => {
             try {
-                const params = new URLSearchParams(window.location.search);
-                const projectId = params.get('project');
                 const headers: Record<string, string> = {};
                 if (projectId) {
                     headers['X-Project-ID'] = projectId;
@@ -176,8 +177,7 @@ const LexiconSurgeon: React.FC = () => {
         setLoading(true);
         setSelectedEntry(null);
         try {
-            const params = new URLSearchParams(window.location.search);
-            const projectId = params.get('project');
+            
             const headers: Record<string, string> = {};
             if (projectId) {
                 headers['X-Project-ID'] = projectId;
@@ -249,8 +249,7 @@ const LexiconSurgeon: React.FC = () => {
         if (!selectedEntry) return;
 
         try {
-            const params = new URLSearchParams(window.location.search);
-            const projectId = params.get('project');
+            
             const headers: Record<string, string> = {};
             if (projectId) {
                 headers['X-Project-ID'] = projectId;
@@ -304,8 +303,6 @@ const LexiconSurgeon: React.FC = () => {
         if (!wireToken.trim() || !wireCanonical.trim()) return;
 
         try {
-            const params = new URLSearchParams(window.location.search);
-            const projectId = params.get('project');
             const headers: Record<string, string> = { 'Content-Type': 'application/json' };
             if (projectId) {
                 headers['X-Project-ID'] = projectId;

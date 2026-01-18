@@ -1,6 +1,6 @@
 [package]
 name = "cuemap-rust"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 
 [dependencies]
@@ -14,11 +14,12 @@ uuid = { version = "1.6", features = ["v4", "serde", "v5"] }
 rayon = "1.8"
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors"] }
+rand = "0.8"
 chrono = "0.4"
 indexmap = { version = "2.1", features = ["serde"] }
 clap = { version = "4.4", features = ["derive"] }
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 regex = "1.10"
 reqwest = { version = "0.12.26", features = ["json"] }
 smallvec = "1.15.1"
@@ -50,14 +51,28 @@ thesaurus = "0.5.2"
 finalfusion = "0.18.0"
 ndarray = "0.15"
 lru = "0.12.3"
-rust-embed = "8.9.0"
+rust-embed = { version = "8.9.0", optional = true }
 mime_guess = "2.0.5"
 postagger = "0.0.3"
+unicode-segmentation = "1.12"
+scraper = "0.21"
+url = "2.5"
+unicode-general-category = "1.1.0"
+nlprule = "0.6"
+subtle = "2.6.1"
+axum-extra = { version = "0.9", features = ["multipart"] }
+
+[features]
+default = []
+ui = ["rust-embed"]
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["full", "test-util"] }
 tempfile = "3.8"
 tower = { version = "0.4", features = ["util"] }
+
+[build-dependencies]
+nlprule-build = "0.6"
 
 [profile.release]
 opt-level = 3
@@ -84,9 +99,7 @@ path = "tests/projects/mod.rs"
 name = "taxonomy"
 path = "tests/taxonomy/mod.rs"
 
-[[test]]
-name = "integration"
-path = "tests/integration/mod.rs"
+
 
 [[test]]
 name = "multi_tenant"
@@ -99,3 +112,7 @@ path = "tests/nl/mod.rs"
 [[test]]
 name = "llm"
 path = "tests/llm/mod.rs"
+
+[[test]]
+name = "agent"
+path = "tests/agent/mod.rs"

@@ -47,11 +47,15 @@ To bridge the gap between user queries and stored memories, CueMap integrates **
 ### Build & Run
 
 ```bash
-# Development
+# Development (Backend only - Fast)
 cargo run
 
-# Production (optimized)
-cargo build --release
+# Development (With Embedded UI)
+# Note: Requires building the UI first (cd web_ui && npm run build)
+cargo run --features ui
+
+# Production (optimized, with UI)
+cargo build --release --features ui
 ./target/release/cuemap-rust --port 8080
 ```
 
@@ -71,19 +75,38 @@ Options:
   -p, --port <PORT>                    Server port [default: 8080]
   -d, --data-dir <DATA_DIR>            Data directory [default: ./data]
   -s, --snapshot-interval <SECONDS>    Snapshot interval [default: 60]
-  -m, --multi-tenant                   Enable multi-tenancy
   --agent-dir <DIR>                    Path to watch for self-learning ingestion
   --agent-throttle <MS>                Throttle rate for ingestion [default: 50ms]
 ```
 
-## Embedded Web UI (New)
+## Embedded Web UI
 
-CueMap v0.5 now includes a lightweight, embedded visualization dashboard.
+CueMap includes a lightweight, embedded visualization dashboard with real-time insights.
 
-- **Synapse Graph**: View your memory store as a force-directed graph. Nodes represent memories and cues; edges represent co-occurrence strength.
+### Features (v0.6)
+
+- **Live Ingestion Dashboard**: Two-column graph view showing Memory and Lexicon growth in real-time with auto-refresh.
+- **Synapse Graph**: Force-directed graph visualization with auto-zoom-to-fit. Nodes represent memories and cues; edges show co-occurrence.
 - **Real-Time Inspector**: Debug queries, view score breakdowns, and inspect raw memory content.
+- **Project Selector**: Switch between projects via header dropdown (persists via URL query params).
+- **Stats Overlay**: Memory and cue counts displayed as translucent overlays on graph views.
 
-Access it directly from the binary at: `http://localhost:8080/ui`
+Access it directly at: `http://localhost:8080/ui` (requires running with `--features ui`)
+
+### Frontend Development
+
+Run the UI separately from the engine for faster iteration:
+
+```bash
+# Terminal 1: Run Rust Engine
+cargo run -- --data-dir ./data
+
+# Terminal 2: Run Vite Dev Server (hot-reloading)
+cd web_ui && npm run dev
+# Access at: http://localhost:3000/ui/
+```
+
+The Vite config proxies all API requests to the engine on port 8080.
 
 ## Self-Learning Agent (Zero-Friction Ingestion)
 
@@ -112,22 +135,24 @@ On startup, if `--agent-dir` is provided, CueMap initializes the **Self-Learning
 ```
 
 
-## Multi-Tenant Mode with Persistence
+## Project Management & Persistence
 
-Multi-tenant mode provides complete project isolation with automatic persistence:
+CueMap provides complete project isolation with automatic persistence:
 
 ### Features
 
-- **Project Isolation**: Each project has its own memory space
+- **Project Isolation**: Each project has its own memory space, identified by `X-Project-ID` header.
 - **Auto-Save on Shutdown**: All projects saved when server stops (Ctrl+C)
 - **Auto-Load on Startup**: All snapshots restored when server starts
 - **Zero Configuration**: Works out of the box
 
 ### Usage
 
+CueMap runs in multi-tenant mode by default. Simply specify a project ID in your requests.
+
 ```bash
-# Start in multi-tenant mode
-./target/release/cuemap-rust --port 8080 --multi-tenant
+# Start server
+./target/release/cuemap-rust --port 8080
 ```
 
 ### Example
@@ -151,7 +176,7 @@ Snapshots are automatically managed:
 - **Created**: On graceful shutdown (SIGINT/Ctrl+C)
 - **Loaded**: On server startup
 - **Location**: `./data/snapshots/` (configurable via `--data-dir`)
-- **Format**: Bincode binary (same as single-tenant mode)
+- **Format**: Bincode binary
 - **Files**: `{project-id}.bin` (one file per project)
 
 ## Authentication
@@ -180,11 +205,11 @@ curl http://localhost:8080/stats
 # Response: Missing X-API-Key header
 
 # With correct key
-curl -H "X-API-Key: your-secret-key" http://localhost:8080/stats
+curl -H "X-API-Key: your-secret-key" -H "X-Project-ID: default" http://localhost:8080/stats
 # Response: {"total_memories": 1000, ...}
 
 # With wrong key
-curl -H "X-API-Key: wrong-key" http://localhost:8080/stats
+curl -H "X-API-Key: wrong-key" -H "X-Project-ID: default" http://localhost:8080/stats
 # Response: Invalid API key
 ```
 
@@ -335,6 +360,7 @@ CueMap can automatically propose cues for your memories using **LLMs** or **Sema
 
 # 2. Add memory
 curl -X POST http://localhost:8080/memories \
+  -H "X-Project-ID: default" \
   -H "Content-Type: application/json" \
   -d '{
     "content": "The payments service is down due to a timeout.",
@@ -376,6 +402,7 @@ export LLM_API_KEY=your-key
 ```bash
 # Basic manual cues
 curl -X POST http://localhost:8080/memories \
+  -H "X-Project-ID: default" \
   -H "Content-Type: application/json" \
   -d '{
     "content": "API Rate Limit Policy: 1000/min",
@@ -384,6 +411,7 @@ curl -X POST http://localhost:8080/memories \
 
 # Auto-generate cues via semantic engine (default) or LLM (if configured)
 curl -X POST http://localhost:8080/memories \
+  -H "X-Project-ID: default" \
   -H "Content-Type: application/json" \
   -d '{
     "content": "The payments service is down due to a timeout.",
@@ -396,6 +424,7 @@ curl -X POST http://localhost:8080/memories \
 #### Explicit Cues
 ```bash
 curl -X POST http://localhost:8080/recall \
+  -H "X-Project-ID: default" \
   -H "Content-Type: application/json" \
   -d '{
     "cues": ["api", "rate_limit"],
@@ -407,6 +436,7 @@ curl -X POST http://localhost:8080/recall \
 #### Natural Language Search (Deterministic)
 ```bash
 curl -X POST http://localhost:8080/recall \
+  -H "X-Project-ID: default" \
   -H "Content-Type: application/json" \
   -d '{
     "query_text": "payments service timeout",
@@ -420,6 +450,7 @@ Returns memories matching tokens mapped via the local Lexicon CueMap. Use `"expl
 
 ```bash
 curl -X PATCH http://localhost:8080/memories/{id}/reinforce \
+  -H "X-Project-ID: default" \
   -H "Content-Type: application/json" \
   -d '{
     "cues": ["important", "urgent"]
@@ -429,12 +460,12 @@ curl -X PATCH http://localhost:8080/memories/{id}/reinforce \
 ### Get Memory
 
 ```bash
-curl http://localhost:8080/memories/{id}
+curl -H "X-Project-ID: default" http://localhost:8080/memories/{id}
 ```
 
 ### Get Stats
 ```bash
-curl http://localhost:8080/stats
+curl -H "X-Project-ID: default" http://localhost:8080/stats
 ```
 
 ### Alias Management
@@ -444,6 +475,7 @@ Manage synonyms and semantic mappings deterministically.
 #### Add Alias
 ```bash
 curl -X POST http://localhost:8080/aliases \
+  -H "X-Project-ID: default" \
   -H "Content-Type: application/json" \
   -d '{
     "from": "pay",
@@ -455,6 +487,7 @@ curl -X POST http://localhost:8080/aliases \
 #### Merge Aliases (Bulk)
 ```bash
 curl -X POST http://localhost:8080/aliases/merge \
+  -H "X-Project-ID: default" \
   -H "Content-Type: application/json" \
   -d '{
     "cues": ["bill", "invoice", "statement"],
@@ -465,7 +498,7 @@ curl -X POST http://localhost:8080/aliases/merge \
 #### Get Aliases
 ```bash
 # Reverse lookup: Find all aliases for "service:payment"
-curl "http://localhost:8080/aliases?cue=service:payment"
+curl -H "X-Project-ID: default" "http://localhost:8080/aliases?cue=service:payment"
 ```
 
 ### Relevance Compression Engine (v0.5)
@@ -476,6 +509,7 @@ The "Hallucination Guardrail" module. Deterministically greedy-fills a token bud
 
 ```bash
 curl -X POST http://localhost:8080/recall/grounded \
+  -H "X-Project-ID: default" \
   -H "Content-Type: application/json" \
   -d '{
     "query_text": "Why is the server down?",

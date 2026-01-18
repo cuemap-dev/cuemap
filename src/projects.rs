@@ -5,6 +5,8 @@ use crate::config::CueGenStrategy;
 use crate::semantic::SemanticEngine;
 use dashmap::DashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 pub struct ProjectContext {
@@ -16,6 +18,7 @@ pub struct ProjectContext {
     pub taxonomy: Taxonomy,
     pub cuegen_strategy: CueGenStrategy,
     pub semantic_engine: SemanticEngine,
+    pub last_activity: AtomicU64,
 }
 
 impl ProjectContext {
@@ -29,7 +32,27 @@ impl ProjectContext {
             taxonomy,
             cuegen_strategy,
             semantic_engine,
+            last_activity: AtomicU64::new(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+            ),
         }
+    }
+    
+    pub fn touch(&self) {
+        self.last_activity.store(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            Ordering::Relaxed
+        );
+    }
+    
+    pub fn get_last_activity(&self) -> u64 {
+        self.last_activity.load(Ordering::Relaxed)
     }
     
     // IDF-based filtering helpers
@@ -43,15 +66,23 @@ impl ProjectContext {
     
     /// Resolves cues from text using the Lexicon.
     /// Returns (resolved_cues, lexicon_memory_ids) - the memory IDs can be used for async reinforcement.
-    pub fn resolve_cues_from_text(&self, text: &str) -> (Vec<String>, Vec<String>) {
+    /// Resolve cues from text with tokenization, normalization, and validation.
+    /// 
+    /// When `skip_lexicon` is true, skips the lexicon lookup but still performs:
+    /// - Tokenization
+    /// - Normalization
+    /// - Taxonomy validation
+    pub fn resolve_cues_from_text(&self, text: &str, skip_lexicon: bool) -> (Vec<String>, Vec<String>) {
         use std::time::Instant;
         let t_start = Instant::now();
         
         let normalized_text = crate::nl::normalize_text(text);
         
-        // Check cache (cache only stores cues, not memory IDs)
-        if let Some(cues) = self.query_cache.get(&normalized_text) {
-            return (cues.clone(), Vec::new());  // No memory IDs from cache
+        // Check cache (cache only stores cues, not memory IDs) - skip if lexicon disabled
+        if !skip_lexicon {
+            if let Some(cues) = self.query_cache.get(&normalized_text) {
+                return (cues.clone(), Vec::new());  // No memory IDs from cache
+            }
         }
         
         // Tokenize
@@ -63,21 +94,41 @@ impl ProjectContext {
             return (Vec::new(), Vec::new());
         }
         
-        // Fast lexicon lookup - O(1) per cue, no scoring overhead
         let t_lex = Instant::now();
-        let lexicon_results = self.lexicon.recall_fast(tokens, 64);
-        let lex_ms = t_lex.elapsed().as_secs_f64() * 1000.0;
-        
-        let t_norm = Instant::now();
         let mut canonical_cues = Vec::new();
         let mut lexicon_memory_ids = Vec::new();
-        for result in lexicon_results {
-            // result.content is the canonical cue
-            let (normalized, _) = crate::normalization::normalize_cue(&result.content, &self.normalization);
-            canonical_cues.push(normalized);
-            lexicon_memory_ids.push(result.memory_id.clone());
+        
+        if skip_lexicon {
+            // Skip lexicon - just normalize the tokens directly
+            for token in &tokens {
+                let (normalized, _) = crate::normalization::normalize_cue(token, &self.normalization);
+                if !canonical_cues.contains(&normalized) {
+                    canonical_cues.push(normalized);
+                }
+            }
+        } else {
+            // Fast lexicon lookup - O(1) per cue, no scoring overhead
+            let lexicon_results = self.lexicon.recall_fast(tokens.clone(), 64);
+            
+            for result in lexicon_results {
+                // result.content is the canonical cue
+                let (normalized, _) = crate::normalization::normalize_cue(&result.content, &self.normalization);
+                canonical_cues.push(normalized);
+                lexicon_memory_ids.push(result.memory_id.clone());
+            }
+            
+            // FALLBACK: If Lexicon returned nothing, use raw tokens directly
+            // This ensures queries for terms not trained in Lexicon still work
+            if canonical_cues.is_empty() {
+                for token in &tokens {
+                    let (normalized, _) = crate::normalization::normalize_cue(token, &self.normalization);
+                    if !canonical_cues.contains(&normalized) {
+                        canonical_cues.push(normalized);
+                    }
+                }
+            }
         }
-        let norm_ms = t_norm.elapsed().as_secs_f64() * 1000.0;
+        let lex_ms = t_lex.elapsed().as_secs_f64() * 1000.0;
         
         // Validate list
         let t_val = Instant::now();
@@ -89,14 +140,16 @@ impl ProjectContext {
         
         // Log timing breakdown if slow (>1ms)
         if total_ms > 1.0 {
-            tracing::info!(
-                "resolve_cues_from_text: tok={:.2}ms lex_recall={:.2}ms norm={:.2}ms val={:.2}ms | total={:.2}ms",
-                tok_ms, lex_ms, norm_ms, val_ms, total_ms
+            tracing::debug!(
+                "resolve_cues_from_text: tok={:.2}ms lex_recall={:.2}ms val={:.2}ms | total={:.2}ms skip_lexicon={}",
+                tok_ms, lex_ms, val_ms, total_ms, skip_lexicon
             );
         }
         
-        // Cache
-        self.query_cache.insert(normalized_text, accepted.clone());
+        // Cache (only if lexicon was used)
+        if !skip_lexicon {
+            self.query_cache.insert(normalized_text, accepted.clone());
+        }
         
         (accepted, lexicon_memory_ids)
     }
@@ -109,9 +162,8 @@ impl ProjectContext {
             expanded.push((cue.clone(), 1.0));
             
             // 2. ONLY expand aliases for original tokens (not Lexicon synonyms)
-            // This avoids expensive alias lookups for all 67 Lexicon results
             if !original_tokens.contains(&cue) {
-                continue;  // Skip alias expansion for synonyms
+                continue;
             }
             
             // 2. Query aliases
@@ -138,7 +190,7 @@ impl ProjectContext {
                          // Default downweight 0.85 if not specified
                          let downweight = data.get("downweight").and_then(|v| v.as_f64()).unwrap_or(0.85);
                          
-                         // The "to" field in content is the actual cue, e.g., "service:payments"
+                         // The "to" field in content is the actual cue
                          expanded.push((to_cue.to_string(), downweight));
                      }
                 }
@@ -152,7 +204,6 @@ impl ProjectContext {
         
         expanded.into_iter()
             .filter(|(cue, _)| {
-                // PERFORMANCE: Corpus Restriction
                 // Only keep cues that exist in the index.
                 self.main.get_cue_index().contains_key(cue) && seen.insert(cue.clone())
             })
@@ -177,7 +228,6 @@ impl ProjectStore {
         }
 
         // Create new project with default config
-        // In a real app, we might load config from DB/disk here
         let ctx = Arc::new(ProjectContext::new(
             NormalizationConfig::default(),
             Taxonomy::default(),

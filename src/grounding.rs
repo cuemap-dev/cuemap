@@ -10,10 +10,10 @@ pub struct SelectedItem {
     pub recency_component: f64,
     pub reinforcement_component: f64,
     pub match_integrity: f64,
-    pub source: String,        // e.g., "commits", "logs", "policies"
-    pub timestamp: String,     // ISO-8601
+    pub source: String,
+    pub timestamp: String,
     pub estimated_tokens: u32,
-    pub why: String,           // short reason, deterministic
+    pub why: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,8 +53,6 @@ impl GroundingEngine {
         let mut excluded_top = Vec::new();
         let mut current_tokens = 0;
 
-        // Results are already sorted by cue_score desc from engine.rs
-        // We perform a greedy selection
         for result in results {
             let tokens = Self::estimate_tokens(&result.content);
             
@@ -70,7 +68,6 @@ impl GroundingEngine {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| {
-                        // Format created_at (unix timestamp) as ISO 8601
                         let secs = result.created_at as i64;
                         let nanos = ((result.created_at - secs as f64) * 1_000_000_000.0) as u32;
                         if let Some(dt) = chrono::DateTime::from_timestamp(secs, nanos) {
@@ -119,7 +116,7 @@ impl GroundingEngine {
 
     pub fn format_context_block(selected: &[SelectedItem]) -> String {
         if selected.is_empty() {
-            return "[VERIFIED CONTEXT]\nNo verified memories found for this query.\n[/VERIFIED CONTEXT]".to_string();
+            return "".to_string();
         }
 
         let mut block = String::from("[VERIFIED CONTEXT]\n");
@@ -133,7 +130,7 @@ impl GroundingEngine {
                 item.timestamp
             ));
         }
-        block.push_str("[/VERIFIED CONTEXT]\n\nGuidelines:\n- Use the context above to personalize your response.\n- You may also use your general knowledge to provide a complete answer.\n- When citing specific memories, include the source ID in brackets.");
+        block.push_str("[/VERIFIED CONTEXT]");
         block
     }
 }

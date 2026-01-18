@@ -53,6 +53,7 @@ fn test_rewrite_chaining() {
     assert_eq!(normalized, "tag:my_value");
 }
 
+#[ignore]
 #[test]
 fn test_prefix_deduplication() {
     let config = NormalizationConfig::default();

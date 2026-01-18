@@ -37,7 +37,6 @@ impl Watcher {
                         }
                     } else if event.kind.is_remove() {
                         for path in event.paths {
-                            debug!("File removed: {:?}", path);
                             let ingester = tx_ingester.clone();
                             handle.spawn(async move {
                                 let mut locked = ingester.lock().await;
