@@ -150,8 +150,7 @@ async fn main() {
         }
     }
     
-    // Start reaper for inactive projects (30 mins timeout, check every 60s)
-    mt_engine.start_reaper(Duration::from_secs(60), Duration::from_secs(1800));
+
     
     let provider: Arc<dyn jobs::ProjectProvider> = mt_engine.clone();
     let job_queue = Arc::new(jobs::JobQueue::new(provider, args.disable_bg_jobs));

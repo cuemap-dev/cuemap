@@ -196,7 +196,7 @@ pub fn routes(mt_engine: Arc<MultiTenantEngine>, job_queue: Arc<JobQueue>, auth_
         .route("/memories/:id", get(get_memory).delete(delete_memory))
         .route("/stats", get(get_stats))
         .route("/projects", get(list_projects))
-        .route("/sandbox/create", post(create_sandbox_project))
+
         .route("/recall/grounded", post(recall_grounded))
         .route("/projects/:id", delete(delete_project))
         .route("/aliases", post(add_alias).get(get_aliases))
@@ -1376,37 +1376,7 @@ async fn merge_aliases(
         })))
 }
 
-async fn create_sandbox_project(
-    State(state): State<EngineState>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let EngineState { mt_engine, .. } = state;
-    let project_id = generate_random_id();
-    match mt_engine.get_or_create_project(project_id.clone()) {
-        Ok(_) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({
-                "project_id": project_id,
-                "status": "created",
-                "expires_in_secs": 300
-            })),
-        ),
-        Err(e) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": e})),
-        ),
-    }
-}
 
-fn generate_random_id() -> String {
-    use rand::seq::SliceRandom;
-    let adjectives = ["gentle", "swift", "brave", "clever", "wild", "bright", "calm", "cool", "deep", "easy"];
-    let nouns = ["dolphin", "eagle", "tiger", "fox", "owl", "wolf", "bear", "lion", "hawk", "shark"];
-    let mut rng = rand::thread_rng();
-    let adj = adjectives.choose(&mut rng).unwrap();
-    let noun = nouns.choose(&mut rng).unwrap();
-    let num = rand::random::<u16>() % 1000;
-    format!("{}-{}-{}", adj, noun, num)
-}
 
 /// Ingest content from a URL using the Agent's Ingester
 async fn ingest_url(

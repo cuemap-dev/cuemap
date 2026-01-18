@@ -61,11 +61,7 @@ impl MultiTenantEngine {
             ctx.touch();
             Ok(ctx.clone())
         } else {
-            // TODO remove for prod release
-            // Check global pool limit (Max 10 for sandbox)
-            if self.projects.len() >= 10 {
-                return Err("Capacity reached. Please try again in 5 minutes.".to_string());
-            }
+
 
             // Create new project with default config
             let ctx = Arc::new(ProjectContext::new(
@@ -79,20 +75,7 @@ impl MultiTenantEngine {
         }
     }
     
-    /// Spawns a background thread to reap inactive projects
-    pub fn start_reaper(&self, interval: Duration, timeout: Duration) {
-        let engine = self.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            loop {
-                ticker.tick().await;
-                let count = engine.cleanup_inactive_projects(timeout.as_secs());
-                if count > 0 {
-                    tracing::info!("Reaper: purged {} inactive projects", count);
-                }
-            }
-        });
-    }
+
     
     /// Spawns a background thread to periodically save all project snapshots
     pub fn start_periodic_snapshots(&self, interval: Duration) {
@@ -115,26 +98,7 @@ impl MultiTenantEngine {
         });
     }
 
-    pub fn cleanup_inactive_projects(&self, timeout_secs: u64) -> usize {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-            
-        let mut count = 0;
-        // DashMap's retain allows removal during iteration
-        self.projects.retain(|id, ctx| {
-            let last = ctx.get_last_activity();
-            if now - last > timeout_secs {
-                tracing::info!("Reaping inactive project '{}'", id);
-                count += 1;
-                false // remove
-            } else {
-                true // keep
-            }
-        });
-        count
-    }
+
     
     pub fn get_project(&self, project_id: &ProjectId) -> Option<Arc<ProjectContext>> {
         self.projects.get(project_id).map(|e| e.clone())

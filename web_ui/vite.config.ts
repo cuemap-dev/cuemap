@@ -17,7 +17,7 @@ export default defineConfig({
       '/lexicon': 'http://localhost:8080',
       '/memory': 'http://localhost:8080',
       '/jobs': 'http://localhost:8080',
-      '/sandbox': 'http://localhost:8080',
+
     }
   }
 })
