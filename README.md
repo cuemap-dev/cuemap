@@ -253,7 +253,7 @@ docker run -p 8080:8080 \
 
 ## Performance
 
-### ⚡️ Benchmark Results (v0.6)
+### Benchmark Results (v0.6)
 
 Tests performed on **Real-World Data** (Wikipedia Articles), processing full natural language sentences with the complete NLP pipeline.
 
@@ -888,13 +888,6 @@ Lexicon Recall:
 | **Synonym handling** | ⚠️ Needs aliases | "pay" vs "payment" requires alias |
 | **Sparse data** | ❌ Low | Only 1-2 memories per cue |
 | **Novel vocabulary** | ❌ Low | Query uses completely new terms |
-
-#### Performance
-
-*   **Lexicon**: A specialized internal memory store (actually another CueMapEngine instance)
-*   **Self-Training**: Automatic association learning from every memory addition
-*   **Zero-Latency**: Pure in-memory hash lookups in microseconds
-*   **Deterministic**: Same query always returns same cues (unlike embeddings)
 
 #### Disambiguation Through Usage Patterns
 
