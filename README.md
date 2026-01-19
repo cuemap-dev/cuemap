@@ -33,7 +33,7 @@ Old, highly overlapping memories are periodically merged into summarized "gist" 
 ### Match Integrity
 Every recall result now includes a **Match Integrity** score. This internal diagnostic combines intersection strength, reinforcement history, and context agreement to tell you how structurally reliable a specific recall result is.
 
-### Semantic Bootstrapping (WordNet & Thesaurus)
+### Semantic Bootstrapping (WordNet)
 To bridge the gap between user queries and stored memories, CueMap integrates **WordNet** lookups during cue generation. This allows the engine to propose synonym-rich cues, ensuring that a memory tagged with "payment" is retrievable via "transaction" or "billing".
 
 
