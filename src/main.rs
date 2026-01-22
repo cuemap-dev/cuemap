@@ -58,7 +58,34 @@ struct Args {
     /// Enable autonomous systems consolidation (daily job)
     #[arg(long, default_value = "false")]
     enable_consolidation: bool,
+
+    // ========== Cloud Backup Options ==========
+    
+    /// Cloud backup provider (s3, gcs, azure, local)
+    #[arg(long)]
+    cloud_backup: Option<String>,
+
+    /// Cloud backup bucket/container name (or path for local)
+    #[arg(long)]
+    cloud_bucket: Option<String>,
+
+    /// Cloud backup region (for S3)
+    #[arg(long)]
+    cloud_region: Option<String>,
+
+    /// S3-compatible endpoint URL (for MinIO, DigitalOcean Spaces, etc.)
+    #[arg(long)]
+    cloud_endpoint: Option<String>,
+
+    /// Cloud backup object key prefix
+    #[arg(long, default_value = "cuemap/snapshots/")]
+    cloud_prefix: String,
+
+    /// Enable automatic cloud backup after each local save
+    #[arg(long, default_value = "false")]
+    cloud_auto_backup: bool,
 }
+
 
 #[tokio::main]
 async fn main() {
@@ -189,9 +216,49 @@ async fn main() {
     
     let mt_engine = mt_engine;
     
+    // Initialize metrics collector
+    let metrics = Arc::new(cuemap_rust::metrics::MetricsCollector::new());
+    
+    // Initialize cloud backup manager if configured
+    let cloud_backup: Option<Arc<persistence::CloudBackupManager>> = if args.cloud_backup.is_some() {
+        match persistence::CloudBackupConfig::from_args(
+            args.cloud_backup.as_deref(),
+            args.cloud_bucket.as_deref(),
+            args.cloud_region.as_deref(),
+            args.cloud_endpoint.as_deref(),
+            &args.cloud_prefix,
+            args.cloud_auto_backup,
+        ) {
+            Ok(config) if config.enabled => {
+                match persistence::CloudBackupManager::new(config).await {
+                    Ok(manager) => {
+                        info!("Cloud backup: Enabled");
+                        Some(Arc::new(manager))
+                    }
+                    Err(e) => {
+                        error!("Failed to initialize cloud backup: {}", e);
+                        None
+                    }
+                }
+            }
+            Ok(_) => {
+                info!("Cloud backup: Disabled");
+                None
+            }
+            Err(e) => {
+                error!("Invalid cloud backup configuration: {}", e);
+                None
+            }
+        }
+    } else {
+        info!("Cloud backup: Not configured");
+        None
+    };
+    
     let app = Router::new()
-        .merge(api::routes(mt_engine, job_queue, auth_config, is_static))
+        .merge(api::routes(mt_engine, job_queue, metrics, auth_config, is_static, cloud_backup))
         .layer(CorsLayer::permissive());
+
 
     
     let addr = SocketAddr::from(([0, 0, 0, 0], args.port));

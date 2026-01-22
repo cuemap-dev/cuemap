@@ -252,3 +252,106 @@ body,
     transform: rotate(360deg);
   }
 }
+
+/* Metrics Footer */
+.metrics-footer {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 32px;
+  background: linear-gradient(180deg, #1e293b 0%, #0f172a 100%);
+  border-top: 1px solid #334155;
+  display: flex;
+  align-items: center;
+  padding: 0 16px;
+  gap: 8px;
+  font-size: 0.75rem;
+  color: #94a3b8;
+  z-index: 1000;
+}
+
+.metrics-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.metrics-label {
+  color: #64748b;
+  font-weight: 500;
+}
+
+.metrics-value {
+  color: #e2e8f0;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.metrics-divider {
+  width: 1px;
+  height: 16px;
+  background: #334155;
+  margin: 0 4px;
+}
+
+.metrics-spacer {
+  flex: 1;
+}
+
+.metrics-status {
+  opacity: 0.8;
+}
+
+.metrics-status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.metrics-status-dot.ok {
+  background: #22c55e;
+  box-shadow: 0 0 4px #22c55e;
+}
+
+.metrics-status-dot.error {
+  background: #ef4444;
+  box-shadow: 0 0 4px #ef4444;
+}
+
+.metrics-status-dot.active {
+  background: #3b82f6;
+  box-shadow: 0 0 4px #3b82f6;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+.metrics-jobs {
+  color: #3b82f6;
+}
+
+.metrics-jobs .metrics-value {
+  color: #3b82f6;
+}
+
+.metrics-loading {
+  color: #64748b;
+  font-style: italic;
+}
+
+@keyframes pulse {
+
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.5;
+  }
+}
+
+/* Adjust app container to account for footer */
+.app-container {
+  padding-bottom: 32px;
+}

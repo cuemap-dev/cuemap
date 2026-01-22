@@ -16,3 +16,5 @@ pub mod grounding;
 pub mod semantic;
 pub mod web;
 pub mod crypto;
+pub mod metrics;
+

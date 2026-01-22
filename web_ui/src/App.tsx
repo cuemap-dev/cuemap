@@ -3,6 +3,7 @@ import { Search, Brain, BookOpen, Upload } from 'lucide-react';
 import GraphVisualizer from './components/GraphVisualizer';
 import Inspector from './components/Inspector';
 import LexiconSurgeon from './components/LexiconSurgeon';
+import MetricsFooter from './components/MetricsFooter';
 
 import IngestionScreen from './components/IngestionScreen';
 import './App.css';
@@ -310,6 +311,8 @@ function App() {
           )}
         </>
       )}
+
+      <MetricsFooter />
     </div>
   );
 }

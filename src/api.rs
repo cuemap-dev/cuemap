@@ -3,6 +3,8 @@ use crate::multi_tenant::{MultiTenantEngine, validate_project_id};
 use crate::normalization::normalize_cue;
 use crate::taxonomy::validate_cues;
 use crate::jobs::{Job, JobQueue};
+use crate::metrics::MetricsCollector;
+use crate::persistence::CloudBackupManager;
 use axum::{
     extract::{Path, State},
     http::{StatusCode, HeaderMap},
@@ -15,6 +17,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+
 
 #[derive(Debug, Deserialize)]
 pub struct AddMemoryRequest {
@@ -173,6 +176,35 @@ pub struct CreateProjectRequest {
     pub project_id: String,
 }
 
+// Context API - Query Expansion
+#[derive(Debug, Deserialize)]
+pub struct ContextExpandRequest {
+    pub query: String,
+    #[serde(default = "default_context_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub min_score: Option<f64>,
+}
+
+fn default_context_limit() -> usize {
+    20
+}
+
+#[derive(Debug, Serialize)]
+pub struct ContextExpandResponse {
+    pub query_cues: Vec<String>,
+    pub expansions: Vec<ExpansionCandidate>,
+    pub latency_ms: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExpansionCandidate {
+    pub term: String,
+    pub score: f64,
+    pub co_occurrence_count: u64,
+    pub source_cues: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ReinforceResponse {
     status: String,
@@ -184,10 +216,19 @@ pub struct EngineState {
     pub mt_engine: Arc<MultiTenantEngine>,
     pub read_only: bool,
     pub job_queue: Arc<JobQueue>,
+    pub metrics: Arc<MetricsCollector>,
+    pub cloud_backup: Option<Arc<CloudBackupManager>>,
 }
 
 /// API Routes
-pub fn routes(mt_engine: Arc<MultiTenantEngine>, job_queue: Arc<JobQueue>, auth_config: AuthConfig, read_only: bool) -> Router {
+pub fn routes(
+    mt_engine: Arc<MultiTenantEngine>, 
+    job_queue: Arc<JobQueue>, 
+    metrics: Arc<MetricsCollector>, 
+    auth_config: AuthConfig, 
+    read_only: bool,
+    cloud_backup: Option<Arc<CloudBackupManager>>,
+) -> Router {
     let mut router = Router::new()
         .route("/", get(root))
         .route("/memories", post(add_memory))
@@ -210,12 +251,21 @@ pub fn routes(mt_engine: Arc<MultiTenantEngine>, job_queue: Arc<JobQueue>, auth_
         .route("/ingest/content", post(ingest_content))
         .route("/ingest/file", post(ingest_file))
         .route("/jobs/status", get(jobs_status))
+        .route("/context/expand", post(context_expand))
+        .route("/metrics", get(prometheus_metrics))
+        // Cloud backup endpoints
+        .route("/backup/upload", post(backup_upload))
+        .route("/backup/download", post(backup_download))
+        .route("/backup/list", get(backup_list))
+        .route("/backup/:project_id", delete(backup_delete))
         .fallback(crate::web::handler)
         .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(EngineState { 
             mt_engine,
             read_only,
-            job_queue 
+            job_queue,
+            metrics,
+            cloud_backup,
         });
     
     // Add auth middleware if enabled
@@ -226,10 +276,11 @@ pub fn routes(mt_engine: Arc<MultiTenantEngine>, job_queue: Arc<JobQueue>, auth_
     router
 }
 
+
 async fn root() -> impl IntoResponse {
     Json(serde_json::json!({
         "name": "CueMap Rust Engine",
-        "version": "0.6.0",
+        "version": "0.6.1",
         "description": "High-performance Temporal-Associative Memory Store"
     }))
 }
@@ -313,7 +364,7 @@ async fn add_memory(
     
     use std::time::Instant;
     let start = Instant::now();
-    let EngineState { mt_engine, read_only, job_queue } = state;
+    let EngineState { mt_engine, read_only, job_queue, metrics, .. } = state;
 
     // Check if read-only
     if read_only {
@@ -382,7 +433,7 @@ async fn add_memory(
     
     session.write_complete();
     
-    tracing::debug!(
+    tracing::info!(
         "POST /memories project={} cues={} id={} timings: tok={:.2}ms norm={:.2}ms val={:.2}ms ins={:.2}ms",
         project_id,
         report.accepted.len(),
@@ -392,6 +443,9 @@ async fn add_memory(
     
     let elapsed = start.elapsed();
     let latency_ms = elapsed.as_secs_f64() * 1000.0;
+
+    // Record metrics
+    metrics.record_ingestion();
 
     (
         StatusCode::OK,
@@ -525,13 +579,15 @@ async fn recall(
             
             let engine_latency_ms = elapsed.as_secs_f64() * 1000.0;
             
-            tracing::debug!(
+            tracing::info!(
                 "POST /recall cross-domain projects={} cues={} results={} latency={:.2}ms",
                 projects.len(),
                 req.cues.len(),
                 total_results,
                 engine_latency_ms
             );
+
+            state.metrics.record_recall(engine_latency_ms);
             
             return (StatusCode::OK, Json(serde_json::json!({ 
                 "results": all_results,
@@ -614,7 +670,7 @@ async fn recall(
             lex_ms, norm_ms, expand_ms, search_ms, cues_to_process.len(), expanded_cues.len()
         );
         
-        tracing::debug!(
+        tracing::info!(
             "POST /recall project={} cues={} results={} latency={:.2}ms",
             project_id,
             cues_to_process.len(),
@@ -646,6 +702,9 @@ async fn recall(
                 cues: tokens,
             }).await;
         }
+
+        // Record metrics
+        state.metrics.record_recall(engine_latency_ms);
         
         if req.explain {
             return (StatusCode::OK, Json(serde_json::json!({ 
@@ -657,7 +716,7 @@ async fn recall(
                 }
             })));
         }
-        
+
         (StatusCode::OK, Json(serde_json::json!({ 
             "results": results,
             "engine_latency": engine_latency_ms
@@ -1631,3 +1690,469 @@ async fn ingest_file(
         })))
 }
 
+/// Context API: Expand a natural language query using the co-occurrence graph
+/// 
+/// This endpoint tokenizes the query, looks up co-occurring terms in the graph,
+/// and returns ranked expansion candidates. Think of it as a domain-specific WordNet.
+async fn context_expand(
+    State(state): State<EngineState>,
+    headers: HeaderMap,
+    Json(req): Json<ContextExpandRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use std::time::Instant;
+    let start = Instant::now();
+    
+    let EngineState { mt_engine, .. } = state;
+    
+    // Extract project ID
+    let project_id = match extract_project_id(&headers) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+    
+    // Get project context
+    let ctx = match mt_engine.get_or_create_project(project_id.clone()) {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": e}))),
+    };
+    
+    // 1. Tokenize query into cues
+    let query_cues = crate::nl::tokenize_to_cues(&req.query);
+    
+    if query_cues.is_empty() {
+        return (StatusCode::OK, Json(serde_json::json!({
+            "query_cues": [],
+            "expansions": [],
+            "latency_ms": start.elapsed().as_secs_f64() * 1000.0
+        })));
+    }
+    
+    // 2. Normalize cues through the normalization layer
+    let normalized_cues: Vec<String> = query_cues
+        .iter()
+        .map(|cue| {
+            let (normalized, _) = normalize_cue(cue, &ctx.normalization);
+            normalized
+        })
+        .collect();
+    
+    // 3. Expand using co-occurrence graph
+    let raw_expansions = ctx.main.expand_cues_from_graph(&normalized_cues, req.limit);
+    
+    // 4. Filter by min_score if specified
+    let expansions: Vec<ExpansionCandidate> = raw_expansions
+        .into_iter()
+        .filter(|(_, score, _, _)| {
+            if let Some(min) = req.min_score {
+                *score >= min
+            } else {
+                true
+            }
+        })
+        .map(|(term, score, count, sources)| ExpansionCandidate {
+            term,
+            score,
+            co_occurrence_count: count,
+            source_cues: sources,
+        })
+        .collect();
+    
+    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+    
+    tracing::info!(
+        "POST /context/expand project={} query=\"{}\" cues={} expansions={} latency={:.2}ms",
+        project_id,
+        req.query,
+        normalized_cues.len(),
+        expansions.len(),
+        latency_ms
+    );
+    
+    (StatusCode::OK, Json(serde_json::json!({
+        "query_cues": normalized_cues,
+        "expansions": expansions,
+        "latency_ms": latency_ms
+    })))
+}
+
+/// Prometheus metrics endpoint - returns plain text in Prometheus exposition format
+async fn prometheus_metrics(
+    State(state): State<EngineState>,
+) -> impl IntoResponse {
+    use std::sync::atomic::Ordering;
+    
+    let EngineState { mt_engine, metrics, job_queue, .. } = state;
+    
+    // Get global stats from multi-tenant engine
+    let global_stats = mt_engine.get_global_stats();
+    let total_memories = global_stats.get("total_memories")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let total_cues = global_stats.get("total_cues")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let total_projects = global_stats.get("total_projects")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    
+    // Get metrics from collector
+    let ingestion_count = metrics.ingestion_count.load(Ordering::Relaxed);
+    let recall_count = metrics.recall_count.load(Ordering::Relaxed);
+    tracing::debug!("Metrics: Found ingestion_count={}, recall_count={}", ingestion_count, recall_count);
+    let recall_p99 = metrics.get_p99_latency();
+    let recall_avg = metrics.get_avg_latency();
+    
+    // Get memory usage
+    let memory_bytes = crate::metrics::get_memory_usage_bytes();
+    
+    // Get active jobs count
+    let active_jobs = job_queue.pending_count();
+    
+    // Build Prometheus format output
+    let output = format!(
+        "# HELP cuemap_ingestion_rate Total memory ingestions since startup
+# TYPE cuemap_ingestion_rate counter
+cuemap_ingestion_rate {}
+
+# HELP cuemap_recall_requests_total Total recall requests since startup
+# TYPE cuemap_recall_requests_total counter
+cuemap_recall_requests_total {}
+
+# HELP cuemap_recall_latency_p99 P99 recall latency in milliseconds
+# TYPE cuemap_recall_latency_p99 gauge
+cuemap_recall_latency_p99 {:.2}
+
+# HELP cuemap_recall_latency_avg Average recall latency in milliseconds
+# TYPE cuemap_recall_latency_avg gauge
+cuemap_recall_latency_avg {:.2}
+
+# HELP cuemap_memory_usage_bytes Process memory usage in bytes (RSS)
+# TYPE cuemap_memory_usage_bytes gauge
+cuemap_memory_usage_bytes {}
+
+# HELP cuemap_total_memories Total memories across all projects
+# TYPE cuemap_total_memories gauge
+cuemap_total_memories {}
+
+# HELP cuemap_lexicon_size Total cues/terms in lexicon
+# TYPE cuemap_lexicon_size gauge
+cuemap_lexicon_size {}
+
+# HELP cuemap_total_projects Number of active projects
+# TYPE cuemap_total_projects gauge
+cuemap_total_projects {}
+
+# HELP cuemap_active_jobs Current pending background jobs
+# TYPE cuemap_active_jobs gauge
+cuemap_active_jobs {}
+",
+        ingestion_count,
+        recall_count,
+        recall_p99,
+        recall_avg,
+        memory_bytes,
+        total_memories,
+        total_cues,
+        total_projects,
+        active_jobs,
+    );
+    
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        output,
+    )
+}
+
+// ============================================================================
+// Cloud Backup Endpoints
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct BackupRequest {
+    pub project_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BackupResponse {
+    pub success: bool,
+    pub project_id: String,
+    pub size_bytes: Option<u64>,
+    pub message: String,
+}
+
+/// Upload a project snapshot to cloud storage
+async fn backup_upload(
+    State(state): State<EngineState>,
+    Json(req): Json<BackupRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let EngineState { mt_engine, cloud_backup, .. } = state;
+    
+    // Check if cloud backup is configured
+    let backup_manager = match cloud_backup {
+        Some(ref manager) => manager,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "Cloud backup is not configured"
+                })),
+            );
+        }
+    };
+    
+    // Validate project ID
+    if !validate_project_id(&req.project_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid project ID format"})),
+        );
+    }
+    
+    // Save project locally first
+    if let Err(e) = mt_engine.save_project(&req.project_id) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Failed to save project locally: {}", e)
+            })),
+        );
+    }
+    
+    // Read the snapshot files
+    let snapshots_dir = mt_engine.list_snapshots();
+    if !snapshots_dir.contains(&req.project_id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Project snapshot not found"})),
+        );
+    }
+    
+    // Get snapshot data from local files
+    let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "./data".to_string());
+    let main_path = format!("{}/snapshots/{}.bin", data_dir, req.project_id);
+    let aliases_path = format!("{}/snapshots/{}_aliases.bin", data_dir, req.project_id);
+    let lexicon_path = format!("{}/snapshots/{}_lexicon.bin", data_dir, req.project_id);
+    
+    let main_data = match std::fs::read(&main_path) {
+        Ok(data) => bytes::Bytes::from(data),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("Failed to read main snapshot: {}", e)
+                })),
+            );
+        }
+    };
+    
+    let aliases_data = std::fs::read(&aliases_path).ok().map(bytes::Bytes::from);
+    let lexicon_data = std::fs::read(&lexicon_path).ok().map(bytes::Bytes::from);
+    
+    // Upload to cloud
+    match backup_manager.upload_project_snapshot(
+        &req.project_id,
+        main_data,
+        aliases_data,
+        lexicon_data,
+    ).await {
+        Ok(size) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "success": true,
+                "project_id": req.project_id,
+                "size_bytes": size,
+                "message": "Snapshot uploaded to cloud storage"
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Failed to upload to cloud: {}", e)
+            })),
+        ),
+    }
+}
+
+/// Download a project snapshot from cloud storage
+async fn backup_download(
+    State(state): State<EngineState>,
+    Json(req): Json<BackupRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let EngineState { mt_engine, cloud_backup, .. } = state;
+    
+    // Check if cloud backup is configured
+    let backup_manager = match cloud_backup {
+        Some(ref manager) => manager,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "Cloud backup is not configured"
+                })),
+            );
+        }
+    };
+    
+    // Validate project ID
+    if !validate_project_id(&req.project_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid project ID format"})),
+        );
+    }
+    
+    // Download from cloud
+    let (main_data, aliases_data, lexicon_data) = match backup_manager.download_project_snapshot(&req.project_id).await {
+        Ok(data) => data,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!("Failed to download from cloud: {}", e)
+                })),
+            );
+        }
+    };
+    
+    // Save to local snapshots directory
+    let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "./data".to_string());
+    let snapshots_dir = format!("{}/snapshots", data_dir);
+    
+    // Create snapshots directory if needed
+    if let Err(e) = std::fs::create_dir_all(&snapshots_dir) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Failed to create snapshots directory: {}", e)
+            })),
+        );
+    }
+    
+    // Write main snapshot
+    let main_path = format!("{}/{}.bin", snapshots_dir, req.project_id);
+    if let Err(e) = std::fs::write(&main_path, &main_data) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Failed to write main snapshot: {}", e)
+            })),
+        );
+    }
+    
+    // Write aliases snapshot if present
+    if let Some(data) = aliases_data {
+        let aliases_path = format!("{}/{}_aliases.bin", snapshots_dir, req.project_id);
+        let _ = std::fs::write(&aliases_path, &data);
+    }
+    
+    // Write lexicon snapshot if present
+    if let Some(data) = lexicon_data {
+        let lexicon_path = format!("{}/{}_lexicon.bin", snapshots_dir, req.project_id);
+        let _ = std::fs::write(&lexicon_path, &data);
+    }
+    
+    // Load the project into memory
+    match mt_engine.load_project(&req.project_id) {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "success": true,
+                "project_id": req.project_id,
+                "size_bytes": main_data.len(),
+                "message": "Snapshot downloaded and loaded from cloud storage"
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Downloaded but failed to load project: {}", e)
+            })),
+        ),
+    }
+}
+
+/// List all cloud backups
+async fn backup_list(
+    State(state): State<EngineState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let EngineState { cloud_backup, .. } = state;
+    
+    // Check if cloud backup is configured
+    let backup_manager = match cloud_backup {
+        Some(ref manager) => manager,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "Cloud backup is not configured"
+                })),
+            );
+        }
+    };
+    
+    match backup_manager.list_snapshots().await {
+        Ok(entries) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "backups": entries,
+                "count": entries.len()
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Failed to list cloud backups: {}", e)
+            })),
+        ),
+    }
+}
+
+/// Delete a cloud backup
+async fn backup_delete(
+    State(state): State<EngineState>,
+    Path(project_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let EngineState { cloud_backup, .. } = state;
+    
+    // Check if cloud backup is configured
+    let backup_manager = match cloud_backup {
+        Some(ref manager) => manager,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "Cloud backup is not configured"
+                })),
+            );
+        }
+    };
+    
+    // Validate project ID
+    if !validate_project_id(&project_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid project ID format"})),
+        );
+    }
+    
+    match backup_manager.delete_snapshot(&project_id).await {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "success": true,
+                "project_id": project_id,
+                "message": "Cloud backup deleted"
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Failed to delete cloud backup: {}", e)
+            })),
+        ),
+    }
+}

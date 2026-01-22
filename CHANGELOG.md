@@ -2,6 +2,13 @@
 
 All notable changes to the CueMap Rust Engine will be documented in this file.
 
+## [0.6.1] - 2026-01-21
+
+### Added
+- **Cloud Backup Integration**: Native support for backing up project snapshots to AWS S3, Google Cloud Storage, and Azure Blob Storage. Configurable via CLI flags (`--cloud-backup`, etc.) and managed via new API endpoints (`/backup/upload`, `/backup/download`, `/backup/list`, `/backup/:id`).
+- **Context Expansion API**: New `/context/expand` endpoint that uses the cue co-occurrence graph to suggest related concepts for a given query, enabling "search suggestion" or "related topics" features.
+- **Prometheus Metrics**: New `/metrics` endpoint exposing internal system metrics (ingestion rate, latency, memory usage, etc.) for observability.
+
 ## [0.6.0] - 2026-01-18
 
 ### Added

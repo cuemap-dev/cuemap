@@ -172,6 +172,32 @@ Snapshots are automatically managed:
 - **Format**: Bincode binary
 - **Files**: `{project-id}.bin`, `{project-id_lexicon}.bin`, `{project-id_aliases}.bin`
 
+### Cloud Backup
+
+CueMap supports secure offsite backups to AWS S3, Google Cloud Storage, and Azure Blob Storage.
+
+**Configuration**:
+Enable cloud backup via CLI flags or environment variables.
+
+```bash
+# S3 Example
+./cuemap-rust \
+  --cloud-backup s3 \
+  --cloud-bucket my-backup-bucket \
+  --cloud-region us-east-1 \
+  --cloud-auto-backup
+```
+
+**Supported Providers**:
+- `s3`: AWS S3 or compatible (MinIO, DigitalOcean Spaces)
+- `gcs`: Google Cloud Storage
+- `azure`: Azure Blob Storage
+- `local`: Local path (for testing/replication)
+
+**Management**:
+Backups can be triggered manually via API (`/backup/upload`, `/backup/download`) or automatically on every save (`--cloud-auto-backup`).
+
+
 ## Authentication
 
 Secure your CueMap instance with API key authentication.
@@ -492,6 +518,62 @@ curl -X DELETE "http://localhost:8080/lexicon/entry/cue:stripe"
 Get all synonyms for a cue.
 ```bash
 curl "http://localhost:8080/lexicon/synonyms/service:payment"
+```
+
+### Context Expansion (Query Suggestion)
+
+Explore related concepts from the cue graph to expand a user's query.
+
+```bash
+curl -X POST http://localhost:8080/context/expand \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "server hung 137",
+    "limit": 5
+  }'
+# Response:
+# {
+#   "query_cues": ["server", "hung", "137"],
+#   "expansions": [
+#     { "term": "out_of_memory", "score": 25.0, "co_occurrence_count": 12 },
+#     { "term": "SIGKILL", "score": 22.0, "co_occurrence_count": 8 }
+#   ]
+# }
+```
+
+### Cloud Backup Management
+
+#### Upload Snapshot
+```bash
+curl -X POST http://localhost:8080/backup/upload \
+  -H "Content-Type: application/json" \
+  -d '{"project_id": "default"}'
+```
+
+#### Download Snapshot
+```bash
+curl -X POST http://localhost:8080/backup/download \
+  -H "Content-Type: application/json" \
+  -d '{"project_id": "default"}'
+```
+
+#### List Backups
+```bash
+curl http://localhost:8080/backup/list
+```
+
+### Monitoring
+
+#### Prometheus Metrics
+Exposes internal system metrics for scraping (Prometheus format).
+
+```bash
+curl http://localhost:8080/metrics
+# Output:
+# cuemap_ingestion_rate 0.0
+# cuemap_recall_latency_p99 0.0
+# cuemap_memory_usage_bytes 1024
+# ...
 ```
 
 ### Ingestion

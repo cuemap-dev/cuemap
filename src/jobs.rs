@@ -260,7 +260,7 @@ impl SessionManager {
                 
                 // 2. Flush sessions outside the lock
                 for session in sessions_to_flush {
-                    // debug!("[Jobs] Auto-flushing session for project: {}", session.project_id);
+                    debug!("[Jobs] Auto-flushing session for project: {}", session.project_id);
                     session.flush(&manager.provider).await;
                 }
                 
@@ -338,6 +338,22 @@ impl JobQueue {
     /// Get session for a project
     pub fn get_session(&self, project_id: &str) -> Option<Arc<IngestionSession>> {
         self.session_manager.get(project_id)
+    }
+    
+    /// Get total pending job count across all sessions (for metrics)
+    pub fn pending_count(&self) -> usize {
+        let mut count = 0;
+        for entry in self.session_manager.sessions.iter() {
+            let session = entry.value();
+            let progress = session.get_progress();
+            // Count jobs that haven't completed yet
+            let pending = (progress.writes_total.saturating_sub(progress.writes_completed))
+                + (progress.propose_cues_total.saturating_sub(progress.propose_cues_completed))
+                + (progress.train_lexicon_total.saturating_sub(progress.train_lexicon_completed))
+                + (progress.update_graph_total.saturating_sub(progress.update_graph_completed));
+            count += pending;
+        }
+        count
     }
 }
 

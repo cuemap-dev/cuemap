@@ -684,7 +684,6 @@ impl CueMapEngine {
             let mut inferred_list: Vec<(String, u64)> = inferred_candidates.into_iter().collect();
             inferred_list.sort_unstable_by(|a, b| b.1.cmp(&a.1));
             
-            // FIX: Drastically lower inference weight (0.7 -> 0.1).
             // Inferred cues are "suggestions", they must NEVER overpower explicit query terms.
             // Even with high IDF, an inferred cue should be a tie-breaker, not a driver.
             let pattern_completion_weight = 0.1; 
@@ -733,7 +732,7 @@ impl CueMapEngine {
         
         for (cue, weight) in query_cues {
             if let Some(ordered_set) = self.cue_index.get(cue) {
-                // IDF Weighting: Penalize common cues (e.g. "youtube"), boost rare ones (e.g. "gut")
+                // IDF Weighting: Penalize common cues, boost rare ones
                 let df = ordered_set.len() as f64;
                 // ln(N / df) is standard IDF. We add 1 to df to avoid division by zero (though unlikely for existing key)
                 // We ensure a minimum weight of 0.1 so cues don't disappear entirely
@@ -762,7 +761,6 @@ impl CueMapEngine {
         let mut seen_memories = HashSet::new();
 
         for (cue_idx, (_cue, _weight, set)) in cue_data.iter().enumerate() {
-            // Use adaptive limit instead of MAX_DRIVER_SCAN
             let scan_limit = std::cmp::min(set.len(), adaptive_scan_limit);
             let items = set.get_recent(Some(scan_limit));
 
@@ -1105,6 +1103,108 @@ impl CueMapEngine {
         })
     }
 
+    /// Context API: Expand query cues using the co-occurrence graph
+    /// Returns Vec of (term, score, raw_count, source_cues) for each candidate
+    /// 
+    /// Scoring: Aggregates co-occurrence counts across all query cues.
+    /// Terms that co-occur with multiple query cues get higher scores.
+    pub fn expand_cues_from_graph(&self, query_cues: &[String], limit: usize) -> Vec<(String, f64, u64, Vec<String>)> {
+        if query_cues.is_empty() {
+            return Vec::new();
+        }
+
+        // Normalize query cues
+        let normalized_cues: Vec<String> = query_cues
+            .iter()
+            .map(|c| c.to_lowercase().trim().to_string())
+            .filter(|c| !c.is_empty())
+            .collect();
+
+        if normalized_cues.is_empty() {
+            return Vec::new();
+        }
+
+        // Fast path: Single cue query - just return top co-occurring terms directly
+        if normalized_cues.len() == 1 {
+            let query_cue = &normalized_cues[0];
+            if let Some(co_map) = self.cue_co_occurrence.get(query_cue) {
+                let mut results: Vec<(String, f64, u64, Vec<String>)> = co_map
+                    .iter()
+                    .filter(|entry| {
+                        let candidate = entry.key();
+                        // Skip metadata cues and superstrings
+                        !candidate.contains(':') && !candidate.contains(query_cue)
+                    })
+                    .map(|entry| {
+                        let (term, count) = entry.pair();
+                        (term.clone(), *count as f64, *count, vec![query_cue.clone()])
+                    })
+                    .collect();
+                
+                // Sort by count descending
+                results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                results.truncate(limit);
+                return results;
+            } else {
+                return Vec::new();
+            }
+        }
+
+        // Multi-cue path: Aggregate candidates across all query cues
+        let mut candidates: HashMap<String, (u64, Vec<String>)> = HashMap::new();
+
+        for query_cue in &normalized_cues {
+            if let Some(co_map) = self.cue_co_occurrence.get(query_cue) {
+                for entry in co_map.iter() {
+                    let (candidate_cue, count) = entry.pair();
+                    
+                    // Skip if candidate is already in query (no point expanding to itself)
+                    if normalized_cues.contains(candidate_cue) {
+                        continue;
+                    }
+                    
+                    // Skip metadata/structural cues (same filter as pattern completion)
+                    if candidate_cue.contains(':') {
+                        continue;
+                    }
+                    
+                    // Skip superstring inferences (avoid vertical specialization)
+                    if candidate_cue.contains(query_cue) {
+                        continue;
+                    }
+
+                    candidates
+                        .entry(candidate_cue.clone())
+                        .and_modify(|(total, sources)| {
+                            *total += *count;
+                            if !sources.contains(query_cue) {
+                                sources.push(query_cue.clone());
+                            }
+                        })
+                        .or_insert((*count, vec![query_cue.clone()]));
+                }
+            }
+        }
+
+        // Convert to vec and sort by score (count) descending
+        let mut results: Vec<(String, f64, u64, Vec<String>)> = candidates
+            .into_iter()
+            .map(|(term, (count, sources))| {
+                // Score = raw count (can be refined with IDF later)
+                let score = count as f64;
+                (term, score, count, sources)
+            })
+            .collect();
+
+        // Sort by score descending
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        
+        // Truncate to limit
+        results.truncate(limit);
+        
+        results
+    }
+
     pub fn get_stats(&self) -> HashMap<String, serde_json::Value> {
         let mut stats = HashMap::new();
         stats.insert(
@@ -1116,10 +1216,6 @@ impl CueMapEngine {
             serde_json::json!(self.cue_count.load(Ordering::Relaxed)),
         );
 
-        
-        // REMOVED: potentially massive 'cues' list
-        // stats.insert("cues".to_string(), serde_json::json!(cues));
-        
         stats
     }
 }
