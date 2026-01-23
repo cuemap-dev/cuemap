@@ -25,6 +25,10 @@ struct Args {
     /// Data directory for persistence
     #[arg(short, long, default_value = "./data")]
     data_dir: String,
+
+    /// Assets directory (read-only models, taggers, defaults)
+    #[arg(long)]
+    assets_dir: Option<String>,
     
     /// Snapshot interval in seconds
     #[arg(short, long, default_value = "60")]
@@ -122,13 +126,17 @@ async fn main() {
         }
     }
     
+    // Determine assets directory (defaults to data_dir if not set)
+    let assets_path = args.assets_dir.clone().unwrap_or_else(|| args.data_dir.clone());
+    info!("Assets directory: {}", assets_path);
+    
     // Initialize persistence (skip if static mode)
     // We still init persistence even if disable_snapshots is true, so we can load state.
     // We just won't start the background saver.
 
     
     // Initialize Semantic Engine (if using bundled data)
-    let semantic_engine = SemanticEngine::new(Some(Path::new(&args.data_dir)));
+    let semantic_engine = SemanticEngine::new(Some(Path::new(&assets_path)));
     let cuegen_strategy = args.cuegen;
 
     
@@ -278,44 +286,63 @@ async fn main() {
 /// Setup shutdown handler for multi-tenant mode
 async fn setup_multi_tenant_shutdown_handler(mt_engine: Arc<multi_tenant::MultiTenantEngine>) {
     tokio::spawn(async move {
-        match tokio::signal::ctrl_c().await {
-            Ok(()) => {
-                info!("Shutdown signal received, saving all projects...");
-                
-                // Wrap save operation in a timeout to prevent hanging forever
-                let save_future = async {
-                    let save_results = mt_engine.save_all();
-                    let saved = save_results.iter().filter(|(_, r)| r.is_ok()).count();
-                    let failed = save_results.iter().filter(|(_, r)| r.is_err()).count();
-                    
-                    if saved > 0 {
-                        info!("✓ Saved {} project snapshots", saved);
-                    }
-                    if failed > 0 {
-                        warn!("✗ Failed to save {} projects", failed);
-                        for (project_id, result) in save_results.iter() {
-                            if let Err(e) = result {
-                                warn!("  - {}: {}", project_id, e);
-                            }
-                        }
-                    }
-                };
+        // Create futures for both SIGINT (Ctrl+C) and SIGTERM (docker stop)
+        let ctrl_c = async {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("failed to install Ctrl+C handler");
+        };
 
-                // Enforce 5 second timeout
-                match tokio::time::timeout(Duration::from_secs(5), save_future).await {
-                    Ok(_) => info!("Shutdown complete"),
-                    Err(_) => {
-                        error!("Shutdown timed out after 5s! Forcing exit.");
-                        error!("Possible cause: A project was locked by a long-running ingestion task.");
+        #[cfg(unix)]
+        let terminate = async {
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install signal handler")
+                .recv()
+                .await;
+        };
+
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+
+        // Wait for either signal
+        tokio::select! {
+            _ = ctrl_c => {
+                info!("Shutdown signal received (SIGINT), saving all projects...");
+            },
+            _ = terminate => {
+                info!("Shutdown signal received (SIGTERM), saving all projects...");
+            },
+        }
+
+        // Wrap save operation in a timeout to prevent hanging forever
+        let save_future = async {
+            let save_results = mt_engine.save_all();
+            let saved = save_results.iter().filter(|(_, r)| r.is_ok()).count();
+            let failed = save_results.iter().filter(|(_, r)| r.is_err()).count();
+            
+            if saved > 0 {
+                info!("✓ Saved {} project snapshots", saved);
+            }
+            if failed > 0 {
+                warn!("✗ Failed to save {} projects", failed);
+                for (project_id, result) in save_results.iter() {
+                    if let Err(e) = result {
+                        warn!("  - {}: {}", project_id, e);
                     }
                 }
-                
-                std::process::exit(0);
             }
-            Err(err) => {
-                warn!("Error setting up shutdown handler: {}", err);
+        };
+
+        // Enforce 5 second timeout
+        match tokio::time::timeout(Duration::from_secs(5), save_future).await {
+            Ok(_) => info!("Shutdown complete"),
+            Err(_) => {
+                error!("Shutdown timed out after 5s! Forcing exit.");
+                error!("Possible cause: A project was locked by a long-running ingestion task.");
             }
         }
+        
+        std::process::exit(0);
     });
 }
 

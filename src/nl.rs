@@ -31,6 +31,20 @@ fn get_lemma_exceptions() -> &'static HashMap<String, String> {
 
 fn get_nlprule_tokenizer() -> Option<&'static nlprule::Tokenizer> {
     NLPRULE_TOKENIZER.get_or_init(|| {
+        // checks for TOKENIZER_PATH environment variable first
+        if let Ok(path) = std::env::var("TOKENIZER_PATH") {
+             match nlprule::Tokenizer::new(&path) {
+                Ok(t) => {
+                    tracing::info!("nlprule tokenizer loaded successfully from env TOKENIZER_PATH: {}", path);
+                    return Some(t);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load nlprule tokenizer from env TOKENIZER_PATH set to {}: {}", path, e);
+                    // continue to fallback
+                }
+            }
+        }
+
         // Try to load the tokenizer binary from OUT_DIR (set during build)
         let tokenizer_path = concat!(env!("OUT_DIR"), "/en_tokenizer.bin");
         match nlprule::Tokenizer::new(tokenizer_path) {

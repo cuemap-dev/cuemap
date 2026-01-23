@@ -146,6 +146,10 @@ const IngestionScreen: React.FC<IngestionScreenProps> = ({ projectId, onComplete
     const [items, setItems] = useState<IngestionItem[]>([]);
     const [isIngesting, setIsIngesting] = useState(false);
 
+    // Crawl options for URL mode
+    const [crawlDepth, setCrawlDepth] = useState<number>(0);
+    const [sameDomainOnly, setSameDomainOnly] = useState<boolean>(true);
+
     const [refreshTrigger, setRefreshTrigger] = useState(0);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -209,13 +213,19 @@ const IngestionScreen: React.FC<IngestionScreenProps> = ({ projectId, onComplete
     };
 
     const ingestUrl = async (url: string): Promise<void> => {
+        const payload: any = { url };
+        if (crawlDepth > 0) {
+            payload.depth = crawlDepth;
+            payload.same_domain_only = sameDomainOnly;
+        }
+
         const response = await fetch('/ingest/url', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
                 'X-Project-ID': projectId,
             },
-            body: JSON.stringify({ url }),
+            body: JSON.stringify(payload),
         });
 
         if (!response.ok) {
@@ -472,12 +482,38 @@ const IngestionScreen: React.FC<IngestionScreenProps> = ({ projectId, onComplete
                                 type="url"
                                 value={urlInput}
                                 onChange={e => setUrlInput(e.target.value)}
-                                placeholder="https://example.com/article"
+                                placeholder="https://docs.example.com/intro"
                                 onKeyDown={e => e.key === 'Enter' && handleAddUrl()}
                             />
                             <button onClick={handleAddUrl} disabled={!urlInput.trim()}>
                                 Add URL
                             </button>
+
+                            {/* Crawl Options */}
+                            <div className="crawl-options">
+                                <div className="depth-selector">
+                                    <label>Crawl Depth:</label>
+                                    <select
+                                        value={crawlDepth}
+                                        onChange={e => setCrawlDepth(Number(e.target.value))}
+                                    >
+                                        <option value={0}>Single Page</option>
+                                        <option value={1}>Depth 1 (follow links)</option>
+                                        <option value={2}>Depth 2 (2 levels)</option>
+                                        <option value={3}>Depth 3 (full docs)</option>
+                                    </select>
+                                </div>
+                                {crawlDepth > 0 && (
+                                    <label className="checkbox-option">
+                                        <input
+                                            type="checkbox"
+                                            checked={sameDomainOnly}
+                                            onChange={e => setSameDomainOnly(e.target.checked)}
+                                        />
+                                        Same domain only
+                                    </label>
+                                )}
+                            </div>
                         </div>
                     )}
 
@@ -712,6 +748,56 @@ Python is great for data science"
                 .url-input button:disabled, .text-input button:disabled {
                     opacity: 0.5;
                     cursor: not-allowed;
+                }
+
+                .crawl-options {
+                    display: flex;
+                    gap: 16px;
+                    align-items: center;
+                    padding: 12px;
+                    background: rgba(15, 23, 42, 0.6);
+                    border-radius: 8px;
+                    border: 1px solid #334155;
+                }
+
+                .depth-selector {
+                    display: flex;
+                    align-items: center;
+                    gap: 8px;
+                }
+
+                .depth-selector label {
+                    color: #94a3b8;
+                    font-size: 0.9rem;
+                }
+
+                .depth-selector select {
+                    padding: 8px 12px;
+                    border-radius: 6px;
+                    border: 1px solid #334155;
+                    background: #0f172a;
+                    color: white;
+                    font-size: 0.9rem;
+                    cursor: pointer;
+                }
+
+                .depth-selector select:hover {
+                    border-color: #3b82f6;
+                }
+
+                .checkbox-option {
+                    display: flex;
+                    align-items: center;
+                    gap: 6px;
+                    color: #94a3b8;
+                    font-size: 0.9rem;
+                    cursor: pointer;
+                }
+
+                .checkbox-option input[type="checkbox"] {
+                    width: 16px;
+                    height: 16px;
+                    accent-color: #3b82f6;
                 }
 
                 .file-input input[type="file"] {

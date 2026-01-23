@@ -314,7 +314,9 @@ impl JobQueue {
         });
         
         let session_manager = Arc::new(SessionManager::new(provider));
-        session_manager.clone().start_auto_flush();
+        if !disable_bg_jobs {
+            session_manager.clone().start_auto_flush();
+        }
         
         Self { 
             sender: tx,

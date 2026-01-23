@@ -1,4 +1,11 @@
 # Multi-stage build for minimal production image
+FROM node:22-slim as ui-builder
+WORKDIR /web_ui
+COPY web_ui/package*.json ./
+RUN npm install
+COPY web_ui .
+RUN npm run build
+
 FROM rust:1.84-slim as builder
 
 WORKDIR /build
@@ -7,6 +14,7 @@ WORKDIR /build
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
+    findutils \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy manifests
@@ -16,9 +24,13 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY build.rs ./
 COPY data ./data
+COPY --from=ui-builder /web_ui/dist ./web_ui/dist
 
-# Build release binary
-RUN cargo build --release
+# Build release binary (with UI feature enabled)
+RUN cargo build --release --features ui
+
+# Find the tokenizer binary (it's hidden in target/release/build/...)
+RUN find target -name "en_tokenizer.bin" -type f -exec cp {} /build/en_tokenizer.bin \;
 
 # Production image
 FROM debian:bookworm-slim
@@ -28,13 +40,17 @@ WORKDIR /app
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy binary from builder
 COPY --from=builder /build/target/release/cuemap-rust /app/cuemap-rust
+# Copy tokenizer and assets to ASSETS directory (separate from data volume)
+COPY --from=builder /build/en_tokenizer.bin /app/assets/en_tokenizer.bin
+COPY data /app/assets
 
-# Create data directory
-RUN mkdir -p /app/data
+# Create data directory (for volume) and assets directory
+RUN mkdir -p /app/data /app/assets/public
 
 # Expose port
 EXPOSE 8080
@@ -43,6 +59,8 @@ EXPOSE 8080
 ENV RUST_LOG=info
 ENV PORT=8080
 ENV DATA_DIR=/app/data
+ENV ASSETS_DIR=/app/assets
+ENV TOKENIZER_PATH=/app/assets/en_tokenizer.bin
 ENV SNAPSHOT_INTERVAL=60
 
 # Health check
@@ -50,4 +68,4 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8080/ || exit 1
 
 # Run the binary
-CMD ["/app/cuemap-rust", "--port", "8080", "--data-dir", "/app/data", "--snapshot-interval", "60"]
+CMD ["/app/cuemap-rust", "--port", "8080", "--data-dir", "/app/data", "--assets-dir", "/app/assets", "--snapshot-interval", "60"]

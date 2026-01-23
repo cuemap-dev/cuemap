@@ -1577,6 +1577,105 @@ impl Chunker {
         content_blocks.join("\n\n")
     }
 
+    /// Extract links from the main article content area only.
+    /// Uses the same content scoping as extract_article_content to avoid
+    /// navigation, footer, and sidebar links.
+    /// 
+    /// Returns a list of absolute URLs found in the main content.
+    pub fn extract_content_links(document: &scraper::Html, base_url: &url::Url) -> Vec<String> {
+        use scraper::{Selector, ElementRef};
+        use std::collections::HashSet;
+
+        // 1. Identify the best container (same as extract_article_content)
+        let content_selectors = [
+            "article", "main", "[role=\"main\"]", ".post-content", 
+            ".article-content", ".entry-content", "#content", ".content"
+        ];
+        
+        let mut root_element = document.root_element();
+        
+        for selector_str in content_selectors {
+            if let Ok(sel) = Selector::parse(selector_str) {
+                if let Some(elem) = document.select(&sel).next() {
+                    if elem.text().count() > 5 { 
+                        root_element = elem;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 2. Identify Noise to Exclude
+        let exclude_selectors = [
+            "nav", "header", "footer", "aside", "script", "style", "noscript",
+            ".nav", ".navigation", ".menu", ".sidebar", ".footer", 
+            ".ad", ".advertisement", ".social-share", ".cookie-banner",
+            ".toc", ".table-of-contents", ".breadcrumb", ".pagination"
+        ];
+        
+        let mut excluded_ids = HashSet::new();
+        for sel_str in exclude_selectors {
+            if let Ok(sel) = Selector::parse(sel_str) {
+                for elem in root_element.select(&sel) {
+                    excluded_ids.insert(elem.id());
+                }
+            }
+        }
+
+        // 3. Extract links from content area only
+        let link_selector = Selector::parse("a[href]").unwrap();
+        let mut links = Vec::new();
+        let mut seen = HashSet::new();
+
+        for element in root_element.select(&link_selector) {
+            // A. Exclusion Check (Ancestry)
+            let mut is_excluded = false;
+            let mut current = Some(element);
+            
+            while let Some(curr_elem) = current {
+                if excluded_ids.contains(&curr_elem.id()) {
+                    is_excluded = true;
+                    break;
+                }
+                if curr_elem == root_element { break; }
+                current = curr_elem.parent().and_then(ElementRef::wrap);
+            }
+            
+            if is_excluded { continue; }
+
+            // B. Extract href
+            if let Some(href) = element.value().attr("href") {
+                // Skip empty, anchor-only, javascript, and mailto links
+                if href.is_empty() 
+                    || href.starts_with('#') 
+                    || href.starts_with("javascript:") 
+                    || href.starts_with("mailto:")
+                    || href.starts_with("tel:")
+                {
+                    continue;
+                }
+
+                // Resolve to absolute URL
+                let absolute_url = if href.starts_with("http://") || href.starts_with("https://") {
+                    href.to_string()
+                } else {
+                    match base_url.join(href) {
+                        Ok(resolved) => resolved.to_string(),
+                        Err(_) => continue,
+                    }
+                };
+
+                // Deduplicate and add
+                if !seen.contains(&absolute_url) {
+                    seen.insert(absolute_url.clone());
+                    links.push(absolute_url);
+                }
+            }
+        }
+
+        links
+    }
+
     // ================== SOCIAL MEDIA EXPORT PARSERS ==================
 
     /// Parse WhatsApp chat export (.txt format)

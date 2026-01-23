@@ -169,6 +169,12 @@ pub struct WireLexiconRequest {
 #[derive(Debug, Deserialize)]
 pub struct IngestUrlRequest {
     pub url: String,
+    /// Crawl depth: 0 = single page (default), 1+ = follow links recursively
+    #[serde(default)]
+    pub depth: u8,
+    /// Only follow links within the same domain (default: true)
+    #[serde(default = "default_true")]
+    pub same_domain_only: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1467,6 +1473,7 @@ async fn merge_aliases(
 
 
 /// Ingest content from a URL using the Agent's Ingester
+/// Supports recursive crawling when depth > 0
 async fn ingest_url(
     State(state): State<EngineState>,
     headers: HeaderMap,
@@ -1485,6 +1492,11 @@ async fn ingest_url(
         Err(e) => return e,
     };
     
+    // Ensure project exists (auto-create)
+    if let Err(e) = state.mt_engine.get_or_create_project(project_id.clone()) {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": e})));
+    }
+    
     // Create an ingester for this request
     let config = AgentConfig {
         watch_dir: String::new(), // Not used for API-driven ingestion
@@ -1492,17 +1504,45 @@ async fn ingest_url(
     };
     let mut ingester = Ingester::new(config, job_queue);
     
-    // Use the Ingester's process_url method
-    match ingester.process_url(&req.url, &project_id).await {
-        Ok(memory_ids) => (StatusCode::OK, Json(serde_json::json!({
-            "status": "ingested",
-            "url": req.url,
-            "chunks": memory_ids.len(),
-            "memory_ids": memory_ids
-        }))),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": format!("Failed to ingest URL: {}", e)
-        }))),
+    // Check if recursive crawling is requested
+    if req.depth > 0 {
+        // Recursive crawl
+        match ingester.process_url_recursive(
+            &req.url, 
+            &project_id, 
+            req.depth, 
+            req.same_domain_only,
+        ).await {
+            Ok(result) => (StatusCode::OK, Json(serde_json::json!({
+                "status": "crawled",
+                "url": req.url,
+                "depth": req.depth,
+                "pages_crawled": result.pages_crawled,
+                "total_chunks": result.memory_ids.len(),
+                "links_found": result.links_found,
+                "links_skipped": result.links_skipped,
+                "memory_ids": result.memory_ids,
+                "errors": result.errors.iter().map(|(url, err)| {
+                    serde_json::json!({"url": url, "error": err})
+                }).collect::<Vec<_>>()
+            }))),
+            Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": format!("Failed to crawl URL: {}", e)
+            }))),
+        }
+    } else {
+        // Single page ingestion (original behavior)
+        match ingester.process_url(&req.url, &project_id).await {
+            Ok(memory_ids) => (StatusCode::OK, Json(serde_json::json!({
+                "status": "ingested",
+                "url": req.url,
+                "chunks": memory_ids.len(),
+                "memory_ids": memory_ids
+            }))),
+            Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": format!("Failed to ingest URL: {}", e)
+            }))),
+        }
     }
 }
 
@@ -1536,6 +1576,11 @@ async fn ingest_content(
         Ok(id) => id,
         Err(e) => return e,
     };
+    
+    // Ensure project exists (auto-create)
+    if let Err(e) = state.mt_engine.get_or_create_project(project_id.clone()) {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": e})));
+    }
     
     // Create an ingester for this request
     let config = AgentConfig {
@@ -1574,10 +1619,15 @@ async fn ingest_file(
             return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "Read-only mode"})));
         }
         
-        let project_id = match extract_project_id(&headers) {
-            Ok(id) => id,
-            Err(e) => return e,
-        };
+    let project_id = match extract_project_id(&headers) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+    
+    // Ensure project exists (auto-create)
+    if let Err(e) = state.mt_engine.get_or_create_project(project_id.clone()) {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": e})));
+    }
         
         // Extract file from multipart
         let mut filename = String::new();
