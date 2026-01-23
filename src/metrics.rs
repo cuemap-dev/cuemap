@@ -37,12 +37,12 @@ impl MetricsCollector {
 
     /// Record a memory ingestion event
     pub fn record_ingestion(&self) {
-        let count = self.ingestion_count.fetch_add(1, Ordering::Relaxed);
+        self.ingestion_count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a recall request with its latency
     pub fn record_recall(&self, latency_ms: f64) {
-        let count = self.recall_count.fetch_add(1, Ordering::Relaxed);
+        self.recall_count.fetch_add(1, Ordering::Relaxed);
 
         if let Ok(mut latencies) = self.recall_latencies.write() {
             if latencies.len() >= LATENCY_WINDOW_SIZE {
