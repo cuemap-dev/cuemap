@@ -58,7 +58,7 @@ cargo build --release --features ui
 
 ```bash
 docker build -f Dockerfile.production -t cuemap/engine .
-docker run -p 8080:8080 cuemap/engine
+docker run -p 8080:8080 cuemap/engine -v $(pwd)/local_snapshot_dir:/app/data
 ```
 
 ### CLI Options
@@ -264,7 +264,7 @@ await client.add('Memory', ['test']);
 ### Docker with Authentication
 
 ```bash
-docker run -p 8080:8080 \
+docker run -p 8080:8080 -v $(pwd)/local_snapshot_dir:/app/data \
   -e CUEMAP_API_KEY=your-secret-key \
   cuemap/engine
 ```
