@@ -279,7 +279,7 @@ docker run -p 8080:8080 -v $(pwd)/local_snapshot_dir:/app/data \
 
 ## Performance
 
-### Benchmark Results (v0.6)
+### Benchmark Results (v0.6.2)
 
 Tests performed on **Real-World Data** (Wikipedia Articles), processing full natural language sentences with the complete NLP pipeline.
 

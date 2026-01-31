@@ -2,6 +2,15 @@
 
 All notable changes to the CueMap Rust Engine will be documented in this file.
 
+## [0.6.2] - 2026-01-24
+
+### Added
+- **Recursive URL Ingestion**: The engine now supports recursive URL ingestion, automatically following links and extracting content from nested pages.
+
+### Fixed
+- **Docker assets issues**: Fixed issues with Docker assets not being mounted correctly.
+- **Project existence checks in ingest endpoints**: Added project existence checks in ingest endpoints to prevent errors.
+
 ## [0.6.1] - 2026-01-21
 
 ### Added
