@@ -25,9 +25,9 @@ fn test_multi_tenant_isolation() {
     ctx2.main.add_memory("Project 2 content".to_string(), vec!["cue2".to_string()], None, false);
     
     // Proj1 should not see cue2
-    assert_eq!(ctx1.main.recall(vec!["cue2".to_string()], 10, false).len(), 0);
+    assert_eq!(ctx1.main.recall(vec!["cue2".to_string()], 10, false, None).len(), 0);
     // Proj2 should not see cue1
-    assert_eq!(ctx2.main.recall(vec!["cue1".to_string()], 10, false).len(), 0);
+    assert_eq!(ctx2.main.recall(vec!["cue1".to_string()], 10, false, None).len(), 0);
     
     assert_eq!(ctx1.main.get_memories().len(), 1);
     assert_eq!(ctx2.main.get_memories().len(), 1);
@@ -56,7 +56,7 @@ fn test_snapshot_roundtrip() {
         
         // Should be able to load
         let ctx = engine.load_project(&project_id).expect("Should load successfully");
-        let results = ctx.main.recall(vec!["save:true".to_string()], 10, false);
+        let results = ctx.main.recall(vec!["save:true".to_string()], 10, false, None);
         
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].content, "persist me");

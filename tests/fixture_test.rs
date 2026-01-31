@@ -23,7 +23,7 @@ fn test_fixture_loading_and_recall() {
     assert_eq!(loaded_engine.get_memories().len(), 1);
     
     // 4. Run recall
-    let results = loaded_engine.recall(vec!["test_cue".to_string()], 5, false);
+    let results = loaded_engine.recall(vec!["test_cue".to_string()], 5, false, None);
     assert!(!results.is_empty());
     assert_eq!(results[0].content, "Test Content");
     

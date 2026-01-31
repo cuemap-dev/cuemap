@@ -13,11 +13,11 @@ impl Eval for DeterministicReplayEval {
     }
 
     fn run(&self, engine: &CueMapEngine) -> EvalResult {
-        let first_run = engine.recall(self.query.clone(), 10, false);
+        let first_run = engine.recall(self.query.clone(), 10, false, None);
         let first_norm = NormalizedRecall::from(first_run);
 
         for i in 0..self.interactions {
-            let next_run = engine.recall(self.query.clone(), 10, false);
+            let next_run = engine.recall(self.query.clone(), 10, false, None);
             let next_norm = NormalizedRecall::from(next_run);
 
             if first_norm != next_norm {

@@ -12,7 +12,7 @@ fn test_pattern_completion() {
     engine.add_memory("content 2".to_string(), vec!["cue:a".to_string(), "cue:c".to_string()], None, false);
     
     // Recall with {B}
-    let results = engine.recall(vec!["cue:b".to_string()], 10, false);
+    let results = engine.recall(vec!["cue:b".to_string()], 10, false, None);
     
     // Check if "cue:a" was inferred. 
     // Since "cue:b" co-occurs with "cue:a" in Memory 1, "cue:a" should be injected.
@@ -43,7 +43,7 @@ fn test_salience_bias() {
     // Normal memory
     let id_normal = engine.add_memory("this is a much longer content for a normal memory".to_string(), vec!["a".to_string()], None, false);
     
-    let results = engine.recall(vec!["a".to_string()], 10, false);
+    let results = engine.recall(vec!["a".to_string()], 10, false, None);
     
     assert_eq!(results[0].memory_id, id_salient, "Salient memory should rank first even if newer memory exists if it has much higher salience");
 }
@@ -55,7 +55,7 @@ fn test_match_integrity_scores() {
     let id_exact = engine.add_memory("exact match".to_string(), vec!["a".to_string(), "b".to_string()], None, false);
     let id_partial = engine.add_memory("partial match".to_string(), vec!["a".to_string(), "c".to_string(), "d".to_string(), "e".to_string()], None, false);
     
-    let results = engine.recall(vec!["a".to_string(), "b".to_string()], 10, false);
+    let results = engine.recall(vec!["a".to_string(), "b".to_string()], 10, false, None);
     
     let res_exact = results.iter().find(|r| r.memory_id == id_exact).unwrap();
     let res_partial = results.iter().find(|r| r.memory_id == id_partial).unwrap();

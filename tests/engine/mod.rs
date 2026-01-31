@@ -27,7 +27,7 @@ fn test_attach_cues() {
     assert_eq!(memory.cues, expected_cues);
 
     // Verify recall works with new cues
-    let results = engine.recall(vec!["b".to_string()], 10, false);
+    let results = engine.recall(vec!["b".to_string()], 10, false, None);
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].memory_id, memory_id);
 
@@ -44,7 +44,7 @@ fn test_freshness_boost() {
     let _id1 = engine.add_memory("oldest".to_string(), vec!["topic".to_string()], None, false);
     let id2 = engine.add_memory("newest".to_string(), vec!["topic".to_string()], None, false);
     
-    let results = engine.recall(vec!["topic".to_string()], 10, true);
+    let results = engine.recall(vec!["topic".to_string()], 10, true, None);
     
     assert_eq!(results.len(), 2);
     // Position 0 gets +1.0 freshness boost.
@@ -67,7 +67,7 @@ fn test_scoring_gradient() {
         ids.push(engine.add_memory(format!("content {}", i), vec![cue.clone()], None, false));
     }
     
-    let results = engine.recall(vec![cue], 10, false);
+    let results = engine.recall(vec![cue], 10, false, None);
     
     // Scores should be strictly decreasing
     for i in 0..results.len()-1 {
@@ -91,7 +91,7 @@ fn test_log_frequency_scaling() {
         engine.upsert_memory_with_id(id2.clone(), "rare".to_string(), vec!["cue".to_string()], None, true);
     }
     
-    let results = engine.recall(vec!["cue".to_string()], 10, false);
+    let results = engine.recall(vec!["cue".to_string()], 10, false, None);
     
     // log10(100) = 2.0
     // log10(10) = 1.0

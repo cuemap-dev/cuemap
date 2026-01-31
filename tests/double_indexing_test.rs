@@ -16,17 +16,17 @@ mod tests {
         );
         
         // 2. Recall using full cue (legacy/precise)
-        let results_full = engine.recall(vec!["name:ComputeTax".to_string()], 10, false);
+        let results_full = engine.recall(vec!["name:ComputeTax".to_string()], 10, false, None);
         assert!(!results_full.is_empty(), "Should find memory by full cue");
         assert_eq!(results_full[0].content, "Function definition content");
 
         // 3. Recall using value only (natural language)
-        let results_val = engine.recall(vec!["ComputeTax".to_string()], 10, false);
+        let results_val = engine.recall(vec!["ComputeTax".to_string()], 10, false, None);
         assert!(!results_val.is_empty(), "Should find memory by value only");
         assert_eq!(results_val[0].content, "Function definition content");
 
         // 4. Recall using another value
-        let results_val2 = engine.recall(vec!["function".to_string()], 10, false);
+        let results_val2 = engine.recall(vec!["function".to_string()], 10, false, None);
         assert!(!results_val2.is_empty(), "Should find memory by 'function'");
     }
 
@@ -41,14 +41,14 @@ mod tests {
         );
 
         // Verify indexing
-        assert!(!engine.recall(vec!["category:secret".to_string()], 1, false).is_empty());
-        assert!(!engine.recall(vec!["secret".to_string()], 1, false).is_empty());
+        assert!(!engine.recall(vec!["category:secret".to_string()], 1, false, None).is_empty());
+        assert!(!engine.recall(vec!["secret".to_string()], 1, false, None).is_empty());
 
         // Delete
         engine.delete_memory(&mem_id);
 
         // Verify gone from both
-        assert!(engine.recall(vec!["category:secret".to_string()], 1, false).is_empty(), "Should be gone from full index");
-        assert!(engine.recall(vec!["secret".to_string()], 1, false).is_empty(), "Should be gone from value index");
+        assert!(engine.recall(vec!["category:secret".to_string()], 1, false, None).is_empty(), "Should be gone from full index");
+        assert!(engine.recall(vec!["secret".to_string()], 1, false, None).is_empty(), "Should be gone from value index");
     }
 }

@@ -13,7 +13,7 @@ impl Eval for AmbiguityRecognitionEval {
     }
 
     fn run(&self, engine: &CueMapEngine) -> EvalResult {
-        let results = engine.recall(self.query.clone(), 5, false);
+        let results = engine.recall(self.query.clone(), 5, false, None);
 
         if results.len() < self.min_candidates {
             return EvalResult::Fail(format!(
@@ -49,7 +49,7 @@ impl Eval for UnanswerableQuestionEval {
     }
 
     fn run(&self, engine: &CueMapEngine) -> EvalResult {
-        let results = engine.recall(self.query.clone(), 5, false);
+        let results = engine.recall(self.query.clone(), 5, false, None);
 
         if results.is_empty() {
             return EvalResult::Pass;

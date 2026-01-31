@@ -1,4 +1,4 @@
-use cuemap_rust::agent::chunker::Chunker;
+use cuemap::agent::chunker::Chunker;
 use std::path::PathBuf;
 
 #[test]

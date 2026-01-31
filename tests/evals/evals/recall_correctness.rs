@@ -17,8 +17,8 @@ impl Eval for ParaphraseInvarianceEval {
     }
 
     fn run(&self, engine: &CueMapEngine) -> EvalResult {
-        let res1 = engine.recall(self.query1.clone(), 5, false);
-        let res2 = engine.recall(self.query2.clone(), 5, false);
+        let res1 = engine.recall(self.query1.clone(), 5, false, None);
+        let res2 = engine.recall(self.query2.clone(), 5, false, None);
 
         if res1.is_empty() || res2.is_empty() {
              return EvalResult::Fail("One or both queries returned empty results".to_string());
@@ -60,7 +60,7 @@ impl Eval for SpecificitySensitivityEval {
 
     fn run(&self, engine: &CueMapEngine) -> EvalResult {
         // Q2: What does calculate_sum do?
-        let specific_res = engine.recall(self.specific_query.clone(), 10, false);
+        let specific_res = engine.recall(self.specific_query.clone(), 10, false, None);
         
         let score_specific_target = specific_res.iter().find(|r| r.memory_id == self.specific_target_id).map(|r| r.score).unwrap_or(0.0);
         let score_general_target = specific_res.iter().find(|r| r.memory_id == self.general_target_id).map(|r| r.score).unwrap_or(0.0);
@@ -74,7 +74,7 @@ impl Eval for SpecificitySensitivityEval {
         }
 
         // Q1: What does calculator do?
-        let general_res = engine.recall(self.general_query.clone(), 10, false);
+        let general_res = engine.recall(self.general_query.clone(), 10, false, None);
         let score_general_on_general = general_res.iter().find(|r| r.memory_id == self.general_target_id).map(|r| r.score).unwrap_or(0.0);
         
         if score_general_on_general <= 0.0 {
@@ -96,7 +96,7 @@ impl Eval for NegativeKnowledgeEval {
     }
 
     fn run(&self, engine: &CueMapEngine) -> EvalResult {
-        let results = engine.recall(self.query.clone(), 5, false);
+        let results = engine.recall(self.query.clone(), 5, false, None);
 
         if let Some(top) = results.first() {
             if top.score >= self.match_integrity_threshold {

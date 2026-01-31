@@ -13,7 +13,7 @@ impl Eval for ReinforcementEffectEval {
 
     fn run(&self, engine: &CueMapEngine) -> EvalResult {
         // Baseline
-        let init_res = engine.recall(self.query.clone(), 1, false);
+        let init_res = engine.recall(self.query.clone(), 1, false, None);
         if init_res.is_empty() {
              return EvalResult::Fail("No initial results".to_string());
         }
@@ -26,7 +26,7 @@ impl Eval for ReinforcementEffectEval {
         }
 
         // Check Effect
-        let final_res = engine.recall(self.query.clone(), 1, false);
+        let final_res = engine.recall(self.query.clone(), 1, false, None);
         if final_res.is_empty() {
             return EvalResult::Fail("Lost memory after reinforcement".to_string());
         }
