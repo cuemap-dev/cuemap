@@ -1,24 +1,28 @@
+use crate::structures::{MainStats, LexiconStats};
+use std::collections::HashMap;
 use crate::engine::CueMapEngine;
 use crate::normalization::NormalizationConfig;
 use crate::taxonomy::Taxonomy;
 use crate::config::CueGenStrategy;
 use crate::semantic::SemanticEngine;
 use dashmap::DashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 pub struct ProjectContext {
-    pub main: CueMapEngine,
-    pub aliases: CueMapEngine,
-    pub lexicon: CueMapEngine,
+    pub main: CueMapEngine<MainStats>,
+    pub aliases: CueMapEngine<MainStats>,
+    pub lexicon: CueMapEngine<LexiconStats>,
     pub query_cache: DashMap<String, Vec<String>>,
     pub normalization: NormalizationConfig,
     pub taxonomy: Taxonomy,
     pub cuegen_strategy: CueGenStrategy,
     pub semantic_engine: SemanticEngine,
     pub last_activity: AtomicU64,
+    // Shared Context (holds top 10k cues)
+    pub market_heatmap: Arc<RwLock<HashMap<String, f32>>>,
 }
 
 impl ProjectContext {
@@ -38,6 +42,7 @@ impl ProjectContext {
                     .unwrap()
                     .as_secs()
             ),
+            market_heatmap: Arc::new(RwLock::new(HashMap::new())),
         }
     }
     
@@ -73,10 +78,19 @@ impl ProjectContext {
     /// - Normalization
     /// - Taxonomy validation
     pub fn resolve_cues_from_text(&self, text: &str, skip_lexicon: bool) -> (Vec<String>, Vec<String>) {
+        self.resolve_cues_from_text_with_lang(text, skip_lexicon, crate::nl::Language::Default)
+    }
+
+    pub fn resolve_cues_from_text_with_lang(&self, text: &str, skip_lexicon: bool, lang: crate::nl::Language) -> (Vec<String>, Vec<String>) {
         use std::time::Instant;
         let t_start = Instant::now();
         
-        let normalized_text = crate::nl::normalize_text(text);
+        let normalized_text = if lang == crate::nl::Language::Default {
+            crate::nl::normalize_text(text)
+        } else {
+            // Include language tag in cache key to avoid collisions between languages with same text but different stopwords
+            format!("{:?}:{}", lang, crate::nl::normalize_text(text))
+        };
         
         // Check cache (cache only stores cues, not memory IDs) - skip if lexicon disabled
         if !skip_lexicon {
@@ -87,7 +101,7 @@ impl ProjectContext {
         
         // Tokenize
         let t_tok = Instant::now();
-        let tokens = crate::nl::tokenize_to_cues(text);
+        let tokens = crate::nl::tokenize_to_cues_with_lang(text, lang);
         let tok_ms = t_tok.elapsed().as_secs_f64() * 1000.0;
         
         if tokens.is_empty() {
@@ -173,8 +187,8 @@ impl ProjectContext {
                 "status:active".to_string(),
             ];
             
-            // Recall aliases (limit 8, auto_reinforce false to avoid noise)
-            let aliases = self.aliases.recall(alias_query, 8, false);
+            // Recall aliases (limit 8, auto_reinforce false to avoid noise, no heatmap)
+            let aliases = self.aliases.recall(alias_query, 8, false, None);
             
             for alias in aliases {
                 // Parse alias content to get target cue and weight

@@ -22,7 +22,7 @@
 //! - `AZURE_STORAGE_ACCOUNT_KEY` - Storage account key
 
 use crate::engine::CueMapEngine;
-use crate::structures::{Memory, OrderedSet};
+use crate::structures::{Memory, OrderedSet, MemoryStats};
 use bytes::Bytes;
 use dashmap::DashMap;
 use object_store::{
@@ -44,8 +44,8 @@ use tracing::{debug, error, info, warn};
 
 
 #[derive(Debug, Serialize, Deserialize)]
-struct PersistedState {
-    memories: HashMap<String, Memory>,
+struct PersistedState<T> {
+    memories: HashMap<String, Memory<T>>,
     cue_index: HashMap<String, Vec<String>>, // Flattened OrderedSet
     version: u32,
     saved_at: u64,
@@ -74,17 +74,20 @@ impl PersistenceManager {
     }
     
     /// Save engine state to a specific path (used by multi-tenant)
-    pub fn save_to_path(
-        engine: &CueMapEngine,
+    /// Save engine state to a specific path (used by multi-tenant)
+    pub fn save_to_path<T>(
+        engine: &CueMapEngine<T>,
         path: &Path,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error>> 
+    where T: Serialize + for<'de> Deserialize<'de> + Clone + Default + Send + Sync + MemoryStats + 'static
+    {
         let start = std::time::Instant::now();
         
         let memories = engine.get_memories();
         let cue_index = engine.get_cue_index();
         
         // Convert DashMaps to serializable format
-        let memories_map: HashMap<String, Memory> = memories
+        let memories_map: HashMap<String, Memory<T>> = memories
             .iter()
             .map(|entry| (entry.key().clone(), entry.value().clone()))
             .collect();
@@ -133,9 +136,12 @@ impl PersistenceManager {
     }
     
     /// Load engine state from a specific path (used by multi-tenant)
-    pub fn load_from_path(
+    /// Load engine state from a specific path (used by multi-tenant)
+    pub fn load_from_path<T>(
         path: &Path,
-    ) -> Result<(DashMap<String, Memory>, DashMap<String, OrderedSet>), Box<dyn std::error::Error>> {
+    ) -> Result<(DashMap<String, Memory<T>>, DashMap<String, OrderedSet>), Box<dyn std::error::Error>> 
+    where T: Serialize + for<'de> Deserialize<'de> + Clone + Default + Send + Sync + MemoryStats + 'static
+    {
         if !path.exists() {
             return Err(format!("Snapshot not found: {:?}", path).into());
         }
@@ -143,7 +149,7 @@ impl PersistenceManager {
         info!("Loading state from {:?}", path);
         
         let data = fs::read(path)?;
-        let state: PersistedState = bincode::deserialize(&data)?;
+        let state: PersistedState<T> = bincode::deserialize(&data)?;
         
         info!(
             "Loaded {} memories and {} cues from snapshot (version: {}, saved: {})",
@@ -214,9 +220,11 @@ impl PersistenceManager {
         self.data_dir.join("cuemap.bin.tmp")
     }
     
-    pub fn load_state(
+    pub fn load_state<T>(
         &self,
-    ) -> Result<(DashMap<String, Memory>, DashMap<String, OrderedSet>), Box<dyn std::error::Error>> {
+    ) -> Result<(DashMap<String, Memory<T>>, DashMap<String, OrderedSet>), Box<dyn std::error::Error>> 
+    where T: Serialize + for<'de> Deserialize<'de> + Clone + Default + Send + Sync + MemoryStats + 'static
+    {
         let snapshot_path = self.snapshot_path();
         
         if !snapshot_path.exists() {
@@ -227,7 +235,7 @@ impl PersistenceManager {
         info!("Loading state from {:?}", snapshot_path);
         
         let data = fs::read(&snapshot_path)?;
-        let state: PersistedState = bincode::deserialize(&data)?;
+        let state: PersistedState<T> = bincode::deserialize(&data)?;
         
         info!(
             "Loaded {} memories and {} cues from snapshot (version: {}, saved: {})",
@@ -255,17 +263,19 @@ impl PersistenceManager {
         Ok((memories, cue_index))
     }
     
-    pub fn save_state(
+    pub fn save_state<T>(
         &self,
-        engine: &CueMapEngine,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+        engine: &CueMapEngine<T>,
+    ) -> Result<(), Box<dyn std::error::Error>> 
+    where T: Serialize + for<'de> Deserialize<'de> + Clone + Default + Send + Sync + MemoryStats + 'static
+    {
         let start = std::time::Instant::now();
         
         let memories = engine.get_memories();
         let cue_index = engine.get_cue_index();
         
         // Convert DashMaps to serializable format
-        let memories_map: HashMap<String, Memory> = memories
+        let memories_map: HashMap<String, Memory<T>> = memories
             .iter()
             .map(|entry| (entry.key().clone(), entry.value().clone()))
             .collect();
@@ -313,10 +323,12 @@ impl PersistenceManager {
         Ok(())
     }
     
-    pub async fn start_background_snapshots(
+    pub async fn start_background_snapshots<T>(
         &self,
-        engine: Arc<CueMapEngine>,
-    ) -> tokio::task::JoinHandle<()> {
+        engine: Arc<CueMapEngine<T>>,
+    ) -> tokio::task::JoinHandle<()> 
+    where T: Serialize + for<'de> Deserialize<'de> + Clone + Default + Send + Sync + MemoryStats + 'static
+    {
         let persistence = self.clone();
         
         tokio::spawn(async move {
@@ -345,10 +357,12 @@ impl Clone for PersistenceManager {
 }
 
 /// Setup graceful shutdown handler
-pub async fn setup_shutdown_handler(
+pub async fn setup_shutdown_handler<T>(
     persistence: PersistenceManager,
-    engine: Arc<CueMapEngine>,
-) {
+    engine: Arc<CueMapEngine<T>>,
+)
+where T: Serialize + for<'de> Deserialize<'de> + Clone + Default + Send + Sync + MemoryStats + 'static
+{
     tokio::spawn(async move {
         // Wait for SIGINT (Ctrl+C) or SIGTERM
         let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())

@@ -1,18 +1,21 @@
 //! Multi-tenant engine supporting project isolation.
 
+use crate::structures::{MainStats, LexiconStats};
 use crate::engine::CueMapEngine;
 use crate::persistence::PersistenceManager;
 use crate::projects::ProjectContext;
+use crate::crypto::EncryptionKey;
 use crate::normalization::NormalizationConfig;
 use crate::taxonomy::Taxonomy;
 use crate::config::CueGenStrategy;
+use std::collections::HashMap;
 use crate::semantic::SemanticEngine;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
 
 pub type ProjectId = String;
@@ -32,6 +35,7 @@ pub struct MultiTenantEngine {
     snapshots_dir: PathBuf,
     cuegen_strategy: CueGenStrategy,
     semantic_engine: SemanticEngine,
+    master_key: Option<Arc<EncryptionKey>>,
 }
 
 impl MultiTenantEngine {
@@ -53,7 +57,12 @@ impl MultiTenantEngine {
             snapshots_dir,
             cuegen_strategy,
             semantic_engine,
+            master_key: None,
         }
+    }
+
+    pub fn set_master_key(&mut self, key: Option<Arc<EncryptionKey>>) {
+        self.master_key = key;
     }
     
     pub fn get_or_create_project(&self, project_id: ProjectId) -> Result<Arc<ProjectContext>, String> {
@@ -64,12 +73,19 @@ impl MultiTenantEngine {
 
 
             // Create new project with default config
-            let ctx = Arc::new(ProjectContext::new(
+            let mut ctx_obj = ProjectContext::new(
                 NormalizationConfig::default(),
                 Taxonomy::default(),
                 self.cuegen_strategy.clone(),
                 self.semantic_engine.clone(),
-            ));
+            );
+            
+            // Set master key on engines
+            ctx_obj.main.set_master_key(self.master_key.clone());
+            ctx_obj.aliases.set_master_key(self.master_key.clone());
+            ctx_obj.lexicon.set_master_key(self.master_key.clone());
+            
+            let ctx = Arc::new(ctx_obj);
             self.projects.insert(project_id, ctx.clone());
             Ok(ctx)
         }
@@ -172,13 +188,14 @@ impl MultiTenantEngine {
         }
         
         // Load main engine (required)
-        let (memories, cue_index) = PersistenceManager::load_from_path(&main_path)
+        let (memories, cue_index) = PersistenceManager::load_from_path::<MainStats>(&main_path)
             .map_err(|e| format!("Failed to load main engine: {}", e))?;
-        let main_engine = CueMapEngine::from_state(memories, cue_index);
+        let mut main_engine = CueMapEngine::from_state(memories, cue_index);
+        main_engine.set_master_key(self.master_key.clone());
         
         // Load aliases engine (optional - may not exist for older snapshots)
-        let aliases_engine = if aliases_path.exists() {
-            match PersistenceManager::load_from_path(&aliases_path) {
+        let mut aliases_engine = if aliases_path.exists() {
+            match PersistenceManager::load_from_path::<MainStats>(&aliases_path) {
                 Ok((memories, cue_index)) => {
                     tracing::debug!("Loaded aliases for project '{}'", project_id);
                     CueMapEngine::from_state(memories, cue_index)
@@ -191,10 +208,11 @@ impl MultiTenantEngine {
         } else {
             CueMapEngine::new()
         };
+        aliases_engine.set_master_key(self.master_key.clone());
         
         // Load lexicon engine (optional - may not exist for older snapshots)
-        let lexicon_engine = if lexicon_path.exists() {
-            match PersistenceManager::load_from_path(&lexicon_path) {
+        let mut lexicon_engine = if lexicon_path.exists() {
+            match PersistenceManager::load_from_path::<LexiconStats>(&lexicon_path) {
                 Ok((memories, cue_index)) => {
                     tracing::debug!("Loaded lexicon for project '{}'", project_id);
                     CueMapEngine::from_state(memories, cue_index)
@@ -207,6 +225,7 @@ impl MultiTenantEngine {
         } else {
             CueMapEngine::new()
         };
+        lexicon_engine.set_master_key(self.master_key.clone());
         
         let ctx = Arc::new(ProjectContext {
             main: main_engine,
@@ -223,6 +242,7 @@ impl MultiTenantEngine {
                     .unwrap()
                     .as_secs()
             ),
+            market_heatmap: Arc::new(RwLock::new(HashMap::new())),
         });
         
         self.projects.insert(project_id.clone(), ctx.clone());
@@ -272,7 +292,6 @@ impl MultiTenantEngine {
         PersistenceManager::delete_snapshot(&snapshot_path)
     }
     
-    #[allow(dead_code)]
     pub fn get_global_stats(&self) -> HashMap<String, serde_json::Value> {
         let projects = self.list_projects();
         

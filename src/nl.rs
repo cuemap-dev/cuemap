@@ -19,6 +19,45 @@ static LEMMA_EXCEPTIONS: OnceLock<HashMap<String, String>> = OnceLock::new();
 // Runtime cache for lemmatized words to avoid redundant nlprule processing
 static LEMMA_CACHE: OnceLock<DashMap<String, String>> = OnceLock::new();
 
+// Language-specific keyword lists for filtering code noise
+static RUST_KEYWORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
+static PYTHON_KEYWORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
+static GO_KEYWORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
+static JS_KEYWORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
+static PHP_KEYWORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
+static JAVA_KEYWORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Language {
+    Default,
+    Rust,
+    Python,
+    TypeScript,
+    JavaScript,
+    Go,
+    Php,
+    Java,
+    Css,
+    Html,
+}
+
+impl From<&str> for Language {
+    fn from(s: &str) -> Self {
+        match s {
+            "lang:rust" => Language::Rust,
+            "lang:python" => Language::Python,
+            "lang:typescript" => Language::TypeScript,
+            "lang:javascript" => Language::JavaScript,
+            "lang:go" => Language::Go,
+            "lang:php" => Language::Php,
+            "lang:java" => Language::Java,
+            "lang:css" => Language::Css,
+            "lang:html" => Language::Html,
+            _ => Language::Default,
+        }
+    }
+}
+
 fn get_lemma_cache() -> &'static DashMap<String, String> {
     LEMMA_CACHE.get_or_init(|| DashMap::new())
 }
@@ -134,6 +173,30 @@ pub fn get_stopwords() -> &'static HashSet<&'static str> {
     })
 }
 
+pub fn get_language_stopwords(lang: Language) -> &'static HashSet<&'static str> {
+    match lang {
+        Language::Rust => RUST_KEYWORDS.get_or_init(|| {
+            ["as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type", "union", "unsafe", "use", "where", "while"].into_iter().collect()
+        }),
+        Language::Python => PYTHON_KEYWORDS.get_or_init(|| {
+            ["and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del", "elif", "else", "except", "False", "finally", "for", "from", "global", "if", "import", "in", "is", "lambda", "None", "nonlocal", "not", "or", "pass", "raise", "return", "True", "try", "while", "with", "yield"].into_iter().collect()
+        }),
+        Language::Go => GO_KEYWORDS.get_or_init(|| {
+            ["break", "default", "func", "interface", "select", "case", "defer", "go", "map", "struct", "chan", "else", "goto", "package", "switch", "const", "fallthrough", "if", "range", "type", "continue", "for", "import", "return", "var"].into_iter().collect()
+        }),
+        Language::TypeScript | Language::JavaScript => JS_KEYWORDS.get_or_init(|| {
+            ["await", "break", "case", "catch", "class", "const", "continue", "debugger", "default", "delete", "do", "else", "enum", "export", "extends", "false", "finally", "for", "function", "if", "import", "in", "instanceof", "new", "null", "return", "super", "switch", "this", "throw", "true", "try", "typeof", "var", "void", "while", "with", "yield", "let", "static", "interface", "implements", "package", "protected", "private", "public"].into_iter().collect()
+        }),
+        Language::Php => PHP_KEYWORDS.get_or_init(|| {
+            ["abstract", "and", "array", "as", "break", "callable", "case", "catch", "class", "clone", "const", "continue", "declare", "default", "die", "do", "echo", "else", "elif", "empty", "enddeclare", "endfor", "endforeach", "endif", "endswitch", "endwhile", "eval", "exit", "extends", "final", "finally", "fn", "for", "foreach", "function", "global", "goto", "if", "implements", "include", "include_once", "instanceof", "insteadof", "interface", "isset", "list", "match", "namespace", "new", "or", "print", "private", "protected", "public", "readonly", "require", "require_once", "return", "static", "switch", "throw", "trait", "try", "unset", "use", "var", "while", "xor", "yield"].into_iter().collect()
+        }),
+        Language::Java => JAVA_KEYWORDS.get_or_init(|| {
+            ["abstract", "assert", "boolean", "break", "byte", "case", "catch", "char", "class", "const", "continue", "default", "do", "double", "else", "enum", "extends", "final", "finally", "float", "for", "goto", "if", "implements", "import", "instanceof", "int", "interface", "long", "native", "new", "package", "private", "protected", "public", "return", "short", "static", "super", "switch", "synchronized", "this", "throw", "throws", "transient", "try", "void", "volatile", "while", "true", "false", "null"].into_iter().collect()
+        }),
+        _ => get_stopwords(), // Fallback to normal stopwords
+    }
+}
+
 fn get_token_regex() -> &'static Regex {
     TOKEN_REGEX.get_or_init(|| {
         Regex::new(r"[a-z][a-z0-9]*").unwrap()
@@ -193,10 +256,11 @@ pub fn normalize_text(text: &str) -> String {
 /// 1. Split text by punctuation and stopwords
 /// 2. Extract candidate phrases (word sequences between delimiters)
 /// 3. Return meaningful multi-word phrases as underscore-joined bigrams
-fn extract_rake_phrases(text: &str) -> Vec<String> {
+fn extract_rake_phrases(text: &str, lang: Language) -> Vec<String> {
     let lower = text.to_lowercase();
     let delimiter_regex = get_phrase_delimiter_regex();
     let stopwords = get_stopwords();
+    let lang_stopwords = get_language_stopwords(lang);
     
     // Split by punctuation first
     let segments: Vec<&str> = delimiter_regex.split(&lower).collect();
@@ -221,7 +285,8 @@ fn extract_rake_phrases(text: &str) -> Vec<String> {
                 continue;
             }
             
-            if stopwords.contains(clean.as_str()) || clean.len() <= 1 {
+            // Check against both global stopwords and language-specific ones
+            if stopwords.contains(clean.as_str()) || lang_stopwords.contains(clean.as_str()) || clean.len() <= 1 {
                 // Stopword encountered - emit current phrase if valid
                 if current_phrase.len() >= 2 && current_phrase.len() <= 4 {
                     let phrase = current_phrase.join("_");
@@ -252,6 +317,10 @@ fn extract_rake_phrases(text: &str) -> Vec<String> {
 }
 
 pub fn tokenize_to_cues(text: &str) -> Vec<String> {
+    tokenize_to_cues_with_lang(text, Language::Default)
+}
+
+pub fn tokenize_to_cues_with_lang(text: &str, lang: Language) -> Vec<String> {
     // 1. Pre-sanitize (URLs, etc.)
     let sanitized = sanitize_text(text);
     
@@ -259,13 +328,15 @@ pub fn tokenize_to_cues(text: &str) -> Vec<String> {
     let normalized = normalize_text(&sanitized);
     
     let mut cues = Vec::new();
+    let stopwords = get_stopwords();
+    let lang_stopwords = get_language_stopwords(lang);
     
     // 3. Extract individual tokens (filtered and stemmed)
     for token in get_token_regex().find_iter(&normalized) {
         let t = token.as_str();
         
         // Skip stopwords, single chars, and hash-like tokens
-        if get_stopwords().contains(t) || t.len() <= 1 || is_hash_like(t) {
+        if stopwords.contains(t) || lang_stopwords.contains(t) || t.len() <= 1 || is_hash_like(t) {
             continue;
         }
         
@@ -279,7 +350,7 @@ pub fn tokenize_to_cues(text: &str) -> Vec<String> {
     }
     
     // 4. Extract quality bigrams using RAKE-style phrase detection (already stemmed internally)
-    let rake_phrases = extract_rake_phrases(&sanitized);
+    let rake_phrases = extract_rake_phrases(&sanitized, lang);
     for phrase in rake_phrases {
         if !cues.contains(&phrase) {
             cues.push(phrase);

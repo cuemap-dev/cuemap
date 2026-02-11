@@ -4,28 +4,172 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+use crate::crypto::{self, EncryptionKey};
+
+// =============================================================================
+// Stats Types - Specialized payloads for different memory engines
+// =============================================================================
+
+/// Main Memory stats: Intrinsic Importance + Event-Driven Dynamic Salience
+/// Used by the "Brain" engine for reactive scoring with decay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Memory {
-    pub id: String,
-    pub content: String,
-    pub created_at: f64,
-    pub last_accessed: f64,
+pub struct MainStats {
+    /// User-set or source-rule importance (default 1.0)
+    #[serde(default = "default_intrinsic_salience")]
+    pub intrinsic_salience: f64,
+    /// Event-driven "heat" - boosted by events, decays with time
+    #[serde(default)]
+    pub dynamic_salience: f64,
+    /// Unix timestamp when dynamic_salience was last boosted (for decay calc)
+    #[serde(default)]
+    pub last_boosted_at: u64,
+    /// Legacy: reinforcement count for backward compat
     #[serde(default)]
     pub reinforcement_count: u64,
-    #[serde(default = "default_salience")]
-    pub salience: f64,
+}
+
+fn default_intrinsic_salience() -> f64 {
+    1.0
+}
+
+impl Default for MainStats {
+    fn default() -> Self {
+        Self {
+            intrinsic_salience: 1.0,
+            dynamic_salience: 0.0,
+            last_boosted_at: 0,
+            reinforcement_count: 0,
+        }
+    }
+}
+
+impl MainStats {
+    /// Backward-compat: get "salience" as sum of intrinsic + dynamic
+    pub fn salience(&self) -> f64 {
+        self.intrinsic_salience + self.dynamic_salience
+    }
+
+    /// Calculate effective salience at a specific point in time (with decay)
+    pub fn effective_salience_at(&self, now: u64) -> f64 {
+        let half_life = 3600.0; // 1 Hour
+        let time_delta = now.saturating_sub(self.last_boosted_at);
+        let decay_factor = 2.0_f64.powf(-(time_delta as f64) / half_life);
+        
+        self.intrinsic_salience + (self.dynamic_salience * decay_factor)
+    }
+}
+
+/// Lexicon stats: Tiered Time-Series Statistics
+/// Used by the "Dictionary" engine for statistical tracking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LexiconStats {
+    /// Total count of reinforcements
+    #[serde(default)]
+    pub total_count: u64,
+    /// High-resolution: Minute timestamp (unix_secs / 60) -> count
+    #[serde(default)]
+    pub minute_stats: HashMap<u32, u16>,
+    /// Low-resolution: Day timestamp (unix_secs / 86400) -> count
+    #[serde(default)]
+    pub daily_stats: HashMap<u32, u32>,
+    /// Unix timestamp of last reinforcement
+    #[serde(default)]
+    pub last_reinforced: u64,
+}
+
+impl Default for LexiconStats {
+    fn default() -> Self {
+        Self {
+            total_count: 0,
+            minute_stats: HashMap::new(),
+            daily_stats: HashMap::new(),
+            last_reinforced: 0,
+        }
+    }
+}
+
+// =============================================================================
+// Traits
+// =============================================================================
+
+/// Trait to allow Generic Engine to read basic stats for ranking/scoring
+pub trait MemoryStats {
+    fn get_salience(&self) -> f64;
+    /// Calculate effective salience at a specific timestamp (allows for time-decay)
+    fn get_effective_salience(&self, now: u64) -> f64;
+    fn get_reinforcement_count(&self) -> u64;
+    fn manual_boost(&mut self);
+}
+
+impl MemoryStats for MainStats {
+    fn get_salience(&self) -> f64 {
+        self.intrinsic_salience + self.dynamic_salience
+    }
+    
+    fn get_effective_salience(&self, now: u64) -> f64 {
+        self.effective_salience_at(now)
+    }
+    
+    fn get_reinforcement_count(&self) -> u64 {
+        self.reinforcement_count
+    }
+    
+    fn manual_boost(&mut self) {
+        self.intrinsic_salience += 0.1;
+        self.reinforcement_count += 1;
+    }
+}
+
+impl MemoryStats for LexiconStats {
+    fn get_salience(&self) -> f64 {
+        // For Lexicon, total_count is the rough equivalent of salience/importance
+        self.total_count as f64
+    }
+    
+    fn get_effective_salience(&self, _now: u64) -> f64 {
+        // Lexicon doesn't decay (yet), just returns total count
+        self.total_count as f64
+    }
+    
+    fn get_reinforcement_count(&self) -> u64 {
+        self.total_count
+    }
+    
+    fn manual_boost(&mut self) {
+        self.total_count += 1;
+    }
+}
+
+// =============================================================================
+// Generic Memory Struct
+// =============================================================================
+
+// MemoryPayload removed in favor of direct Vec<u8> with magic byte detection
+
+
+/// Generic Memory wrapper for all memory types.
+/// The `stats` field contains type-specific payload (MainStats or LexiconStats).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Memory<T> {
+    pub id: String,
+    // Content is now just raw bytes (Compressed OR Encrypted)
+    pub content: Vec<u8>, 
+    pub created_at: f64,
+    pub last_accessed: f64,
     #[serde(default)]
     pub cues: Vec<String>,
     #[serde(default)]
     pub metadata: HashMap<String, serde_json::Value>,
+    /// Type-specific stats payload
+    pub stats: T,
 }
 
-fn default_salience() -> f64 {
-    1.0
-}
-
-impl Memory {
-    pub fn new(content: String, metadata: Option<HashMap<String, serde_json::Value>>) -> Self {
+impl<T: Default> Memory<T> {
+    // Note: We avoid taking String directly in `new` to force explicit conversion choice.
+    // Callers should use `new_with_payload` or handle compression/encryption first.
+    // Or we provide a helper that takes key.
+    
+    pub fn new(content: Vec<u8>, metadata: Option<HashMap<String, serde_json::Value>>) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -36,10 +180,9 @@ impl Memory {
             content,
             created_at: now,
             last_accessed: now,
-            reinforcement_count: 0,
-            salience: 1.0,
             cues: Vec::new(),
             metadata: metadata.unwrap_or_default(),
+            stats: T::default(),
         }
     }
     
@@ -48,7 +191,50 @@ impl Memory {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs_f64();
-        self.reinforcement_count += 1;
+    }
+    
+    /// Retrieve and decode content as String
+    /// Implements "Smart Access":
+    /// 1. Checks if data is Zstd compressed (Magic Bytes). If so, just decompress.
+    /// 2. If not, assumes Encrypted. Tries to decrypt using key, then decompress.
+    pub fn access_content(&self, key: Option<&EncryptionKey>) -> Result<String, String> {
+        // 1. Try to detect if it's just compressed (not encrypted)
+        if crypto::is_compressed(&self.content) {
+            let bytes = crypto::decompress(&self.content)
+                .map_err(|e| format!("Decompression failed (plaintext): {}", e))?;
+            return String::from_utf8(bytes).map_err(|e| format!("Invalid UTF-8: {}", e));
+        }
+        
+        // 2. Fallback: Assume Encrypted
+        // If content is not Zstd magic bytes, it must be encrypted (unless it's garbage)
+        let k = key.ok_or_else(|| "Memory appears encrypted (no magic bytes) but no key provided".to_string())?;
+        
+        let compressed = crypto::decrypt(&self.content, k)?;
+        // The decrypted payload MUST be compressed zstd data
+        let bytes = crypto::decompress(&compressed)
+            .map_err(|e| format!("Decompression failed (after decrypt): {}", e))?;
+            
+        String::from_utf8(bytes).map_err(|e| format!("Invalid UTF-8: {}", e))
+    }
+    
+    /// Create payload from string (compress and optionally encrypt)
+    pub fn create_payload(text: &str, key: Option<&EncryptionKey>) -> Result<Vec<u8>, String> {
+        let compressed = crypto::compress(text.as_bytes())
+            .map_err(|e| format!("Compression failed: {}", e))?;
+            
+        if let Some(k) = key {
+            crypto::encrypt(&compressed, k)
+        } else {
+            Ok(compressed)
+        }
+    }
+}
+
+/// Convenience: Memory<MainStats> can increment reinforcement_count on touch
+impl Memory<MainStats> {
+    pub fn touch_and_reinforce(&mut self) {
+        self.touch();
+        self.stats.reinforcement_count += 1;
     }
 }
 

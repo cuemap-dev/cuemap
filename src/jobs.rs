@@ -1,9 +1,11 @@
 use crate::multi_tenant::MultiTenantEngine;
 use crate::projects::ProjectContext;
+use crate::structures::{MainStats, LexiconStats};
 use crate::llm::{LlmConfig, propose_cues};
 use crate::normalization::normalize_cue;
 use crate::taxonomy::validate_cues;
 use crate::config::*;
+use crate::metrics::MetricsCollector;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, warn, error, debug};
@@ -23,6 +25,8 @@ pub enum Job {
     ReinforceMemories { project_id: String, memory_ids: Vec<String>, cues: Vec<String> },
     ReinforceLexicon { project_id: String, memory_ids: Vec<String>, cues: Vec<String> },
     ConsolidateMemories { project_id: String },
+    UpdateMarketHeatmap { project_id: String },
+    DeleteMemory { project_id: String, memory_id: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,7 +155,7 @@ impl IngestionSession {
     }
     
     /// Flush and process all buffered jobs in order
-    pub async fn flush(&self, provider: &Arc<dyn ProjectProvider>) {
+    pub async fn flush(&self, provider: &Arc<dyn ProjectProvider>, metrics: &Option<Arc<MetricsCollector>>) {
         use std::sync::atomic::Ordering;
         
         // Try to transition Writing -> Processing
@@ -170,31 +174,31 @@ impl IngestionSession {
         let total_graph = update_graph.len();
         
         if total_propose > 0 || total_train > 0 || total_graph > 0 {
-            info!("[Jobs] Phase 2: Processing {} ProposeCues, {} TrainLexicon, {} UpdateGraph", 
+            debug!("[Jobs] Phase 2: Processing {} ProposeCues, {} TrainLexicon, {} UpdateGraph", 
                   total_propose, total_train, total_graph);
             
             // Process ProposeCues first
             for (_i, (project_id, memory_id, content)) in propose_cues.into_iter().enumerate() {
 
-                process_job(Job::ProposeCues { project_id, memory_id, content }, provider).await;
+                process_job(Job::ProposeCues { project_id, memory_id, content }, provider, metrics).await;
                 self.propose_cues_completed.fetch_add(1, Ordering::Relaxed);
             }
             
             // Then TrainLexicon
             for (_i, (project_id, memory_id)) in train_lexicon.into_iter().enumerate() {
 
-                process_job(Job::TrainLexiconFromMemory { project_id, memory_id }, provider).await;
+                process_job(Job::TrainLexiconFromMemory { project_id, memory_id }, provider, metrics).await;
                 self.train_lexicon_completed.fetch_add(1, Ordering::Relaxed);
             }
             
             // Finally UpdateGraph
             for (_i, (project_id, memory_id)) in update_graph.into_iter().enumerate() {
 
-                process_job(Job::UpdateGraph { project_id, memory_id }, provider).await;
+                process_job(Job::UpdateGraph { project_id, memory_id }, provider, metrics).await;
                 self.update_graph_completed.fetch_add(1, Ordering::Relaxed);
             }
             
-            info!("[Jobs] All background jobs complete ✓");
+            debug!("[Jobs] All background jobs complete ✓");
         }
         
         // Try to transition Processing -> Done
@@ -208,15 +212,58 @@ impl IngestionSession {
 pub struct SessionManager {
     sessions: dashmap::DashMap<String, Arc<IngestionSession>>,
     provider: Arc<dyn ProjectProvider>,
+    metrics: Option<Arc<MetricsCollector>>,
 }
 
 impl SessionManager {
-    pub fn new(provider: Arc<dyn ProjectProvider>) -> Self {
+    pub fn new(provider: Arc<dyn ProjectProvider>, metrics: Option<Arc<MetricsCollector>>) -> Self {
         Self {
             sessions: dashmap::DashMap::new(),
             provider,
+            metrics,
         }
     }
+    
+    /// Get aggregated progress across all sessions
+    pub fn get_global_progress(&self) -> JobProgress {
+        let mut global = JobProgress {
+            phase: "idle".to_string(), // Default
+            writes_completed: 0,
+            writes_total: 0,
+            propose_cues_completed: 0,
+            propose_cues_total: 0,
+            train_lexicon_completed: 0,
+            train_lexicon_total: 0,
+            update_graph_completed: 0,
+            update_graph_total: 0,
+        };
+        
+        let mut active_count = 0;
+        
+        for entry in self.sessions.iter() {
+            let p = entry.value().get_progress();
+            
+            global.writes_completed += p.writes_completed;
+            global.writes_total += p.writes_total;
+            global.propose_cues_completed += p.propose_cues_completed;
+            global.propose_cues_total += p.propose_cues_total;
+            global.train_lexicon_completed += p.train_lexicon_completed;
+            global.train_lexicon_total += p.train_lexicon_total;
+            global.update_graph_completed += p.update_graph_completed;
+            global.update_graph_total += p.update_graph_total;
+            
+            if p.phase != "idle" && p.phase != "done" {
+                active_count += 1;
+            }
+        }
+        
+        if active_count > 0 {
+            global.phase = format!("processing ({} projects)", active_count);
+        }
+        
+        global
+    }
+
     
     /// Get or create a session for a project
     pub fn get_or_create(&self, project_id: &str) -> Arc<IngestionSession> {
@@ -234,7 +281,7 @@ impl SessionManager {
     /// Flush a specific session
     pub async fn flush_session(&self, project_id: &str) {
         if let Some(session) = self.get(project_id) {
-            session.flush(&self.provider).await;
+            session.flush(&self.provider, &self.metrics).await;
         }
     }
     
@@ -261,7 +308,7 @@ impl SessionManager {
                 // 2. Flush sessions outside the lock
                 for session in sessions_to_flush {
                     debug!("[Jobs] Auto-flushing session for project: {}", session.project_id);
-                    session.flush(&manager.provider).await;
+                    session.flush(&manager.provider, &manager.metrics).await;
                 }
                 
                 // Cleanup stale sessions every 30 iterations (60 seconds)
@@ -280,47 +327,87 @@ impl SessionManager {
 pub struct JobQueue {
     sender: mpsc::Sender<Job>,
     pub session_manager: Arc<SessionManager>,
+    pub metrics: Option<Arc<MetricsCollector>>,
 }
 
 // Abstraction to access projects regardless of mode
 pub trait ProjectProvider: Send + Sync + 'static {
     fn get_project(&self, project_id: &str) -> Option<Arc<ProjectContext>>;
     fn save_project(&self, project_id: &str) -> Result<(), String>;
+    fn list_active_projects(&self) -> Vec<String>;
 }
 
 impl ProjectProvider for MultiTenantEngine {
     fn get_project(&self, project_id: &str) -> Option<Arc<ProjectContext>> {
-        self.get_project(&project_id.to_string())
+        self.get_or_create_project(project_id.to_string()).ok()
     }
     
     fn save_project(&self, project_id: &str) -> Result<(), String> {
         self.save_project(&project_id.to_string()).map(|_| ())
+    }
+
+    fn list_active_projects(&self) -> Vec<String> {
+        self.list_projects().into_iter().map(|p| p.project_id).collect()
     }
 }
 
 
 
 impl JobQueue {
-    pub fn new(provider: Arc<dyn ProjectProvider>, disable_bg_jobs: bool) -> Self {
+    pub fn new(provider: Arc<dyn ProjectProvider>, metrics: Option<Arc<MetricsCollector>>, disable_bg_jobs: bool) -> Self {
         let (tx, mut rx) = mpsc::channel(1000);
         let provider_clone = provider.clone();
+        let session_manager = Arc::new(SessionManager::new(provider.clone(), metrics.clone()));
+        let session_manager_clone = session_manager.clone();
+        let metrics_clone = metrics.clone();
         
         tokio::spawn(async move {
             while let Some(job) = rx.recv().await {
+                // Determine if this job should signal a session write completion
+                let project_for_completion = match &job {
+                    Job::ExtractAndIngest { project_id, .. } => Some(project_id.clone()),
+                    _ => None,
+                };
+
                 if !disable_bg_jobs {
-                    process_job(job, &provider_clone).await;
+                    process_job(job, &provider_clone, &metrics_clone).await;
+                }
+
+                // If it was a write job, signal completion to the session
+                if let Some(pid) = project_for_completion {
+                    if let Some(session) = session_manager_clone.get(&pid) {
+                        debug!("[Jobs] Async write job complete for project: {}", pid);
+                        session.write_complete();
+                    }
                 }
             }
         });
         
-        let session_manager = Arc::new(SessionManager::new(provider));
         if !disable_bg_jobs {
             session_manager.clone().start_auto_flush();
+            
+            // Background Task: Market Heatmap Sync (Every 60s)
+            let tx_sync = tx.clone();
+            let provider_sync = provider.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                debug!("JobQueue: Market Heatmap Sync background task started");
+                loop {
+                    interval.tick().await;
+                    let projects = provider_sync.list_active_projects();
+                    debug!("JobQueue: Ticking Market Heatmap Sync ({} projects)", projects.len());
+                    // Trigger update for all active projects
+                    for pid in projects {
+                        let _ = tx_sync.send(Job::UpdateMarketHeatmap { project_id: pid }).await;
+                    }
+                }
+            });
         }
         
         Self { 
             sender: tx,
             session_manager,
+            metrics,
         }
     }
     
@@ -356,6 +443,10 @@ impl JobQueue {
             count += pending;
         }
         count
+    }
+
+    pub fn get_global_progress(&self) -> JobProgress {
+        self.session_manager.get_global_progress()
     }
 }
 
@@ -446,8 +537,18 @@ pub fn is_lexicon_trainable(cue: &str) -> bool {
 
 // Shared logic for training lexicon from memory content (Identity + WordNet Synonyms)
 fn train_lexicon_impl(ctx: &ProjectContext, memory_id: &str, content: &str) {
+    // Detect language from memory cues if available
+    let lang = if let Some(mem) = ctx.main.get_memory(memory_id) {
+        mem.cues.iter()
+            .find(|c| c.starts_with("lang:"))
+            .map(|c| crate::nl::Language::from(c.as_str()))
+            .unwrap_or(crate::nl::Language::Default)
+    } else {
+        crate::nl::Language::Default
+    };
+
     // Tokenize content
-    let tokens = crate::nl::tokenize_to_cues(content);
+    let tokens = crate::nl::tokenize_to_cues_with_lang(content, lang);
 
     
     if tokens.is_empty() {
@@ -468,12 +569,14 @@ fn train_lexicon_impl(ctx: &ProjectContext, memory_id: &str, content: &str) {
         }
 
         // 1. Train Identity: Token -> Token
-        let lex_id = format!("cue:{}", token);
+        let lex_id = token.clone();
         ctx.lexicon.upsert_memory_with_id(
-            lex_id.clone(),
+            lex_id,
             token.clone(),
             vec![token.clone()], 
             None,
+            Some(LexiconStats::default()),
+            false,
             false
         );
         identity_count += 1;
@@ -486,12 +589,14 @@ fn train_lexicon_impl(ctx: &ProjectContext, memory_id: &str, content: &str) {
                 continue;
             }
             // Upsert: Synonym triggered by Token
-            let syn_id = format!("cue:{}", synonym);
+            let syn_id = synonym.clone();
             ctx.lexicon.upsert_memory_with_id(
                 syn_id,
                 synonym.clone(),
                 vec![token.clone()],
                 None,
+                Some(LexiconStats::default()),
+                false,
                 false
             );
             synonym_count += 1;
@@ -512,7 +617,7 @@ fn train_lexicon_impl(ctx: &ProjectContext, memory_id: &str, content: &str) {
     }
 }
 
-async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>) {
+async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>, metrics: &Option<Arc<MetricsCollector>>) {
     match job {
         Job::TrainLexiconFromMemory { project_id, memory_id } => {
             if let Some(ctx) = provider.get_project(&project_id) {
@@ -522,7 +627,8 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>) {
                 tokio::task::spawn_blocking(move || {
                      // Fetch memory from main engine
                      if let Some(memory) = ctx_clone.main.get_memory(&memory_id_clone) {
-                         train_lexicon_impl(&ctx_clone, &memory_id_clone, &memory.content);
+                         let content = memory.access_content(ctx_clone.main.get_master_key().as_deref()).unwrap_or_default();
+                         train_lexicon_impl(&ctx_clone, &memory_id_clone, &content);
                      }
                 }).await.unwrap();
             }
@@ -545,13 +651,23 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>) {
                      debug!("Job: Proposing cues for memory {} in project {} (strategy: {:?})", memory_id, project_id, ctx.cuegen_strategy);
                  
                  // 1. Resolve known cues (Lexicon recall)
-                 let (mut known_cues, _) = ctx.resolve_cues_from_text(&content, false);
+                  // Detect language from memory cues
+                  let lang = ctx.main.get_memory(&memory_id)
+                      .map(|mem| mem.cues.iter()
+                          .find(|c| c.starts_with("lang:"))
+                          .map(|c| crate::nl::Language::from(c.as_str()))
+                          .unwrap_or(crate::nl::Language::Default))
+                      .unwrap_or(crate::nl::Language::Default);
+
+                  // 1. Resolve known cues (Lexicon recall)
+                  let (mut known_cues, _) = ctx.resolve_cues_from_text_with_lang(&content, false, lang);
+
                  
                  // 2. Bootstrap if needed (for static strategies to have something to expand)
                  // If Lexicon found very few cues, add raw tokens as seed cues for expansion.
                  // Limit to 10 seeds because expansion multiplies them (each seed → multiple synonyms).
                  if known_cues.len() < 3 {
-                     let tokens = crate::nl::tokenize_to_cues(&content);
+                     let tokens = crate::nl::tokenize_to_cues_with_lang(&content, lang);
                      for token in tokens.into_iter().take(10) {
                          if !known_cues.contains(&token) {
                              known_cues.push(token);
@@ -573,7 +689,7 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>) {
                  // PERF/QUALITY: Use raw tokens for expansion to avoid Lexicon Pollution loop.
                  // We only expand what is explicitly in the content.
                  // Filter by IDF to skip common words (e.g. "the").
-                 let tokens = crate::nl::tokenize_to_cues(&content);
+                 let tokens = crate::nl::tokenize_to_cues_with_lang(&content, lang);
                  let expansion_candidates: Vec<String> = tokens.iter()
                      .filter(|c| ctx.get_cue_frequency(c) <= threshold)
                      .cloned()
@@ -681,7 +797,7 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>) {
                      debug!("Job: Attached {} cues to memory {}: {:?}{}", report.accepted.len(), memory_id, sample, suffix);
                      
                      // 7. Retrain lexicon with new cues
-                     let tokens = crate::nl::tokenize_to_cues(&content);
+                     let tokens = crate::nl::tokenize_to_cues_with_lang(&content, lang);
                      if !tokens.is_empty() {
                          for canonical_cue in report.accepted {
                              if !is_lexicon_trainable(&canonical_cue) {
@@ -705,6 +821,8 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>) {
                                   canonical_cue, 
                                   filtered_tokens, 
                                   None,
+                                  Some(LexiconStats::default()),
+                                  false,
                                   false
                               );
                          }
@@ -754,7 +872,7 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>) {
                         })
                         .collect();
                     
-                    debug!("Job: Analyzing {} candidates for aliases in project {}", candidates.len(), project_id_clone);
+                    info!("Job: Analyzing {} candidates for aliases in project {}", candidates.len(), project_id_clone);
                     
                     // 3. Parallel Comparison
                     let proposals: Vec<(String, String, f64, String)> = candidates
@@ -822,15 +940,13 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>) {
                             
                             let cues = vec![
                                 "type:alias".to_string(),
-                                format!("from:{}", from),
-                                format!("to:{}", to),
                                 "status:proposed".to_string(),
                                 "reason:overlap_analysis".to_string(),
                                 id_cue
                             ];
                             
-                            ctx_clone.aliases.upsert_memory_with_id(alias_id.clone(), content, cues, None, false);
-                            debug!("Job: Proposed alias {} -> {} (score: {:.2})", from, to, score);
+                            ctx_clone.aliases.upsert_memory_with_id(alias_id.clone(), content, cues, None, Some(MainStats::default()), false, false);
+                            info!("Job: Proposed alias {} -> {} (score: {:.2})", from, to, score);
                         }
                     }
                 }).await.unwrap();
@@ -853,10 +969,15 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>) {
                     let mut resolved_cues: Vec<String>;
                     
                     // 1. Resolve raw content cues (tokens only, no expansion)
+                    let lang = structural_cues_clone.iter()
+                        .find(|c| c.starts_with("lang:"))
+                        .map(|c| crate::nl::Language::from(c.as_str()))
+                        .unwrap_or(crate::nl::Language::Default);
+
                     match category {
                         ChunkCategory::Conversation => {
                             resolved_cues = structural_cues_clone;
-                            let (normalized_tokens, _) = ctx_clone.resolve_cues_from_text(&content_clone, true);
+                            let (normalized_tokens, _) = ctx_clone.resolve_cues_from_text_with_lang(&content_clone, true, lang);
                             for token in normalized_tokens {
                                 if !resolved_cues.contains(&token) {
                                     resolved_cues.push(token);
@@ -866,7 +987,7 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>) {
                         // Treat all other categories similarly: Just get tokens.
                         // Prose/WebContent getting WordNet expansion is now handled by Lexicon Training below.
                         _ => {
-                             let (normalized_tokens, _) = ctx_clone.resolve_cues_from_text(&content_clone, true);
+                             let (normalized_tokens, _) = ctx_clone.resolve_cues_from_text_with_lang(&content_clone, true, lang);
                              resolved_cues = normalized_tokens;
                         }
                     }
@@ -882,7 +1003,9 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>) {
                         content_clone,
                         resolved_cues.clone(),
                         None,
-                        false
+                        Some(MainStats::default()),
+                        false,
+                        true
                     );
                     
                     // Note: Lexicon training is now handled by buffered TrainLexiconFromMemory jobs
@@ -890,6 +1013,11 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>) {
                     
                     debug!("Agent: Ingested {} ({:?}, {} cues)", memory_id_clone, category, resolved_cues.len());
                 }).await.unwrap();
+
+                // Record ingestion metric
+                if let Some(m) = metrics {
+                    m.record_ingestion();
+                }
             }
         }
 
@@ -918,12 +1046,19 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>) {
                       }
                       
                       if deleted_count > 0 {
-                          debug!("Agent: Verified {}. Pruned {} stale memories.", file_path, deleted_count);
+                          info!("Agent: Verified {}. Pruned {} stale memories.", file_path, deleted_count);
                       } else {
                           debug!("Agent: Verified {}. No stale memories found.", file_path);
                       }
                   }
              }
+        }
+        Job::DeleteMemory { project_id, memory_id } => {
+            if let Some(ctx) = provider.get_project(&project_id) {
+                if ctx.main.delete_memory(&memory_id) {
+                    debug!("Job: Deleted stale memory {}", memory_id);
+                }
+            }
         }
         Job::UpdateGraph { project_id, memory_id } => {
             if let Some(ctx) = provider.get_project(&project_id) {
@@ -942,16 +1077,66 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>) {
 
         Job::ReinforceMemories { project_id, memory_ids, cues } => {
             if let Some(ctx) = provider.get_project(&project_id) {
+                // 1. Primary Reinforcement
+                debug!("Job: Starting reinforcement for {} memories", memory_ids.len());
                 for memory_id in &memory_ids {
-                    ctx.main.reinforce_memory(memory_id, cues.clone());
+                    // Use dynamic reinforcement logic (logarithmic saturation)
+                    ctx.main.reinforce_dynamic(memory_id, 1.0);
                 }
-                debug!("Job: Reinforced {} memories with {} cues", memory_ids.len(), cues.len());
+                
+                // 2. Ripple Effect (Retrieval-Induced Activation)
+                // If this reinforcement was triggered by a Recall (indicated by presence of cues?), 
+                // we "prime" related memories.
+                if !cues.is_empty() && !memory_ids.is_empty() {
+                    let ctx_clone = ctx.clone();
+                    // Take top 5 memory contents (limiter)
+                    let source_memories: Vec<String> = memory_ids.iter().take(5).cloned().collect();
+                    
+                    // let project_id_clone = project_id.clone(); // Unused
+
+                    tokio::task::spawn_blocking(move || {
+                        let mut ripple_targets: HashSet<String> = HashSet::new();
+                        
+                        // For each source memory, perform a lightweight recall
+                        for mem_id in source_memories {
+                            if let Some(mem) = ctx_clone.main.get_memory(&mem_id) {
+                                let lang = mem.cues.iter()
+                                    .find(|c| c.starts_with("lang:"))
+                                    .map(|c| crate::nl::Language::from(c.as_str()))
+                                    .unwrap_or(crate::nl::Language::Default);
+                                // Use content as query
+                                let content = mem.access_content(ctx_clone.main.get_master_key().as_deref()).unwrap_or_default();
+                                let ripple_results = ctx_clone.main.recall_fast(
+                                    crate::nl::tokenize_to_cues_with_lang(&content, lang), 
+                                    10
+                                );
+                                
+                                for res in ripple_results {
+                                    // Don't boost the source itself again
+                                    if res.memory_id != mem_id {
+                                        ripple_targets.insert(res.memory_id);
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Boost Tier 2 (Ripple) memories
+                        if !ripple_targets.is_empty() {
+                            debug!("Job: [Ripple Effect] Priming {} related memories", ripple_targets.len());
+                            for target_id in ripple_targets {
+                                // Smaller boost (0.5) for priming
+                                ctx_clone.main.reinforce_dynamic(&target_id, 0.5);
+                            }
+                        }
+                    });
+                }
             }
         }
         Job::ReinforceLexicon { project_id, memory_ids, cues } => {
             if let Some(ctx) = provider.get_project(&project_id) {
                 for memory_id in &memory_ids {
-                    ctx.lexicon.reinforce_memory(memory_id, cues.clone());
+                    // Use tiered reinforcement logic (buckets)
+                    ctx.lexicon.reinforce_tiered(memory_id, 1);
                 }
                 debug!("Job: Reinforced {} lexicon entries with {} cues", memory_ids.len(), cues.len());
             }
@@ -967,10 +1152,50 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>) {
                             error!("Failed to save project '{}' after consolidation: {}", project_id, e);
                         }
                 } else {
-                    debug!("Consolidation: No overlapping memories found for '{}'", project_id);
+                    info!("Consolidation: No overlapping memories found for '{}'", project_id);
+                }
+            }
+        }
+        Job::UpdateMarketHeatmap { project_id } => {
+            if let Some(ctx) = provider.get_project(&project_id) {
+                // Sync Lexicon Trending -> Market Heatmap
+                // 1. Get trending items (Top 1000?)
+                let trending = ctx.lexicon.get_trending_items(1000);
+                
+                if !trending.is_empty() {
+                    let mut map = ctx.market_heatmap.write().unwrap();
+                    map.clear();
+                    
+                    for (cue, velocity) in trending {
+                        // Normalize velocity to 0.0 - 2.0 range
+                        // Log10(1 + v) is a good start.
+                        let score = (1.0 + velocity).log10() as f32;
+                        
+                        // Cap at 2.0 to prevent runaway market override
+                        let final_score = score.min(2.0);
+                        
+                        if final_score > 0.1 {
+                            let clean_cue = cue.strip_prefix("cue:").unwrap_or(&cue).to_string();
+                            map.insert(clean_cue.clone(), final_score);
+                            // Log top 10 cues contributing to heatmap
+                            if map.len() <= 10 {
+                                debug!("Job: [Heatmap] Cue '{}' added (original id: '{}') with lift {:.2} (velocity={:.2})", clean_cue, cue, final_score, velocity);
+                            }
+                        }
+                    }
+                    
+                    let total_cues = map.len();
+                    let avg_lift = if total_cues > 0 {
+                        map.values().sum::<f32>() / total_cues as f32
+                    } else {
+                        0.0
+                    };
+                    
+                    debug!("Job: Updated Market Heatmap for '{}' with {} active cues (avg lift: {:.2})", project_id, total_cues, avg_lift);
+                } else {
+                    debug!("Job: No trending cues found for project '{}', heatmap unchanged", project_id);
                 }
             }
         }
         }
     }
-

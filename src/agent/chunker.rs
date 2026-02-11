@@ -182,7 +182,10 @@ impl Chunker {
     /// Chunk a binary file from disk. Used for PDF/Office files that require file-based extraction.
     /// For text files, falls back to reading content and using chunk_file.
     pub fn chunk_binary_file(path: &Path) -> Vec<Chunk> {
-        let file_type = Self::detect_type(path);
+        let file_type = match Self::detect_type(path) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
         
         match file_type {
             ChunkerType::Pdf => Self::chunk_pdf(path),
@@ -199,13 +202,20 @@ impl Chunker {
     }
     
     pub fn chunk_file(path: &Path, content: &str) -> Vec<Chunk> {
-        // PRIORITY 1: Content-based detection for social media exports
-        if let Some(chunks) = Self::try_social_export_by_content(content, path) {
-            return chunks;
-        }
-        
-        // PRIORITY 2: Path-based type detection
-        let file_type = Self::detect_type(path);
+        // PRIORITY 1: Path-based type detection (explicit extensions win)
+        let file_type = match Self::detect_type(path) {
+            Some(t) => t,
+            None => {
+                // PRIORITY 2: Content-based detection for social media exports or other formats without extensions
+                if let Some(chunks) = Self::try_social_export_by_content(content, path) {
+                    return chunks;
+                }
+                
+                // If still unknown format, we return empty chunks to skip ingestion
+                // as per user request to avoid blindly processing unknown formats as text.
+                return Vec::new();
+            }
+        };
         
         match file_type {
             ChunkerType::Python => Self::chunk_python(content),
@@ -225,9 +235,7 @@ impl Chunker {
             ChunkerType::Pdf => Self::chunk_pdf(path),
             ChunkerType::Office => Self::chunk_office(path),
             ChunkerType::Text => Self::chunk_text(content),
-            // ApiSpec is auto-detected within JSON/YAML parsers
             ChunkerType::ApiSpec => Self::chunk_json(content),
-            // SocialExport - detect specific format and route to parser
             ChunkerType::SocialExport => Self::chunk_social_export(path, content),
         }
     }
@@ -294,34 +302,35 @@ impl Chunker {
         Self::chunk_json(content)
     }
 
-    pub fn detect_type(path: &Path) -> ChunkerType {
+    pub fn detect_type(path: &Path) -> Option<ChunkerType> {
         // Check for social media export patterns in path
         let path_lower = path.to_string_lossy().to_lowercase();
         if path_lower.contains("whatsapp") 
             || path_lower.contains("instagram") 
             || path_lower.contains("youtube")
             || (path_lower.contains("chrome") && path_lower.contains("history")) {
-            return ChunkerType::SocialExport;
+            return Some(ChunkerType::SocialExport);
         }
         
         match path.extension().and_then(|s| s.to_str()) {
-            Some("py") => ChunkerType::Python,
-            Some("rs") => ChunkerType::Rust,
-            Some("ts" | "tsx") => ChunkerType::TypeScript,
-            Some("js" | "jsx") => ChunkerType::JavaScript,
-            Some("go") => ChunkerType::Go,
-            Some("html" | "htm") => ChunkerType::Html,
-            Some("css") => ChunkerType::Css,
-            Some("php") => ChunkerType::Php,
-            Some("java") => ChunkerType::Java,
-            Some("md") => ChunkerType::Markdown,
-            Some("csv") => ChunkerType::Csv,
-            Some("json") => ChunkerType::Json,
-            Some("yaml" | "yml") => ChunkerType::Yaml,
-            Some("xml") => ChunkerType::Xml,
-            Some("pdf") => ChunkerType::Pdf,
-            Some("docx" | "xlsx" | "pptx") => ChunkerType::Office,
-            _ => ChunkerType::Text,
+            Some("py") => Some(ChunkerType::Python),
+            Some("rs") => Some(ChunkerType::Rust),
+            Some("ts" | "tsx") => Some(ChunkerType::TypeScript),
+            Some("js" | "jsx") => Some(ChunkerType::JavaScript),
+            Some("go") => Some(ChunkerType::Go),
+            Some("html" | "htm") => Some(ChunkerType::Html),
+            Some("css") => Some(ChunkerType::Css),
+            Some("php") => Some(ChunkerType::Php),
+            Some("java") => Some(ChunkerType::Java),
+            Some("md") => Some(ChunkerType::Markdown),
+            Some("csv") => Some(ChunkerType::Csv),
+            Some("json") => Some(ChunkerType::Json),
+            Some("yaml" | "yml") => Some(ChunkerType::Yaml),
+            Some("xml") => Some(ChunkerType::Xml),
+            Some("pdf") => Some(ChunkerType::Pdf),
+            Some("docx" | "xlsx" | "pptx") => Some(ChunkerType::Office),
+            Some("txt" | "log") => Some(ChunkerType::Text),
+            _ => None,
         }
     }
 
@@ -329,7 +338,9 @@ impl Chunker {
         PARSERS.with(|parsers| {
             let mut parsers = parsers.borrow_mut();
             let parser = parsers.get_python();
-            Self::chunk_treesitter_with_names(content, parser, &["function_definition", "class_definition"], "lang:python", ChunkCategory::Code)
+            Self::chunk_treesitter_with_names(content, parser, 
+                &["function_definition", "class_definition", "if_statement", "for_statement", "while_statement", "try_statement", "except_clause", "with_statement", "assignment", "call", "comment"], 
+                "lang:python", ChunkCategory::Code)
         })
     }
 
@@ -337,7 +348,10 @@ impl Chunker {
         PARSERS.with(|parsers| {
             let mut parsers = parsers.borrow_mut();
             let parser = parsers.get_rust();
-            Self::chunk_treesitter_with_names(content, parser, &["function_item", "struct_item", "impl_item", "enum_item", "mod_item", "trait_item"], "lang:rust", ChunkCategory::Code)
+            Self::chunk_treesitter_with_names(content, parser, 
+                &["function_item", "struct_item", "enum_item", "trait_item", 
+                  "if_expression", "match_expression", "match_arm", "for_expression", "while_expression", "loop_expression"], 
+                "lang:rust", ChunkCategory::Code)
         })
     }
     
@@ -345,7 +359,9 @@ impl Chunker {
         PARSERS.with(|parsers| {
             let mut parsers = parsers.borrow_mut();
             let parser = parsers.get_typescript();
-            Self::chunk_treesitter_with_names(content, parser, &["function_declaration", "class_declaration", "interface_declaration", "lexical_declaration", "method_definition", "constructor_declaration"], "lang:typescript", ChunkCategory::Code)
+            Self::chunk_treesitter_with_names(content, parser, 
+                &["function_declaration", "class_declaration", "interface_declaration", "lexical_declaration", "method_definition", "constructor_declaration", "if_statement", "for_statement", "while_statement", "expression_statement", "call_expression", "comment", "jsx_element", "jsx_self_closing_element"], 
+                "lang:typescript", ChunkCategory::Code)
         })
     }
 
@@ -353,7 +369,9 @@ impl Chunker {
         PARSERS.with(|parsers| {
             let mut parsers = parsers.borrow_mut();
             let parser = parsers.get_javascript();
-            Self::chunk_treesitter_with_names(content, parser, &["function_declaration", "class_declaration", "method_definition"], "lang:javascript", ChunkCategory::Code)
+            Self::chunk_treesitter_with_names(content, parser, 
+                &["function_declaration", "class_declaration", "method_definition", "if_statement", "for_statement", "while_statement", "expression_statement", "call_expression", "comment", "jsx_element", "jsx_self_closing_element"], 
+                "lang:javascript", ChunkCategory::Code)
         })
     }
 
@@ -361,7 +379,9 @@ impl Chunker {
         PARSERS.with(|parsers| {
             let mut parsers = parsers.borrow_mut();
             let parser = parsers.get_go();
-            Self::chunk_treesitter_with_names(content, parser, &["function_declaration", "method_declaration", "type_declaration"], "lang:go", ChunkCategory::Code)
+            Self::chunk_treesitter_with_names(content, parser, 
+                &["function_declaration", "method_declaration", "type_declaration", "if_statement", "for_statement", "call_expression", "block"], 
+                "lang:go", ChunkCategory::Code)
         })
     }
 
@@ -474,7 +494,9 @@ impl Chunker {
         PARSERS.with(|parsers| {
             let mut parsers = parsers.borrow_mut();
             let parser = parsers.get_php();
-            Self::chunk_treesitter_with_names(content, parser, &["function_definition", "class_definition", "method_declaration"], "lang:php", ChunkCategory::Code)
+            Self::chunk_treesitter_with_names(content, parser, 
+                &["function_definition", "class_definition", "method_declaration", "if_statement", "for_statement", "foreach_statement", "while_statement", "expression_statement", "comment", "compound_statement"], 
+                "lang:php", ChunkCategory::Code)
         })
     }
 
@@ -482,29 +504,108 @@ impl Chunker {
         PARSERS.with(|parsers| {
             let mut parsers = parsers.borrow_mut();
             let parser = parsers.get_java();
-            Self::chunk_treesitter_with_names(content, parser, &["class_declaration", "method_declaration", "constructor_declaration"], "lang:java", ChunkCategory::Code)
+            Self::chunk_treesitter_with_names(content, parser, 
+                &["class_declaration", "method_declaration", "constructor_declaration", "if_statement", "for_statement", "while_statement", "expression_statement", "comment", "block"], 
+                "lang:java", ChunkCategory::Code)
         })
     }
 
-    fn chunk_treesitter_with_names(content: &str, parser: &mut Parser, node_kinds: &[&str], lang_tag: &str, category: ChunkCategory) -> Vec<Chunk> {
+    fn chunk_treesitter_with_names(
+        content: &str, 
+        parser: &mut Parser, 
+        node_kinds: &[&str], 
+        lang_tag: &str, 
+        category: ChunkCategory
+    ) -> Vec<Chunk> {
         let mut chunks = Vec::new();
-        if let Some(tree) = parser.parse(content, None) {
-             Self::visit_nodes(tree.root_node(), content, node_kinds, &mut chunks, lang_tag, category);
+        tracing::info!("[CHUNKER DEBUG] Attempting to parse {} bytes...", content.len());
+        let tree_result = parser.parse(content, None);
+        tracing::info!("[CHUNKER DEBUG] Parse result: {}", if tree_result.is_some() { "SUCCESS" } else { "FAILED" });
+        if let Some(tree) = tree_result {
+            // New config for splitting logic
+            let max_chars = 3000; // soft limit - large enough for most functions
+            tracing::info!("[CHUNKER DEBUG] Parsed {} bytes, root: {}", content.len(), tree.root_node().kind());
+            Self::visit_nodes_recursive(
+                tree.root_node(), 
+                content, 
+                node_kinds, 
+                &mut chunks, 
+                lang_tag, 
+                category,
+                max_chars
+            );
+            tracing::info!("[CHUNKER DEBUG] After visit: {} chunks", chunks.len());
         }
         
         if chunks.is_empty() && !content.trim().is_empty() {
-             return Self::chunk_text(content);
+            eprintln!("[DEBUG CHUNKER] No chunks from tree-sitter, falling back to line-based chunker");
+            // Use line-based chunking for code (not sentence-based which creates overlapping windows)
+            let lines: Vec<&str> = content.lines().collect();
+            let lines_per_chunk = 20; // ~20 lines per chunk for code
+            
+            for (chunk_idx, chunk_lines) in lines.chunks(lines_per_chunk).enumerate() {
+                let chunk_content = chunk_lines.join("\n");
+                if chunk_content.trim().is_empty() {
+                    continue;
+                }
+                
+                let chunk_start = 1 + (chunk_idx * lines_per_chunk);
+                let chunk_end = chunk_start + chunk_lines.len() - 1;
+                
+                chunks.push(Chunk {
+                    content: chunk_content,
+                    start_line: chunk_start,
+                    end_line: chunk_end,
+                    context: format!("code (part {})", chunk_idx + 1),
+                    structural_cues: vec![
+                        lang_tag.to_string(),
+                    ],
+                    category,
+                });
+            }
         }
         chunks
     }
 
-    fn visit_nodes(node: tree_sitter::Node, content: &str, node_kinds: &[&str], chunks: &mut Vec<Chunk>, lang_tag: &str, category: ChunkCategory) {
-        if node_kinds.contains(&node.kind()) {
-             let name = node.child_by_field_name("name")
+    fn visit_nodes_recursive(
+        node: tree_sitter::Node, 
+        content: &str, 
+        node_kinds: &[&str], 
+        chunks: &mut Vec<Chunk>, 
+        lang_tag: &str, 
+        category: ChunkCategory,
+        max_chars: usize
+    ) {
+        let kind = node.kind();
+        let start_row = node.start_position().row;
+        let end_row = node.end_position().row;
+        // let line_count = end_row - start_row;
+        
+        // 1. Is this a node we care about?
+        let is_target_node = node_kinds.contains(&kind);
+        
+        // 2. Get the text length roughly (byte range is faster than utf8 conversion)
+        let byte_len = node.end_byte() - node.start_byte();
+
+        // 3. DECISION LOGIC:
+        // If it's a target node AND it fits within our size limit, chunk it.
+        // If it's too big, we usually SKIP making a chunk here and drill down, 
+        // UNLESS it's a "leaf-ish" node (like a comment or huge string) that won't have children.
+        
+        let should_chunk_here = is_target_node && byte_len <= max_chars;
+        
+        // Debug: Log all target nodes we encounter
+        if is_target_node {
+            eprintln!("[DEBUG CHUNKER] Found target: {} lines {}-{} ({} bytes) should_chunk={}", 
+                kind, start_row + 1, end_row + 1, byte_len, should_chunk_here);
+        }
+        
+        if should_chunk_here {
+            // --- EXTRACT IDENTIFIER ---
+            let name = node.child_by_field_name("name")
                 .or_else(|| node.child_by_field_name("identifier"))
                 .or_else(|| node.child_by_field_name("selectors"))
                 .or_else(|| {
-                    // Fallback for languages where identifiers aren't field-named (like some HTML nodes)
                     for i in 0..node.child_count() {
                         let c = node.child(i as u32).unwrap();
                         if c.kind() == "identifier" || c.kind() == "tag_name" || c.kind() == "selectors" {
@@ -514,26 +615,32 @@ impl Chunker {
                     None
                 })
                 .map(|n| n.utf8_text(content.as_bytes()).unwrap_or("anon"))
-                .unwrap_or("anon");
+                .unwrap_or_else(|| {
+                     if kind.contains("statement") { "stmt" }
+                     else if kind.contains("expression") { "expr" }
+                     else if kind.contains("comment") { "comment" }
+                     else { "anon" }
+                });
 
-             let start = node.start_position().row + 1;
-             let end = node.end_position().row + 1;
-             let text = node.utf8_text(content.as_bytes()).unwrap_or("").to_string();
-             
-             let type_cue = node.kind()
+            let text = node.utf8_text(content.as_bytes()).unwrap_or("").to_string();
+            
+            let type_cue = kind
                  .replace("_declaration", "")
                  .replace("_definition", "")
                  .replace("_item", "")
                  .replace("_rule", "")
                  .replace("_set", "");
 
-             let name_label = if lang_tag == "lang:css" { "selector" } else { "name" };
+            let name_label = if lang_tag == "lang:css" { "selector" } else { "name" };
 
-             chunks.push(Chunk {
-                 content: text,
-                 start_line: start,
-                 end_line: end,
-                context: format!("{}:{}", node.kind(), name),
+            eprintln!("[DEBUG CHUNKER] Creating chunk: {} '{}' lines {}-{} ({} bytes)", 
+                kind, name, start_row + 1, end_row + 1, byte_len);
+
+            chunks.push(Chunk {
+                content: text,
+                start_line: start_row + 1,
+                end_line: end_row + 1,
+                context: format!("{}:{}", kind, name),
                 structural_cues: vec![
                     lang_tag.to_string(),
                     format!("type:{}", type_cue),
@@ -541,11 +648,60 @@ impl Chunker {
                 ],
                 category,
             });
+            
+            // If we chunked this node, we generally don't want to chunk its children 
+            // separately UNLESS the node is massive. But since we checked byte_len <= max_chars,
+            // we treat this as a "leaf chunk".
+            return; 
         }
 
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            Self::visit_nodes(child, content, node_kinds, chunks, lang_tag, category);
+        // 4. If we didn't chunk it (because it wasn't a target OR it was too big),
+        // we recurse into children to find smaller, manageable pieces.
+        if is_target_node && byte_len > max_chars {
+            let initial_chunk_count = chunks.len();
+            
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                Self::visit_nodes_recursive(child, content, node_kinds, chunks, lang_tag, category, max_chars);
+            }
+            
+            // If we drilled down but got nothing (e.g. big linear function), force line-based segmentation
+            if chunks.len() == initial_chunk_count {
+                let text = node.utf8_text(content.as_bytes()).unwrap_or("");
+                
+                // Use line-based chunking for code (not sentence-based which creates overlapping windows)
+                let lines: Vec<&str> = text.lines().collect();
+                let lines_per_chunk = 20; // ~20 lines per chunk for code
+                
+                for (chunk_idx, chunk_lines) in lines.chunks(lines_per_chunk).enumerate() {
+                    let chunk_content = chunk_lines.join("\n");
+                    if chunk_content.trim().is_empty() {
+                        continue;
+                    }
+                    
+                    let chunk_start = start_row + 1 + (chunk_idx * lines_per_chunk);
+                    let chunk_end = chunk_start + chunk_lines.len() - 1;
+                    
+                    chunks.push(Chunk {
+                        content: chunk_content,
+                        start_line: chunk_start,
+                        end_line: chunk_end,
+                        context: format!("{} (part {})", kind, chunk_idx + 1),
+                        structural_cues: vec![
+                            lang_tag.to_string(),
+                            format!("type:{}", kind),
+                            format!("parent:{}", kind),
+                        ],
+                        category,
+                    });
+                }
+            }
+        } else {
+            // Standard recursion for non-target nodes
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                Self::visit_nodes_recursive(child, content, node_kinds, chunks, lang_tag, category, max_chars);
+            }
         }
     }
 
@@ -1067,6 +1223,9 @@ impl Chunker {
         let mut chunks = Vec::new();
         let step = config.window_size.saturating_sub(config.overlap).max(1);
         
+        // Map sentences back to line numbers if possible, otherwise use cumulative count
+        let lines: Vec<&str> = content.lines().collect();
+        
         for (chunk_idx, i) in (0..sentences.len()).step_by(step).enumerate() {
             let window_end = (i + config.window_size).min(sentences.len());
             let chunk_content: String = sentences[i..window_end].join(" ");
@@ -1082,12 +1241,16 @@ impl Chunker {
             } else {
                 chunk_content
             };
+
+            // Estimate line range (approximate for generic text)
+            let start_line = (i * lines.len() / sentences.len()).max(1);
+            let end_line = (window_end * lines.len() / sentences.len()).min(lines.len());
             
             chunks.push(Chunk {
                 content: final_content,
-                start_line: i,
-                end_line: window_end,
-                context: format!("sentences:{}..{}", i, window_end),
+                start_line,
+                end_line,
+                context: format!("window:{}", chunk_idx),
                 structural_cues: vec![
                     "lang:text".to_string(),
                     "type:sentence_window".to_string(),
@@ -1101,8 +1264,8 @@ impl Chunker {
         if chunks.is_empty() && !content.trim().is_empty() {
             chunks.push(Chunk {
                 content: content.to_string(),
-                start_line: 0,
-                end_line: 0,
+                start_line: 1,
+                end_line: lines.len(),
                 context: "text:full".to_string(),
                 structural_cues: vec![
                     "lang:text".to_string(),
@@ -1249,24 +1412,26 @@ impl Chunker {
     pub fn get_category_for_file(path: &Path) -> ChunkCategory {
         let file_type = Self::detect_type(path);
         match file_type {
-            ChunkerType::Python | ChunkerType::Rust | ChunkerType::TypeScript |
-            ChunkerType::JavaScript | ChunkerType::Go | ChunkerType::Html |
-            ChunkerType::Css | ChunkerType::Php | ChunkerType::Java => ChunkCategory::Code,
+            Some(ChunkerType::Python) | Some(ChunkerType::Rust) | Some(ChunkerType::TypeScript) |
+            Some(ChunkerType::JavaScript) | Some(ChunkerType::Go) | Some(ChunkerType::Html) |
+            Some(ChunkerType::Css) | Some(ChunkerType::Php) | Some(ChunkerType::Java) => ChunkCategory::Code,
             
-            ChunkerType::Csv | ChunkerType::Json | ChunkerType::Yaml |
-            ChunkerType::Xml => ChunkCategory::Structured,
+            Some(ChunkerType::Csv) | Some(ChunkerType::Json) | Some(ChunkerType::Yaml) |
+            Some(ChunkerType::Xml) => ChunkCategory::Structured,
             
-            ChunkerType::ApiSpec => ChunkCategory::ApiSpec,
-            ChunkerType::SocialExport => ChunkCategory::Conversation,
+            Some(ChunkerType::ApiSpec) => ChunkCategory::ApiSpec,
+            Some(ChunkerType::SocialExport) => ChunkCategory::Conversation,
             
-            ChunkerType::Markdown | ChunkerType::Pdf | ChunkerType::Office |
-            ChunkerType::Text => ChunkCategory::Prose,
+            Some(ChunkerType::Markdown) | Some(ChunkerType::Pdf) | Some(ChunkerType::Office) |
+            Some(ChunkerType::Text) => ChunkCategory::Prose,
+            
+            None => ChunkCategory::Prose, // Default to Prose for unknown if we somehow get here
         }
     }
 
     /// Chunk URL content by fetching, extracting readable content, and segmenting.
     /// Uses Mozilla Readability algorithm to strip navbars, ads, and keep main article.
-    pub async fn chunk_url(url: &str) -> Result<Vec<Chunk>, String> {
+    pub async fn chunk_url(url: &str, parallel: bool) -> Result<Vec<Chunk>, String> {
         use scraper::{Html, Selector};
         
         // 1. Fetch the page with User-Agent (required by Wikipedia and many other sites)
@@ -1396,68 +1561,136 @@ impl Chunker {
         // 6. Segment into sentence chunks (no overlap, semantic boundaries)
         // Strategy: Group 2-3 sentences per chunk for smaller, focused memories
         let sentences: Vec<&str> = clean_text.unicode_sentences().collect();
-        let mut chunks = Vec::new();
-        
         // Target 2-3 sentences per chunk, min 80 chars, max 500 chars
         const MIN_CHUNK_CHARS: usize = 80;
         const MAX_CHUNK_CHARS: usize = 500;
         const TARGET_SENTENCES: usize = 3;
+
+        let mut chunks = Vec::new();
         
-        let mut current_chunk = String::new();
-        let mut current_sentence_count = 0;
-        let mut chunk_idx = 0;
-        
-        for sentence in sentences {
-            let sentence = sentence.trim();
-            if sentence.is_empty() {
-                continue;
-            }
+        if parallel && sentences.len() > 50 {
+            // Parallel Processing using Rayon
+            use rayon::prelude::*;
             
-            // Check if adding this sentence would exceed max
-            let would_be_length = current_chunk.len() + sentence.len() + 1;
+            // Heuristic: Process in batches of 20 sentences to balance overhead vs parallelism
+            let batch_size = 20;
             
-            if !current_chunk.is_empty() && 
-               (would_be_length > MAX_CHUNK_CHARS || current_sentence_count >= TARGET_SENTENCES) {
-                // Finalize current chunk if it meets minimum
-                if current_chunk.len() >= MIN_CHUNK_CHARS {
-                    let mut chunk_cues = metadata_cues.clone();
-                    chunk_cues.push("type:web_content".to_string());
+            // First, generate chunks in parallel (without correct indices yet)
+            let mut raw_chunks: Vec<Chunk> = sentences.par_chunks(batch_size)
+                .flat_map(|batch| {
+                    let mut batch_chunks = Vec::new();
+                    let mut current_chunk = String::new();
+                    let mut current_sentence_count = 0;
                     
-                    chunks.push(Chunk {
-                        content: current_chunk.trim().to_string(),
-                        start_line: chunk_idx,
-                        end_line: chunk_idx,
-                        context: format!("web:{}:{}", host, chunk_idx),
-                        structural_cues: chunk_cues,
-                        category: ChunkCategory::WebContent,
-                    });
-                    chunk_idx += 1;
+                    for sentence in batch {
+                        let sentence = sentence.trim();
+                        if sentence.is_empty() { continue; }
+                        
+                        let would_be_length = current_chunk.len() + sentence.len() + 1;
+                        if !current_chunk.is_empty() && (would_be_length > MAX_CHUNK_CHARS || current_sentence_count >= TARGET_SENTENCES) {
+                            if current_chunk.len() >= MIN_CHUNK_CHARS {
+                                let mut chunk_cues = metadata_cues.clone();
+                                chunk_cues.push("type:web_content".to_string());
+                                batch_chunks.push(Chunk {
+                                    content: current_chunk.trim().to_string(),
+                                    start_line: 0, // Placeholder
+                                    end_line: 0,   // Placeholder
+                                    context: format!("web:{}", host), // Placeholder suffix
+                                    structural_cues: chunk_cues,
+                                    category: ChunkCategory::WebContent,
+                                });
+                            }
+                            current_chunk.clear();
+                            current_sentence_count = 0;
+                        }
+                        
+                        if !current_chunk.is_empty() { current_chunk.push(' '); }
+                        current_chunk.push_str(sentence);
+                        current_sentence_count += 1;
+                    }
+                    
+                    if current_chunk.len() >= MIN_CHUNK_CHARS {
+                        let mut chunk_cues = metadata_cues.clone();
+                        chunk_cues.push("type:web_content".to_string());
+                        batch_chunks.push(Chunk {
+                            content: current_chunk.trim().to_string(),
+                            start_line: 0,
+                            end_line: 0,
+                            context: format!("web:{}", host),
+                            structural_cues: chunk_cues,
+                            category: ChunkCategory::WebContent,
+                        });
+                    }
+                    batch_chunks
+                })
+                .collect();
+                
+            // Fixup indices sequentially
+            for (idx, chunk) in raw_chunks.iter_mut().enumerate() {
+                chunk.start_line = idx;
+                chunk.end_line = idx;
+                chunk.context = format!("web:{}:{}", host, idx);
+            }
+            chunks = raw_chunks;
+            
+        } else {
+            // Sequential Processing (Original Logic)
+            let mut current_chunk = String::new();
+            let mut current_sentence_count = 0;
+            let mut chunk_idx = 0;
+            
+            for sentence in sentences {
+                let sentence = sentence.trim();
+                if sentence.is_empty() {
+                    continue;
                 }
-                current_chunk.clear();
-                current_sentence_count = 0;
+                
+                // Check if adding this sentence would exceed max
+                let would_be_length = current_chunk.len() + sentence.len() + 1;
+                
+                if !current_chunk.is_empty() && 
+                   (would_be_length > MAX_CHUNK_CHARS || current_sentence_count >= TARGET_SENTENCES) {
+                    // Finalize current chunk if it meets minimum
+                    if current_chunk.len() >= MIN_CHUNK_CHARS {
+                        let mut chunk_cues = metadata_cues.clone();
+                        chunk_cues.push("type:web_content".to_string());
+                        
+                        chunks.push(Chunk {
+                            content: current_chunk.trim().to_string(),
+                            start_line: chunk_idx,
+                            end_line: chunk_idx,
+                            context: format!("web:{}:{}", host, chunk_idx),
+                            structural_cues: chunk_cues,
+                            category: ChunkCategory::WebContent,
+                        });
+                        chunk_idx += 1;
+                    }
+                    current_chunk.clear();
+                    current_sentence_count = 0;
+                }
+                
+                // Add sentence to current chunk
+                if !current_chunk.is_empty() {
+                    current_chunk.push(' ');
+                }
+                current_chunk.push_str(sentence);
+                current_sentence_count += 1;
             }
             
-            // Add sentence to current chunk
-            if !current_chunk.is_empty() {
-                current_chunk.push(' ');
+            // Don't forget the last chunk
+            if current_chunk.len() >= MIN_CHUNK_CHARS {
+                let mut chunk_cues = metadata_cues.clone();
+                chunk_cues.push("type:web_content".to_string());
+                
+                chunks.push(Chunk {
+                    content: current_chunk.trim().to_string(),
+                    start_line: chunk_idx,
+                    end_line: chunk_idx,
+                    context: format!("web:{}:{}", host, chunk_idx),
+                    structural_cues: chunk_cues,
+                    category: ChunkCategory::WebContent,
+                });
             }
-            current_chunk.push_str(sentence);
-            current_sentence_count += 1;
-        }
-        
-        // Don't forget the last chunk
-        if current_chunk.len() >= MIN_CHUNK_CHARS {
-            let mut chunk_cues = metadata_cues.clone();
-            chunk_cues.push("type:web_content".to_string());
-            
-            chunks.push(Chunk {
-                content: current_chunk.trim().to_string(),
-                start_line: chunk_idx,
-                end_line: chunk_idx,
-                context: format!("web:{}:{}", host, chunk_idx),
-                structural_cues: chunk_cues,
-                category: ChunkCategory::WebContent,
-            });
         }
         
         // If no chunks, return full content as single chunk

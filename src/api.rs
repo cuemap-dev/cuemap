@@ -1,4 +1,5 @@
 use crate::auth::AuthConfig;
+use crate::structures::{MainStats, LexiconStats, MemoryStats};
 use crate::multi_tenant::{MultiTenantEngine, validate_project_id};
 use crate::normalization::normalize_cue;
 use crate::taxonomy::validate_cues;
@@ -19,19 +20,19 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct AddMemoryRequest {
-    content: String,
-    cues: Vec<String>,
+    pub content: String,
+    pub cues: Vec<String>,
     #[serde(default)]
-    metadata: Option<HashMap<String, serde_json::Value>>,
+    pub metadata: Option<HashMap<String, serde_json::Value>>,
     #[serde(default)]
     pub disable_temporal_chunking: bool,
     #[serde(default)]
     pub async_ingest: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct AddMemoryResponse {
     id: String,
     status: String,
@@ -39,20 +40,20 @@ pub struct AddMemoryResponse {
     latency_ms: f64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RecallRequest {
     #[serde(default)]
-    cues: Vec<String>,
+    pub cues: Vec<String>,
     #[serde(default)]
-    query_text: Option<String>,
+    pub query_text: Option<String>,
     #[serde(default = "default_limit")]
-    limit: usize,
+    pub limit: usize,
     #[serde(default = "default_auto_reinforce")]
-    auto_reinforce: bool,
+    pub auto_reinforce: bool,
     #[serde(default)]
-    projects: Option<Vec<String>>,
+    pub projects: Option<Vec<String>>,
     #[serde(default)]
-    min_intersection: Option<usize>,
+    pub min_intersection: Option<usize>,
     #[serde(default)]
     pub explain: bool,
     #[serde(default)]
@@ -63,7 +64,7 @@ pub struct RecallRequest {
     pub disable_systems_consolidation: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RecallGroundedRequest {
     pub query_text: String,
     #[serde(default = "default_token_budget")]
@@ -89,10 +90,10 @@ fn default_true() -> bool {
 }
 
 fn default_token_budget() -> u32 {
-    500
+    2048
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RecallGroundedResponse {
     pub verified_context: String,
     pub proof: crate::grounding::GroundingProof,
@@ -108,20 +109,20 @@ fn default_limit() -> usize {
     10
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ReinforceRequest {
-    cues: Vec<String>,
+    pub cues: Vec<String>,
 }
 
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct AddAliasRequest {
     pub from: String,
     pub to: String,
     pub weight: Option<f64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct GetAliasRequest {
     pub cue: String,
 }
@@ -132,7 +133,7 @@ pub struct MergeAliasRequest {
     pub to: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct AliasResponse {
     pub id: String,
     pub from: String,
@@ -141,14 +142,14 @@ pub struct AliasResponse {
 }
 
 /// Response for /lexicon/inspect/:cue endpoint
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct LexiconInspectResponse {
     pub cue: String,
     pub outgoing: Vec<LexiconEntry>,  // What this token maps to
     pub incoming: Vec<LexiconEntry>,  // Other tokens that map to the same canonical
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct LexiconEntry {
     pub memory_id: String,
     pub content: String,      // The canonical cue
@@ -160,13 +161,13 @@ pub struct LexiconEntry {
 }
 
 /// Request for POST /lexicon/wire - manually wire a token to a canonical cue
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct WireLexiconRequest {
     pub token: String,
     pub canonical: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct IngestUrlRequest {
     pub url: String,
     /// Crawl depth: 0 = single page (default), 1+ = follow links recursively
@@ -177,13 +178,13 @@ pub struct IngestUrlRequest {
     pub same_domain_only: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CreateProjectRequest {
     pub project_id: String,
 }
 
 // Context API - Query Expansion
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ContextExpandRequest {
     pub query: String,
     #[serde(default = "default_context_limit")]
@@ -196,19 +197,27 @@ fn default_context_limit() -> usize {
     20
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ContextExpandResponse {
     pub query_cues: Vec<String>,
     pub expansions: Vec<ExpansionCandidate>,
     pub latency_ms: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ExpansionCandidate {
     pub term: String,
     pub score: f64,
     pub co_occurrence_count: u64,
     pub source_cues: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct RecallWebRequest {
+    pub url: Option<String>,
+    pub query: String,
+    #[serde(default)]
+    pub persist: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -239,6 +248,7 @@ pub fn routes(
         .route("/", get(root))
         .route("/memories", post(add_memory))
         .route("/recall", post(recall))
+        .route("/recall/web", post(recall_web))
         .route("/memories/:id/reinforce", patch(reinforce_memory))
         .route("/memories/:id", get(get_memory).delete(delete_memory))
         .route("/stats", get(get_stats))
@@ -358,6 +368,14 @@ fn extract_project_id(headers: &HeaderMap) -> Result<String, (StatusCode, Json<s
     Ok(project_id.to_string())
 }
 
+fn extract_project_id_optional(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("X-Project-ID")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .filter(|s| validate_project_id(s))
+}
+
 async fn add_memory(
     State(state): State<EngineState>,
     headers: HeaderMap,
@@ -414,7 +432,13 @@ async fn add_memory(
     let t_validate = step4_start.elapsed().as_secs_f64() * 1000.0;
     
     let step5_start = Instant::now();
-    let memory_id = ctx.main.add_memory(req.content.clone(), report.accepted.clone(), req.metadata, req.disable_temporal_chunking);
+    let memory_id = ctx.main.add_memory(
+        req.content.clone(), 
+        report.accepted.clone(), 
+        req.metadata, 
+        MainStats::default(),
+        req.disable_temporal_chunking
+    );
     let t_insert = step5_start.elapsed().as_secs_f64() * 1000.0;
 
     // Buffer background jobs (will be processed after ingestion completes)
@@ -471,6 +495,7 @@ async fn add_memory(
     )
 }
 
+#[axum::debug_handler]
 async fn recall(
     State(state): State<EngineState>,
     headers: HeaderMap,
@@ -479,255 +504,266 @@ async fn recall(
     use std::time::Instant;
     
     let EngineState { ref mt_engine, ref job_queue, .. } = &state;
-    {
-        // Cross-domain query if projects array is provided
-        if let Some(projects) = req.projects {
-            let start = Instant::now();
-            
-            // Query all projects in parallel using rayon
-            let (all_results, reinforce_tasks): (Vec<serde_json::Value>, Vec<Option<(String, Vec<String>, Vec<String>)>>) = projects
-                .par_iter()
-                .map(|project_id| {
-                    let ctx = match mt_engine.get_or_create_project(project_id.clone()) {
-                        Ok(c) => c,
-                        Err(_) => return (serde_json::json!({"project_id": project_id, "error": "Capacity reached"}), None),
-                    };
-                    
-                    // Collect cues
-                    let mut cues_to_process = req.cues.clone();
-                    
-                    let (original_tokens, _lexicon_mids) = if let Some(text) = &req.query_text {
-                         let (resolved, lex_mids) = ctx.resolve_cues_from_text(text, false);
-                         cues_to_process.extend(resolved);
-                         (crate::nl::tokenize_to_cues(text), lex_mids)
-                    } else {
-                        (req.cues.clone(), Vec::new())
-                    };
-                    
-                    // Normalize query cues
-                    let mut normalized_cues = Vec::new();
-                    for cue in &cues_to_process {
-                        let (normalized, _) = normalize_cue(cue, &ctx.normalization);
-                        normalized_cues.push(normalized);
-                    }
-                    
-                    // Expand aliases (only for original tokens)
-                    let expanded_cues = ctx.expand_query_cues(normalized_cues, &original_tokens);
-                    
-                    let results = ctx.main.recall_weighted(
-                        expanded_cues.clone(), 
-                        req.limit, 
-                        false,
-                        req.min_intersection,
-                        req.explain,
-                        req.disable_pattern_completion,
-                        req.disable_salience_bias,
-                        req.disable_systems_consolidation
-                    );
-                    
-                    let json_results: Vec<serde_json::Value> = results
-                        .iter()
-                        .map(|r| serde_json::json!({
-                            "id": r.memory_id,
-                            "content": r.content,
-                            "score": r.score,
-                            "intersection_count": r.intersection_count,
-                            "recency_score": r.recency_score,
-                            "metadata": r.metadata,
-                            "explain": r.explain
-                        }))
-                        .collect();
-                    
-                    let mut response_block = serde_json::json!({
-                        "project_id": project_id,
-                        "results": json_results
-                    });
-                    
-                    if req.explain {
-                        response_block.as_object_mut().unwrap().insert(
-                            "explain".to_string(), 
-                            serde_json::json!({
-                                "query_cues": cues_to_process,
-                                "expanded_cues": expanded_cues
-                            })
-                        );
-                    }
-                    
-                    // Collect reinforcement task
-                    // Respects auto_reinforce flag
-                    let task = if req.auto_reinforce && !results.is_empty() {
-                         let memory_ids: Vec<String> = results.iter().map(|r| r.memory_id.clone()).collect();
-                         let cues: Vec<String> = expanded_cues.iter().map(|(c, _)| c.clone()).collect();
-                         Some((project_id.clone(), memory_ids, cues))
-                    } else {
-                        None
-                    };
-
-                    (response_block, task)
-                })
-                .unzip();
-
-            // Enqueue reinforcement tasks
-            for task in reinforce_tasks {
-                if let Some((pid, mids, cues)) = task {
-                    job_queue.enqueue(crate::jobs::Job::ReinforceMemories {
-                        project_id: pid,
-                        memory_ids: mids,
-                        cues,
-                    }).await;
-                }
-            }
-            
-            let elapsed = start.elapsed();
-            let total_results: usize = all_results.iter()
-                .filter_map(|r| r.get("results").and_then(|res| res.as_array().map(|a| a.len())))
-                .sum();
-            
-            let engine_latency_ms = elapsed.as_secs_f64() * 1000.0;
-            
-            tracing::info!(
-                "POST /recall cross-domain projects={} cues={} results={} latency={:.2}ms",
-                projects.len(),
-                req.cues.len(),
-                total_results,
-                engine_latency_ms
-            );
-
-            state.metrics.record_recall(engine_latency_ms);
-            
-            return (StatusCode::OK, Json(serde_json::json!({ 
-                "results": all_results,
-                "engine_latency": engine_latency_ms
-            })));
-        }
-        
-        // Single project query using X-Project-ID header
-        let project_id = match extract_project_id(&headers) {
-            Ok(id) => id,
-            Err(e) => return e,
-        };
-        
+    
+    // --- Path 1: Cross-domain query ---
+    if let Some(projects) = req.projects {
         let start = Instant::now();
-        let ctx = match mt_engine.get_or_create_project(project_id.clone()) {
-            Ok(c) => c,
-            Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": e}))),
-        };
         
-        // Collect cues
-        let mut cues_to_process = req.cues.clone();
-        
-        let t_lex = Instant::now();
-        let mut lexicon_memory_ids: Vec<String> = Vec::new();
-        if let Some(ref text) = req.query_text {
-             // 1. Lexicon Recall
-             let (resolved, lex_mids) = ctx.resolve_cues_from_text(text, false);
-             cues_to_process.extend(resolved);
-             lexicon_memory_ids = lex_mids;
+        // Query all projects in parallel using rayon
+        let (all_results, reinforce_tasks): (Vec<serde_json::Value>, Vec<Option<(String, Vec<String>, Vec<String>)>>) = projects
+            .par_iter()
+            .map(|project_id| {
+                let ctx = match mt_engine.get_or_create_project(project_id.clone()) {
+                    Ok(c) => c,
+                    Err(_) => return (serde_json::json!({"project_id": project_id, "error": "Capacity reached"}), None),
+                };
+                
+                // Collect cues
+                let mut cues_to_process = req.cues.clone();
+                
+                let (original_tokens, _lexicon_mids) = if let Some(text) = &req.query_text {
+                     let (resolved, lex_mids) = ctx.resolve_cues_from_text(text, false);
+                     cues_to_process.extend(resolved);
+                     (crate::nl::tokenize_to_cues(text), lex_mids)
+                } else {
+                    (req.cues.clone(), Vec::new())
+                };
+                
+                // Normalize query cues
+                let mut normalized_cues = Vec::new();
+                for cue in &cues_to_process {
+                    let (normalized, _) = normalize_cue(cue, &ctx.normalization);
+                    normalized_cues.push(normalized);
+                }
+                
+                // Expand aliases
+                let expanded_cues = ctx.expand_query_cues(normalized_cues, &original_tokens);
+                
+                // Read Market Heatmap (scoped locally inside this closure, no awaits here, so it's safe)
+                let heatmap = ctx.market_heatmap.read().ok();
+                let heatmap_ref = heatmap.as_deref();
 
-             // 2. Raw Token Fallback
-             let tokens = crate::nl::tokenize_to_cues(text);
-             for token in tokens {
-                 if !cues_to_process.contains(&token) {
-                     cues_to_process.push(token);
-                 }
+                let results = ctx.main.recall_weighted(
+                    expanded_cues.clone(), 
+                    req.limit, 
+                    false,
+                    req.min_intersection,
+                    req.explain,
+                    req.disable_pattern_completion,
+                    req.disable_salience_bias,
+                    req.disable_systems_consolidation,
+                    heatmap_ref
+                );
+                
+                let json_results: Vec<serde_json::Value> = results
+                    .iter()
+                    .map(|r| serde_json::json!({
+                        "id": r.memory_id,
+                        "content": r.content,
+                        "score": r.score,
+                        "intersection_count": r.intersection_count,
+                        "recency_score": r.recency_score,
+                        "metadata": r.metadata,
+                        "explain": r.explain
+                    }))
+                    .collect();
+                
+                let mut response_block = serde_json::json!({
+                    "project_id": project_id,
+                    "results": json_results
+                });
+                
+                if req.explain {
+                    response_block.as_object_mut().unwrap().insert(
+                        "explain".to_string(), 
+                        serde_json::json!({
+                            "query_cues": cues_to_process,
+                            "expanded_cues": expanded_cues
+                        })
+                    );
+                }
+                
+                // Collect reinforcement task
+                let task = if req.auto_reinforce && !results.is_empty() {
+                     let memory_ids: Vec<String> = results.iter().map(|r| r.memory_id.clone()).collect();
+                     let cues: Vec<String> = expanded_cues.iter().map(|(c, _)| c.clone()).collect();
+                     Some((project_id.clone(), memory_ids, cues))
+                } else {
+                    None
+                };
+
+                (response_block, task)
+            })
+            .unzip();
+
+        // Enqueue reinforcement tasks
+        for task in reinforce_tasks {
+            if let Some((pid, mids, cues)) = task {
+                job_queue.enqueue(crate::jobs::Job::ReinforceMemories {
+                    project_id: pid,
+                    memory_ids: mids,
+                    cues,
+                }).await;
+            }
+        }
+        
+        let elapsed = start.elapsed();
+        let total_results: usize = all_results.iter()
+            .filter_map(|r| r.get("results").and_then(|res| res.as_array().map(|a| a.len())))
+            .sum();
+        
+        let engine_latency_ms = elapsed.as_secs_f64() * 1000.0;
+        
+        tracing::info!(
+            "POST /recall cross-domain projects={} cues={} results={} latency={:.2}ms",
+            projects.len(),
+            req.cues.len(),
+            total_results,
+            engine_latency_ms
+        );
+
+        state.metrics.record_recall(engine_latency_ms);
+        
+        return (StatusCode::OK, Json(serde_json::json!({ 
+            "results": all_results,
+            "engine_latency": engine_latency_ms
+        })));
+    }
+    
+    // --- Path 2: Single project query ---
+    let project_id = match extract_project_id(&headers) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+    
+    let start = Instant::now();
+    let ctx = match mt_engine.get_or_create_project(project_id.clone()) {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": e}))),
+    };
+    
+    // Collect cues
+    let mut cues_to_process = req.cues.clone();
+    
+    let t_lex = Instant::now();
+    let mut lexicon_memory_ids: Vec<String> = Vec::new();
+    if let Some(ref text) = req.query_text {
+         // 1. Lexicon Recall
+         let (resolved, lex_mids) = ctx.resolve_cues_from_text(text, false);
+         cues_to_process.extend(resolved);
+         lexicon_memory_ids = lex_mids;
+
+         // 2. Raw Token Fallback
+         let tokens = crate::nl::tokenize_to_cues(text);
+         for token in tokens {
+             if !cues_to_process.contains(&token) {
+                 cues_to_process.push(token);
              }
-        }
-        let lex_ms = t_lex.elapsed().as_secs_f64() * 1000.0;
-        
-        // Normalize query cues
-        let t_norm = Instant::now();
-        let mut normalized_cues = Vec::new();
-        for cue in &cues_to_process {
-            let (normalized, _) = normalize_cue(cue, &ctx.normalization);
-            normalized_cues.push(normalized);
-        }
-        let norm_ms = t_norm.elapsed().as_secs_f64() * 1000.0;
-        
-        // Expand aliases (only for original tokens, not Lexicon synonyms)
-        let t_expand = Instant::now();
-        let original_tokens = if let Some(ref text) = req.query_text {
-            crate::nl::tokenize_to_cues(text)
-        } else {
-            req.cues.clone()
-        };
-        let expanded_cues = ctx.expand_query_cues(normalized_cues, &original_tokens);
-        let expand_ms = t_expand.elapsed().as_secs_f64() * 1000.0;
-        
-        let t_search = Instant::now();
-        // Always pass auto_reinforce=false to avoid blocking, we'll do it async
-        let results = ctx.main.recall_weighted(
+         }
+    }
+    let lex_ms = t_lex.elapsed().as_secs_f64() * 1000.0;
+    
+    // Normalize query cues
+    let t_norm = Instant::now();
+    let mut normalized_cues = Vec::new();
+    for cue in &cues_to_process {
+        let (normalized, _) = normalize_cue(cue, &ctx.normalization);
+        normalized_cues.push(normalized);
+    }
+    let norm_ms = t_norm.elapsed().as_secs_f64() * 1000.0;
+    
+    // Expand aliases
+    let t_expand = Instant::now();
+    let original_tokens = if let Some(ref text) = req.query_text {
+        crate::nl::tokenize_to_cues(text)
+    } else {
+        req.cues.clone()
+    };
+    let expanded_cues = ctx.expand_query_cues(normalized_cues, &original_tokens);
+    let expand_ms = t_expand.elapsed().as_secs_f64() * 1000.0;
+    
+    let t_search = Instant::now();
+
+    let results = {
+        let heatmap = ctx.market_heatmap.read().ok();
+        let heatmap_ref = heatmap.as_deref();
+
+        ctx.main.recall_weighted(
             expanded_cues.clone(), 
             req.limit, 
-            false, // Never block on reinforcement
+            false, 
             req.min_intersection,
             req.explain,
             req.disable_pattern_completion,
             req.disable_salience_bias,
-            req.disable_systems_consolidation
-        );
-        let search_ms = t_search.elapsed().as_secs_f64() * 1000.0;
-        
-        let elapsed = start.elapsed();
-        
-        let engine_latency_ms = elapsed.as_secs_f64() * 1000.0;
-        
-        tracing::debug!(
-            "Recall breakdown: lex={:.2}ms norm={:.2}ms expand={:.2}ms search={:.2}ms | cues={} expanded={}",
-            lex_ms, norm_ms, expand_ms, search_ms, cues_to_process.len(), expanded_cues.len()
-        );
-        
-        tracing::info!(
-            "POST /recall project={} cues={} results={} latency={:.2}ms",
-            project_id,
-            cues_to_process.len(),
-            results.len(),
-            engine_latency_ms
-        );
-        
-        // Async reinforcement via background job (doesn't block response)
-        if req.auto_reinforce && !results.is_empty() {
-            let memory_ids: Vec<String> = results.iter().map(|r| r.memory_id.clone()).collect();
-            let cues: Vec<String> = expanded_cues.iter().map(|(c, _)| c.clone()).collect();
-            job_queue.enqueue(crate::jobs::Job::ReinforceMemories {
-                project_id: project_id.clone(),
-                memory_ids,
-                cues,
-            }).await;
-        }
-        
-        // Reinforce Lexicon memories (async)
-        if req.auto_reinforce && !lexicon_memory_ids.is_empty() {
-            let tokens = if let Some(ref text) = req.query_text {
-                crate::nl::tokenize_to_cues(text)
-            } else {
-                Vec::new()
-            };
-            job_queue.enqueue(crate::jobs::Job::ReinforceLexicon {
-                project_id: project_id.clone(),
-                memory_ids: lexicon_memory_ids,
-                cues: tokens,
-            }).await;
-        }
+            req.disable_systems_consolidation,
+            heatmap_ref
+        )
+    }; 
 
-        // Record metrics
-        state.metrics.record_recall(engine_latency_ms);
-        
-        if req.explain {
-            return (StatusCode::OK, Json(serde_json::json!({ 
-                "results": results,
-                "engine_latency": engine_latency_ms,
-                "explain": {
-                    "query_cues": cues_to_process,
-                    "expanded_cues": expanded_cues
-                }
-            })));
-        }
-
-        (StatusCode::OK, Json(serde_json::json!({ 
-            "results": results,
-            "engine_latency": engine_latency_ms
-        })))
+    let search_ms = t_search.elapsed().as_secs_f64() * 1000.0;
+    
+    let elapsed = start.elapsed();
+    
+    let engine_latency_ms = elapsed.as_secs_f64() * 1000.0;
+    
+    tracing::debug!(
+        "Recall breakdown: lex={:.2}ms norm={:.2}ms expand={:.2}ms search={:.2}ms | cues={} expanded={}",
+        lex_ms, norm_ms, expand_ms, search_ms, cues_to_process.len(), expanded_cues.len()
+    );
+    
+    tracing::debug!(
+        "POST /recall project={} cues={} results={} latency={:.2}ms",
+        project_id,
+        cues_to_process.len(),
+        results.len(),
+        engine_latency_ms
+    );
+    
+    // Async reinforcement via background job (doesn't block response)
+    if req.auto_reinforce && !results.is_empty() {
+        let memory_ids: Vec<String> = results.iter().map(|r| r.memory_id.clone()).collect();
+        let cues: Vec<String> = expanded_cues.iter().map(|(c, _)| c.clone()).collect();
+        // This await was causing the conflict because `heatmap` was seen as potentially live
+        job_queue.enqueue(crate::jobs::Job::ReinforceMemories {
+            project_id: project_id.clone(),
+            memory_ids,
+            cues,
+        }).await;
     }
+    
+    // Reinforce Lexicon memories (async)
+    if req.auto_reinforce && !lexicon_memory_ids.is_empty() {
+        let tokens = if let Some(ref text) = req.query_text {
+            crate::nl::tokenize_to_cues(text)
+        } else {
+            Vec::new()
+        };
+        job_queue.enqueue(crate::jobs::Job::ReinforceLexicon {
+            project_id: project_id.clone(),
+            memory_ids: lexicon_memory_ids,
+            cues: tokens,
+        }).await;
+    }
+
+    // Record metrics
+    state.metrics.record_recall(engine_latency_ms);
+    
+    if req.explain {
+        return (StatusCode::OK, Json(serde_json::json!({ 
+            "results": results,
+            "engine_latency": engine_latency_ms,
+            "explain": {
+                "query_cues": cues_to_process,
+                "expanded_cues": expanded_cues
+            }
+        })));
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({ 
+        "results": results,
+        "engine_latency": engine_latency_ms
+    })))
 }
 
 async fn reinforce_memory(
@@ -749,9 +785,16 @@ async fn reinforce_memory(
         
         // Normalize cues
         let mut normalized_cues = Vec::new();
-        for cue in req.cues {
-            let (normalized, _) = normalize_cue(&cue, &ctx.normalization);
-            normalized_cues.push(normalized);
+        
+        if req.cues.is_empty() {
+            if let Some(mem) = ctx.main.get_memories().get(&memory_id) {
+                normalized_cues = mem.cues.clone();
+            }
+        } else {
+            for cue in req.cues {
+                let (normalized, _) = normalize_cue(&cue, &ctx.normalization);
+                normalized_cues.push(normalized);
+            }
         }
         
         let success = ctx.main.reinforce_memory(&memory_id, normalized_cues);
@@ -837,47 +880,53 @@ async fn get_stats(
     State(state): State<EngineState>,
     headers: HeaderMap,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let project_id = match extract_project_id(&headers) {
-        Ok(id) => id,
-        Err(e) => return e,
-    };
-    
+    let project_id_opt = extract_project_id_optional(&headers);
     let EngineState { mt_engine, .. } = state;
-    let ctx = match mt_engine.get_or_create_project(project_id) {
-        Ok(c) => c,
-        Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": e}))),
-    };
-    let stats = ctx.main.get_stats();
-    (StatusCode::OK, Json(serde_json::Value::Object(stats.into_iter().collect())))
+
+    if let Some(project_id) = project_id_opt {
+        let ctx = match mt_engine.get_or_create_project(project_id) {
+            Ok(c) => c,
+            Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": e}))),
+        };
+        let stats = ctx.main.get_stats();
+        (StatusCode::OK, Json(serde_json::Value::Object(stats.into_iter().collect())))
+    } else {
+        // Global stats
+        let stats = mt_engine.get_global_stats();
+        (StatusCode::OK, Json(serde_json::json!(stats)))
+    }
 }
 
-/// Get job/ingestion progress for a project
+/// Get job/ingestion progress for a project or globally
 async fn jobs_status(
     State(state): State<EngineState>,
     headers: HeaderMap,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let project_id = match extract_project_id(&headers) {
-        Ok(id) => id,
-        Err(e) => return e,
-    };
-    
+    let project_id_opt = extract_project_id_optional(&headers);
     let EngineState { job_queue, .. } = state;
-    if let Some(session) = job_queue.get_session(&project_id) {
-        let progress = session.get_progress();
-        (StatusCode::OK, Json(serde_json::json!(progress)))
+    
+    if let Some(project_id) = project_id_opt {
+        if let Some(session) = job_queue.get_session(&project_id) {
+            let progress = session.get_progress();
+            (StatusCode::OK, Json(serde_json::json!(progress)))
+        } else {
+            // No active session - return idle status
+            (StatusCode::OK, Json(serde_json::json!({
+                "phase": "idle",
+                "writes_completed": 0,
+                "writes_total": 0,
+                "propose_cues_completed": 0,
+                "propose_cues_total": 0,
+                "train_lexicon_completed": 0,
+                "train_lexicon_total": 0,
+                "update_graph_completed": 0,
+                "update_graph_total": 0
+            })))
+        }
     } else {
-        // No active session - return idle status
-        (StatusCode::OK, Json(serde_json::json!({
-            "phase": "idle",
-            "writes_completed": 0,
-            "writes_total": 0,
-            "propose_cues_completed": 0,
-            "propose_cues_total": 0,
-            "train_lexicon_completed": 0,
-            "train_lexicon_total": 0,
-            "update_graph_completed": 0,
-            "update_graph_total": 0
-        })))
+        // Global progress
+        let progress = job_queue.get_global_progress();
+        (StatusCode::OK, Json(serde_json::json!(progress)))
     }
 }
 
@@ -917,6 +966,9 @@ async fn recall_grounded(
         let original_tokens = crate::nl::tokenize_to_cues(&req.query_text);
         let expanded_cues = ctx.expand_query_cues(normalized_cues, &original_tokens);
         
+        let heatmap = ctx.market_heatmap.read().ok();
+        let heatmap_ref = heatmap.as_deref();
+
         let results = ctx.main.recall_weighted(
             expanded_cues.clone(), 
             req.limit.max(20),
@@ -925,8 +977,10 @@ async fn recall_grounded(
             true,
             req.disable_pattern_completion,
             req.disable_salience_bias,
-            req.disable_systems_consolidation
+            req.disable_systems_consolidation,
+            heatmap_ref
         );
+        drop(heatmap); // Guard must be dropped before async return to satisfy Send (even if implicit)
         
         // 2. Apply Budgeting Logic
         let (selected, excluded, context_block) = GroundingEngine::select_memories(
@@ -950,10 +1004,15 @@ async fn recall_grounded(
         
         let elapsed = start.elapsed();
         
+        // 4. Sign Context
+        let crypto = crate::crypto::CryptoEngine::new();
+        let signature = crypto.sign(&context_block);
+        
         (StatusCode::OK, Json(serde_json::json!({ 
             "verified_context": context_block,
             "proof": proof,
-            "engine_latency_ms": elapsed.as_secs_f64() * 1000.0
+            "engine_latency_ms": elapsed.as_secs_f64() * 1000.0,
+            "signature": signature
         })))
 }
 
@@ -1063,7 +1122,9 @@ async fn add_alias(
         content,
         cues,
         None,
-        false 
+        Some(MainStats::default()),
+        false,
+        false
     );
 
     (StatusCode::OK, Json(serde_json::json!({"id": alias_id, "status": "created"})))
@@ -1096,7 +1157,7 @@ async fn get_aliases(
             "status:active".to_string()
         ];
         
-        let results = ctx.aliases.recall(query_cues, 50, false);
+        let results = ctx.aliases.recall(query_cues, 50, false, None);
         let mut aliases = Vec::new();
         
         for res in results {
@@ -1136,6 +1197,7 @@ async fn lexicon_inspect(
             let token_lower = token.to_lowercase();
             let canonical_lower = canonical.to_lowercase();
             let mut count = 0;
+            
             for ref_multi in ctx.main.get_memories().iter() {
                 let memory = ref_multi.value();
                 let cues_lower: Vec<String> = memory.cues.iter().map(|c| c.to_lowercase()).collect();
@@ -1170,16 +1232,18 @@ async fn lexicon_inspect(
         
         // 2. INCOMING: What tokens map to this canonical cue?
         let mut incoming: Vec<LexiconEntry> = Vec::new();
+        let key_lex = ctx.lexicon.get_master_key();
         for ref_multi in ctx.lexicon.get_memories().iter() {
             let memory = ref_multi.value();
-            if memory.content.to_lowercase() == cue_lower {
+            let content = memory.access_content(key_lex.as_deref()).unwrap_or_default();
+            if content.to_lowercase() == cue_lower {
                 for token in &memory.cues {
-                    let affected = count_affected(token, &memory.content);
+                    let affected = count_affected(token, &content);
                     incoming.push(LexiconEntry {
                         memory_id: memory.id.clone(),
-                        content: memory.content.clone(),
+                        content: content.clone(),
                         token: token.clone(),
-                        reinforcement_score: memory.reinforcement_count as f64,
+                        reinforcement_score: memory.stats.get_reinforcement_count() as f64,
                         created_at: memory.created_at,
                         affected_memories_count: affected,
                     });
@@ -1248,9 +1312,10 @@ async fn lexicon_graph(
         let mut token_to_canonical: HashMap<String, Vec<String>> = HashMap::new();
         
         // Return all entries (no limit)
+        let key = ctx.lexicon.get_master_key();
         for ref_multi in ctx.lexicon.get_memories().iter() {
             let memory = ref_multi.value();
-            let canonical = memory.content.clone();
+            let canonical = memory.access_content(key.as_deref()).unwrap_or_default();
             for token in &memory.cues {
                 token_to_canonical.entry(token.clone())
                     .or_default()
@@ -1325,6 +1390,8 @@ async fn lexicon_wire(
             canonical.clone(),
             vec![token.clone()],
             None,
+            Some(LexiconStats::default()),
+            false,
             false
         );
         
@@ -1360,7 +1427,8 @@ async fn lexicon_synonyms(
         
         for ref_multi in ctx.lexicon.get_memories().iter() {
             let memory = ref_multi.value();
-            let mem_canon = memory.content.to_lowercase();
+            let content = memory.access_content(ctx.lexicon.get_master_key().as_deref()).unwrap_or_default();
+            let mem_canon = content.to_lowercase();
             
             if mem_canon == cue_lower || memory.cues.iter().any(|c| c.to_lowercase() == cue_lower) {
                  connected.insert(mem_canon.clone());
@@ -1392,10 +1460,12 @@ async fn lexicon_synonyms(
         let mut existing_in_graph: Vec<String> = Vec::new();
         let mut new_suggestions: Vec<String> = Vec::new();
         
+        let key = ctx.lexicon.get_master_key();
         for syn in &suggestions {
             let exists = ctx.lexicon.get_memories().iter().any(|ref_multi| {
                 let memory = ref_multi.value();
-                memory.content.to_lowercase() == syn.to_lowercase() ||
+                let content = memory.access_content(key.as_deref()).unwrap_or_default();
+                content.to_lowercase() == syn.to_lowercase() ||
                 memory.cues.iter().any(|c| c.to_lowercase() == syn.to_lowercase())
             });
             
@@ -1458,6 +1528,8 @@ async fn merge_aliases(
                 content,
                 cues,
                 None,
+                Some(MainStats::default()),
+                false,
                 false
             );
             created_ids.push(alias_id);
@@ -1471,6 +1543,198 @@ async fn merge_aliases(
 }
 
 
+
+/// Ingest content from a URL using the Agent's Ingester
+/// Supports recursive crawling when depth > 0
+
+
+async fn recall_web(
+    State(state): State<EngineState>,
+    headers: HeaderMap,
+    Json(req): Json<RecallWebRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use crate::agent::ingester::Ingester;
+    use crate::agent::AgentConfig;
+    use crate::agent::search::search_ddg_lite;
+    use std::time::Instant;
+
+    let EngineState { read_only, job_queue, .. } = state;
+    if req.persist && read_only {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "Read-only mode: cannot persist"})));
+    }
+
+    let project_id = match extract_project_id(&headers) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+
+    // Ensure project exists (auto-create)
+    if let Err(e) = state.mt_engine.get_or_create_project(project_id.clone()) {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": e})));
+    }
+
+    // Create an ingester for this request
+    let config = AgentConfig {
+        watch_dir: String::new(),
+        throttle_ms: 0,
+        state_file: None,
+    };
+    let ingester = Ingester::new(config.clone(), job_queue.clone());
+    let ingester = std::sync::Arc::new(ingester); // Arc for sharing across tasks
+
+    let start_time = Instant::now();
+    let mut chunks = Vec::new();
+    let mut urls_processed = Vec::new();
+
+    // 1. Determine targets: specific URL or Search
+    if let Some(url) = &req.url {
+        // Direct URL Mode
+        urls_processed.push(url.clone());
+        match ingester.fetch_and_chunk_url(url).await {
+            Ok(c) => chunks.extend(c),
+            Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("Failed to fetch URL: {}", e)}))),
+        };
+    } else {
+        // Search Mode
+        let search_results = match search_ddg_lite(&req.query, 5).await {
+            Ok(res) => res,
+            Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("Search failed: {}", e)}))),
+        };
+        
+        urls_processed = search_results.clone();
+        
+        // Parallel Fetch & Chunk using JoinSet for async concurrency
+        let mut set = tokio::task::JoinSet::new();
+        
+        for url in search_results {
+            let ingester_clone = ingester.clone();
+            set.spawn(async move {
+                (url.clone(), ingester_clone.fetch_and_chunk_url(&url).await)
+            });
+        }
+        
+        // Collect results
+        while let Some(res) = set.join_next().await {
+            if let Ok((url, result)) = res {
+                match result {
+                    Ok(c) => chunks.extend(c),
+                    Err(e) => tracing::warn!("Failed to fetch search result {}: {}", url, e),
+                }
+            }
+        }
+        
+        if chunks.is_empty() {
+             return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "No content found from search results"})));
+        }
+    }
+
+    let fetch_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+
+    // 2. Immediate Recall (In-Memory)
+    let processing_start = Instant::now();
+    let query_cues = crate::nl::tokenize_to_cues(&req.query);
+    
+    // Simple improved scoring: weighted intersection
+    struct ScoredChunk {
+        content: String,
+        score: f64,
+        intersection: usize,
+    }
+
+    let mut scored_chunks: Vec<ScoredChunk> = chunks.iter().map(|chunk| {
+        let chunk_cues = crate::nl::tokenize_to_cues(&chunk.content);
+        
+        let intersection = chunk_cues.iter().filter(|c| query_cues.contains(c)).count();
+        
+        // Simple scoring: intersection count * 10 
+        let mut score = (intersection as f64) * 10.0;
+        
+        // Boost if query terms appear in structural cues (e.g. title, header)
+        for q in &query_cues {
+            for s in &chunk.structural_cues {
+                if s.to_lowercase().contains(q) {
+                    score += 5.0;
+                }
+            }
+        }
+        
+        ScoredChunk {
+            content: chunk.content.clone(),
+            score,
+            intersection,
+        }
+    }).collect();
+
+    // Sort by score desc
+    scored_chunks.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    
+    // Take top results (more for search mode to have variety)
+    let limit = if req.url.is_none() { 10 } else { 5 };
+    
+    let results: Vec<serde_json::Value> = scored_chunks.into_iter()
+        .take(limit)
+        .filter(|r| r.score > 0.0)
+        .map(|r| serde_json::json!({
+            "content": r.content,
+            "score": r.score,
+            "intersection": r.intersection,
+            // "url": r.url // Optional source info
+        }))
+        .collect();
+        
+    let processing_ms = processing_start.elapsed().as_secs_f64() * 1000.0;
+
+    // 3. Optional Persistence (Async)
+    if req.persist {
+        let project_id_clone = project_id.clone();
+        let chunks_clone = chunks.clone();
+        let urls_processed_clone = urls_processed.clone();
+        
+        // Fix: Use local job_queue variable, not state.job_queue (which is moved)
+        let job_queue_clone = job_queue.clone(); 
+        
+        tokio::spawn(async move {
+             let config = AgentConfig {
+                watch_dir: String::new(),
+                throttle_ms: 0,
+                state_file: None,
+            };
+            let mut async_ingester = Ingester::new(config, job_queue_clone);
+            
+            // For search results, we have mixed sources. `process_chunks` expects a single source?
+            // `process_chunks` takes `source: &str`.
+            // We should arguably just say "web_search" or iterate and group by source?
+            // Actually `process_chunks` uses source to generate ID. If we pass "web_search", valid.
+            // But we should differentiate URLs if possible. 
+            // Ingester implementation:
+            // let memory_id = format!("{}:{}", source, chunk_hash);
+            // If all share "web_search", they dedup by content hash, which is fine.
+            
+            let source = if urls_processed_clone.len() == 1 {
+                 format!("url:{}", urls_processed_clone[0]) 
+            } else {
+                 "web_search".to_string()
+            };
+
+            if let Err(e) = async_ingester.process_chunks(chunks_clone, &project_id_clone, &source).await {
+                tracing::error!("Async persistence failed for web recall: {}", e);
+            }
+        });
+    }
+
+    let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+    
+    (StatusCode::OK, Json(serde_json::json!({
+        "urls": urls_processed,
+        "results": results,
+        "latency_ms": total_ms,
+        "timings": {
+            "fetch_chunk": fetch_ms,
+            "search_overhead": if req.url.is_none() { true } else { false },
+            "processing": processing_ms
+        }
+    })))
+}
 
 /// Ingest content from a URL using the Agent's Ingester
 /// Supports recursive crawling when depth > 0
@@ -1501,6 +1765,7 @@ async fn ingest_url(
     let config = AgentConfig {
         watch_dir: String::new(), // Not used for API-driven ingestion
         throttle_ms: 0,
+        state_file: None,
     };
     let mut ingester = Ingester::new(config, job_queue);
     
@@ -1586,6 +1851,7 @@ async fn ingest_content(
     let config = AgentConfig {
         watch_dir: String::new(),
         throttle_ms: 0,
+        state_file: None,
     };
     let mut ingester = Ingester::new(config, job_queue);
     

@@ -61,17 +61,47 @@ docker build -f Dockerfile.production -t cuemap/engine .
 docker run -p 8080:8080 cuemap/engine -v $(pwd)/local_snapshot_dir:/app/data
 ```
 
-### CLI Options
+### CLI Commands
+
+CueMap provides a unified CLI for server management, ingestion, and interaction.
 
 ```bash
-./target/release/cuemap-rust --help
+cuemap <COMMAND> [OPTIONS]
+```
+
+#### Core Commands
+- **`start`**: Start the CueMap server.
+- **`stop`**: Stop the background server instance.
+- **`status`**: Check server health, metrics, and background jobs.
+- **`logs`**: View or tail server logs.
+
+#### Interaction
+- **`add`**: Add a memory via natural language.
+- **`recall`**: Search memories (supports Grounded Recall and Web Recall).
+- **`ingest`**: Ingest data from files or URLs.
+- **`projects`**: Create and list projects.
+- **`set-project`**: Set the default project for the current session.
+
+#### Knowledge Graph
+- **`lexicon`**: Inspect lexicon entries and wire/unwire cues.
+- **`alias`**: Manage aliases and semantic weights.
+- **`expand`**: Test context expansion (query suggestions).
+
+### Server Options (`start`)
+
+```bash
+cuemap start [OPTIONS]
 
 Options:
   -p, --port <PORT>                    Server port [default: 8080]
   -d, --data-dir <DATA_DIR>            Data directory [default: ./data]
-  -s, --snapshot-interval <SECONDS>    Snapshot interval [default: 60]
-  --agent-dir <DIR>                    Path to watch for self-learning ingestion
-  --agent-throttle <MS>                Throttle rate for ingestion [default: 50ms]
+  --agent-dir <DIR>                    Path to watch for Self-Learning Agent
+  --detach                             Run server in the background
+  
+  # Cloud Backup
+  --cloud-backup <PROVIDER>            s3, gcs, azure, or local
+  --cloud-bucket <BUCKET>              Bucket name
+  --cloud-auto-backup                  Backup after every save
 ```
 
 ## Embedded Web UI

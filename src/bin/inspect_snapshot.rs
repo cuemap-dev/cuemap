@@ -1,6 +1,8 @@
-use cuemap_rust::persistence::PersistenceManager;
+use cuemap::persistence::PersistenceManager;
 use std::env;
 use std::path::Path;
+
+use cuemap::structures::MainStats;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -11,7 +13,7 @@ fn main() {
     let path = Path::new(&args[1]);
     
     // We can use the public load_from_path
-    match PersistenceManager::load_from_path(path) {
+    match PersistenceManager::load_from_path::<MainStats>(path) {
         Ok((memories, cue_index)) => {
             println!("Snapshot Summary for {:?}", path);
             println!("----------------------------------------");
@@ -28,8 +30,14 @@ fn main() {
                 println!("ID: {}", key);
                 println!("  Cues:    {:?}", memory.cues);
                 // Preview content (first 50 chars)
-                let preview: String = memory.content.chars().take(50).collect();
-                println!("  Content: {:?}...", preview);
+                // Preview content type
+                // Use the crypto helper to guess type
+                let preview = if cuemap::crypto::is_compressed(&memory.content) {
+                    "[Compressed Zstd]"
+                } else {
+                    "[Encrypted/Binary]"
+                };
+                println!("  Content: {}", preview);
                 println!("");
             }
         }

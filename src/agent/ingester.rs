@@ -2,31 +2,120 @@ use crate::agent::chunker::Chunker;
 use crate::agent::AgentConfig;
 use crate::jobs::{Job, JobQueue};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use tracing::{info, warn, debug};
 use ignore::WalkBuilder;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use serde::{Deserialize, Serialize};
 
 pub struct Ingester {
     config: AgentConfig,
     job_queue: Arc<JobQueue>,
     file_hashes: HashMap<String, String>, // path -> sha256
+    gitignore: Option<Gitignore>,
+    memory_hashes: HashMap<String, String>,    // memory_id -> content_hash
+    path_to_memories: HashMap<String, HashSet<String>>, // path -> set of current memory_ids
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct IngesterState {
+    file_hashes: HashMap<String, String>,
+    memory_hashes: HashMap<String, String>,
+    path_to_memories: HashMap<String, HashSet<String>>,
 }
 
 impl Ingester {
     pub fn new(config: AgentConfig, job_queue: Arc<JobQueue>) -> Self {
+        // Canonicalize watch_dir to ensure absolute path matching works across the engine
+        let watch_path = fs::canonicalize(&config.watch_dir)
+            .unwrap_or_else(|_| PathBuf::from(&config.watch_dir));
+        debug!("Agent initializing with watch root: {:?}", watch_path);
+
+        // Prepare gitignore
+        let mut gitignore = None;
+        let mut builder = GitignoreBuilder::new(&watch_path);
+        
+        // Search for .gitignore in watch_dir AND its parents up to the filesystem root
+        // This is important for monorepos where the root .gitignore is in a parent directory.
+        let mut current = Some(watch_path.as_path());
+        let mut found_any = false;
+        while let Some(p) = current {
+            let p_gi = p.join(".gitignore");
+            if p_gi.exists() {
+                 debug!("Loading .gitignore from {:?}", p_gi);
+                 if let Some(err) = builder.add(&p_gi) {
+                    warn!("Error loading .gitignore at {:?}: {}", p_gi, err);
+                } else {
+                    found_any = true;
+                }
+            }
+            current = p.parent();
+        }
+
+        if found_any {
+            match builder.build() {
+                Ok(gi) => gitignore = Some(gi),
+                Err(e) => warn!("Failed to build gitignore: {}", e),
+            }
+        } else {
+            debug!("No .gitignore files found in {:?} or its parents", watch_path);
+        }
+
+        let mut config = config;
+        config.watch_dir = watch_path.to_string_lossy().to_string();
+
         Self {
             config,
             job_queue,
             file_hashes: HashMap::new(),
+            gitignore,
+            memory_hashes: HashMap::new(),
+            path_to_memories: HashMap::new(),
         }
     }
 
+    pub fn load_state(&mut self, state_path: &std::path::Path) -> Result<(), String> {
+        if !state_path.exists() {
+            return Ok(());
+        }
+
+        let content = fs::read_to_string(state_path)
+            .map_err(|e| format!("Failed to read agent state: {}", e))?;
+        
+        let state: IngesterState = serde_json::from_str(&content)
+            .map_err(|e| format!("Failed to parse agent state: {}", e))?;
+
+        self.file_hashes = state.file_hashes;
+        self.memory_hashes = state.memory_hashes;
+        self.path_to_memories = state.path_to_memories;
+
+        debug!("Loaded agent state: {} files tracked", self.file_hashes.len());
+        Ok(())
+    }
+
+    pub fn save_state(&self, state_path: &std::path::Path) -> Result<(), String> {
+        let state = IngesterState {
+            file_hashes: self.file_hashes.clone(),
+            memory_hashes: self.memory_hashes.clone(),
+            path_to_memories: self.path_to_memories.clone(),
+        };
+
+        let content = serde_json::to_string_pretty(&state)
+            .map_err(|e| format!("Failed to serialize agent state: {}", e))?;
+
+        fs::write(state_path, content)
+            .map_err(|e| format!("Failed to write agent state: {}", e))?;
+
+        debug!("Saved agent state: {} files tracked", self.file_hashes.len());
+        Ok(())
+    }
+
     pub async fn scan_all(&mut self) -> Result<(), String> {
-        info!("Starting full scan of {}", self.config.watch_dir);
+        debug!("Starting full scan of {}", self.config.watch_dir);
         
         let path_str = self.config.watch_dir.clone();
         
@@ -54,12 +143,52 @@ impl Ingester {
             }
         }
         
-        info!("Scan complete. Tracking {} files.", self.file_hashes.len());
+        debug!("Scan complete. Tracking {} files.", self.file_hashes.len());
         Ok(())
     }
 
     pub async fn process_file_path(&mut self, path: PathBuf) -> Result<(), String> {
+        let path = fs::canonicalize(&path)
+            .map_err(|e| format!("Failed to canonicalize path {:?}: {}", path, e))?;
         let path_str = path.to_string_lossy().to_string();
+        
+        // 0. Ignore state file
+        if let Some(ref state_path) = self.config.state_file {
+            if let Ok(abs_path) = std::fs::canonicalize(&path) {
+                if let Ok(abs_state) = std::fs::canonicalize(state_path) {
+                    if abs_path == abs_state {
+                        debug!("Skipping agent state file: {}", path_str);
+                        return Ok(());
+                    }
+                } else {
+                     // If state file doesn't exist yet but paths match string-wise
+                     if path == *state_path {
+                         debug!("Skipping agent state file: {}", path_str);
+                         return Ok(());
+                     }
+                }
+            }
+        }
+
+        // 0.1 Hidden file check (matches behavior of scan_all)
+        // Check if any component starts with a dot (excluding '.' and '..')
+        if path.components().any(|c| {
+            let s = c.as_os_str().to_string_lossy();
+            s.starts_with('.') && s != "." && s != ".."
+        }) {
+            debug!("Skipping hidden path: {}", path_str);
+            return Ok(());
+        }
+
+        // 0.1 Check Gitignore
+        if let Some(gi) = &self.gitignore {
+            // gi.matched handles absolute paths by making them relative to the builder's root.
+            if gi.matched(&path, path.is_dir()).is_ignore() {
+                debug!("Skipping gitignored file: {}", path_str);
+                return Ok(());
+            }
+        }
+
         // Standardize casing for case-insensitive filesystems (MacOS/Windows)
         let path_norm = path_str.to_lowercase();
         
@@ -81,11 +210,9 @@ impl Ingester {
         
         // Update hash
         self.file_hashes.insert(path_norm.clone(), hash.clone());
-        info!("Ingesting: {}", path_str);
+        debug!("Ingesting: {}", path_str);
         
         // 3. Chunk
-        // Try to convert to UTF-8 for text-based chunking, otherwise pass empty string
-        // The chunker will use the path for binary formats (PDF, Office)
         let content_str = String::from_utf8(bytes).ok();
         let chunks = Chunker::chunk_file(&path, content_str.as_deref().unwrap_or(""));
         
@@ -93,15 +220,37 @@ impl Ingester {
         let project_id = "main".to_string();
         let mut valid_memory_ids = Vec::new();
         
+        let session = self.job_queue.session_manager.get_or_create(&project_id);
+        
+        // Track which memories are new/updated vs unchanged
+        let old_memories = self.path_to_memories.get(&path_norm).cloned().unwrap_or_default();
+        let mut new_memories = HashSet::new();
+
         for chunk in chunks.iter() {
+            let mut memory_id = format!("file:{}:{}-{}", path_norm, chunk.start_line, chunk.end_line);
+            let mut suffix = 1;
+            while new_memories.contains(&memory_id) {
+                memory_id = format!("file:{}:{}-{}:{}", path_norm, chunk.start_line, chunk.end_line, suffix);
+                suffix += 1;
+            }
+            new_memories.insert(memory_id.clone());
+
             let mut chunk_hasher = Sha256::new();
             chunk_hasher.update(chunk.content.as_bytes());
             let chunk_hash = format!("{:x}", chunk_hasher.finalize());
-            // Use normalized path for ID consistency
-            let memory_id = format!("file:{}:{}", path_norm, chunk_hash); 
             
-            // Store only raw content - no metadata prefix
-            // Context info is captured in structural_cues (path, context, category)
+            // Optimization: Skip ingestion if ID and content haven't changed
+            if let Some(old_hash) = self.memory_hashes.get(&memory_id) {
+                if old_hash == &chunk_hash {
+                    debug!("Skipping unchanged memory: {}", memory_id);
+                    valid_memory_ids.push(memory_id);
+                    continue;
+                }
+            }
+
+            self.memory_hashes.insert(memory_id.clone(), chunk_hash);
+            session.expect_write();
+
             self.job_queue.enqueue(Job::ExtractAndIngest {
                 project_id: project_id.clone(),
                 memory_id: memory_id.clone(),
@@ -111,9 +260,38 @@ impl Ingester {
                 category: chunk.category,
             }).await;
             
+            self.job_queue.buffer(&project_id, Job::ProposeCues {
+                project_id: project_id.clone(),
+                memory_id: memory_id.clone(),
+                content: chunk.content.clone(),
+            }).await;
+
+            self.job_queue.buffer(&project_id, Job::TrainLexiconFromMemory {
+                project_id: project_id.clone(),
+                memory_id: memory_id.clone(),
+            }).await;
+            
+            self.job_queue.buffer(&project_id, Job::UpdateGraph {
+                project_id: project_id.clone(),
+                memory_id: memory_id.clone(),
+            }).await;
+
             valid_memory_ids.push(memory_id);
         }
         
+        // Cleanup memories that no longer exist in this file (e.g. after code shift or deletion)
+        for old_id in old_memories {
+            if !new_memories.contains(&old_id) {
+                self.memory_hashes.remove(&old_id);
+                // Explicitly delete from engine
+                self.job_queue.enqueue(Job::DeleteMemory {
+                    project_id: project_id.clone(),
+                    memory_id: old_id,
+                }).await;
+            }
+        }
+        self.path_to_memories.insert(path_norm.clone(), new_memories);
+
         // 5. Verification: Prune stale memories
         self.job_queue.enqueue(Job::VerifyFile {
             project_id,
@@ -127,17 +305,20 @@ impl Ingester {
     pub async fn delete_file_path(&mut self, path: PathBuf) -> Result<(), String> {
         let path_str = path.to_string_lossy().to_string();
         let path_norm = path_str.to_lowercase();
-        info!("Processing deletion: {}", path_str);
+        debug!("Processing deletion: {}", path_str);
 
         // Remove from tracking
         self.file_hashes.remove(&path_norm);
-
-        // Enqueue Verification with EMPTY valid_ids to prune all associated memories
-        self.job_queue.enqueue(Job::VerifyFile {
-            project_id: "main".to_string(),
-            file_path: path_norm,
-            valid_memory_ids: Vec::new(),
-        }).await;
+        if let Some(mems) = self.path_to_memories.remove(&path_norm) {
+            for m_id in mems {
+                self.memory_hashes.remove(&m_id);
+                // Explicitly delete from engine
+                self.job_queue.enqueue(Job::DeleteMemory {
+                    project_id: "main".to_string(),
+                    memory_id: m_id,
+                }).await;
+            }
+        }
 
         Ok(())
     }
@@ -146,9 +327,10 @@ impl Ingester {
     pub async fn process_url(&mut self, url: &str, project_id: &str) -> Result<Vec<String>, String> {
         use crate::agent::chunker::Chunker;
         
-        info!("Ingesting URL: {}", url);
+        debug!("Ingesting URL: {}", url);
         
-        let chunks = Chunker::chunk_url(url).await?;
+        // Standard ingestion uses sequential chunking
+        let chunks = Chunker::chunk_url(url, false).await?;
         let source = format!("url:{}", url);
         
         self.process_chunks(chunks, project_id, &source).await
@@ -200,10 +382,10 @@ impl Ingester {
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
         // ========== PHASE 1: Crawl and collect chunks ==========
-        info!("Crawl Phase 1: Fetching pages and collecting chunks...");
+        debug!("Crawl Phase 1: Fetching pages and collecting chunks...");
         
         while let Some((current_url, depth)) = queue.pop_front() {
-            info!("Crawling [depth={}]: {}", depth, current_url);
+            debug!("Crawling [depth={}]: {}", depth, current_url);
 
             // Fetch the page
             let html_content = match client.get(&current_url).send().await {
@@ -221,7 +403,8 @@ impl Ingester {
             };
 
             // Parse and chunk the content
-            match Chunker::chunk_url(&current_url).await {
+            // Recursive crawler uses sequential chunking
+            match Chunker::chunk_url(&current_url, false).await {
                 Ok(chunks) => {
                     let source = format!("url:{}", current_url);
                     for chunk in chunks {
@@ -281,11 +464,11 @@ impl Ingester {
             }
         }
 
-        info!("Crawl Phase 1 complete: {} pages, {} total chunks collected", 
+        debug!("Crawl Phase 1 complete: {} pages, {} total chunks collected", 
               result.pages_crawled, all_chunks.len());
 
         // ========== PHASE 2: Write all chunks as memories ==========
-        info!("Crawl Phase 2: Writing {} chunks as memories...", all_chunks.len());
+        debug!("Crawl Phase 2: Writing {} chunks as memories...", all_chunks.len());
         
         // Set up session tracking for the entire batch
         let session = self.job_queue.session_manager.get_or_create(project_id);
@@ -310,14 +493,13 @@ impl Ingester {
                 category: chunk.category,
             }).await;
             
-            session.write_complete();
             result.memory_ids.push(memory_id);
         }
         
         info!("Crawl Phase 2 complete: {} memories written", result.memory_ids.len());
 
         // ========== PHASE 3: Buffer background jobs ==========
-        info!("Crawl Phase 3: Buffering {} background jobs...", all_chunks.len() * 3);
+        debug!("Crawl Phase 3: Buffering {} background jobs...", all_chunks.len() * 3);
         
         for (source, chunk) in all_chunks {
             let mut chunk_hasher = Sha256::new();
@@ -343,7 +525,7 @@ impl Ingester {
             }).await;
         }
 
-        info!(
+        debug!(
             "Crawl complete: {} pages, {} chunks, {} links skipped, {} errors",
             result.pages_crawled,
             result.memory_ids.len(),
@@ -386,7 +568,7 @@ impl Ingester {
     pub async fn process_content(&mut self, content: &str, filename: &str, project_id: &str) -> Result<Vec<String>, String> {
         use crate::agent::chunker::Chunker;
         
-        info!("Ingesting content: {} ({} bytes)", filename, content.len());
+        debug!("Ingesting content: {} ({} bytes)", filename, content.len());
         
         // Create a virtual path for the chunker to determine content type
         let virtual_path = PathBuf::from(filename);
@@ -396,8 +578,8 @@ impl Ingester {
         self.process_chunks(chunks, project_id, &source).await
     }
 
-    /// Shared chunk processing logic - returns memory IDs of ingested chunks
-    async fn process_chunks(
+    /// Publicly expose processing of chunks for external callers (like API immediate recall)
+    pub async fn process_chunks(
         &mut self, 
         chunks: Vec<crate::agent::chunker::Chunk>, 
         project_id: &str, 
@@ -446,13 +628,20 @@ impl Ingester {
                 memory_id: memory_id.clone(),
             }).await;
             
-            session.write_complete();
-            
             memory_ids.push(memory_id);
         }
         
-        info!("Enqueued {} chunks from {}", memory_ids.len(), source);
+        debug!("Enqueued {} chunks from {}", memory_ids.len(), source);
         Ok(memory_ids)
+    }
+
+    /// Fetch and chunk a URL without persisting (for immediate recall)
+    pub async fn fetch_and_chunk_url(&self, url: &str) -> Result<Vec<crate::agent::chunker::Chunk>, String> {
+        use crate::agent::chunker::Chunker;
+        
+        debug!("Fetching and chunking URL: {}", url);
+        // Immediate recall uses parallel chunking for speed
+        Chunker::chunk_url(url, true).await
     }
 }
 
