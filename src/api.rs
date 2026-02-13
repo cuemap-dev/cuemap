@@ -300,7 +300,7 @@ pub fn routes(
 async fn root() -> impl IntoResponse {
     Json(serde_json::json!({
         "name": "CueMap Rust Engine",
-        "version": "0.6.1",
+        "version": "0.6.3",
         "description": "High-performance Temporal-Associative Memory Store"
     }))
 }
@@ -411,31 +411,24 @@ async fn add_memory(
     
     // 1. Cue Preparation Strategy
     // If cues are empty, bootstrap from content
-    let step1_start = Instant::now();
     let mut initial_cues = req.cues;
     if initial_cues.is_empty() {
          // Bootstrap from content tokens
          let tokens = crate::nl::tokenize_to_cues(&req.content);
          initial_cues.extend(tokens);
     }
-    let t_tokenize = step1_start.elapsed().as_secs_f64() * 1000.0;
     
     // 2. Normalize cues
-    let step3_start = Instant::now();
     let mut normalized_cues = Vec::new();
     for cue in initial_cues {
         let (normalized, _) = normalize_cue(&cue, &ctx.normalization);
         normalized_cues.push(normalized);
     }
-    let t_normalize = step3_start.elapsed().as_secs_f64() * 1000.0;
     
     // 3. Validate cues
-    let step4_start = Instant::now();
     let report = validate_cues(normalized_cues, &ctx.taxonomy);
     let _accepted_count = report.accepted.len();
-    let t_validate = step4_start.elapsed().as_secs_f64() * 1000.0;
     
-    let step5_start = Instant::now();
     let memory_id = ctx.main.add_memory(
         req.content.clone(), 
         report.accepted.clone(), 
@@ -443,7 +436,6 @@ async fn add_memory(
         MainStats::default(),
         req.disable_temporal_chunking
     );
-    let t_insert = step5_start.elapsed().as_secs_f64() * 1000.0;
 
     // Buffer background jobs (will be processed after ingestion completes)
     let session = job_queue.session_manager.get_or_create(&project_id);
@@ -467,14 +459,7 @@ async fn add_memory(
     
     session.write_complete();
     
-    tracing::info!(
-        "POST /memories project={} cues={} id={} timings: tok={:.2}ms norm={:.2}ms val={:.2}ms ins={:.2}ms",
-        project_id,
-        report.accepted.len(),
-        memory_id,
-        t_tokenize, t_normalize, t_validate, t_insert
-    );
-    
+
     let elapsed = start.elapsed();
     let latency_ms = elapsed.as_secs_f64() * 1000.0;
 
@@ -488,13 +473,7 @@ async fn add_memory(
             "status": "stored",
             "cues": report.accepted,
             "rejected_cues": report.rejected,
-            "latency_ms": latency_ms,
-            "_debug_timings": {
-                "tokenization": t_tokenize,
-                "normalization": t_normalize,
-                "validation": t_validate,
-                "insertion": t_insert
-            }
+            "latency_ms": latency_ms
         })),
     )
 }
@@ -616,20 +595,7 @@ async fn recall(
         }
         
         let elapsed = start.elapsed();
-        let total_results: usize = all_results.iter()
-            .filter_map(|r| r.get("results").and_then(|res| res.as_array().map(|a| a.len())))
-            .sum();
-        
         let engine_latency_ms = elapsed.as_secs_f64() * 1000.0;
-        
-        tracing::info!(
-            "POST /recall cross-domain projects={} cues={} results={} latency={:.2}ms",
-            projects.len(),
-            req.cues.len(),
-            total_results,
-            engine_latency_ms
-        );
-
         state.metrics.record_recall(engine_latency_ms);
         
         return (StatusCode::OK, Json(serde_json::json!({ 
@@ -2067,15 +2033,6 @@ async fn context_expand(
         .collect();
     
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-    
-    tracing::info!(
-        "POST /context/expand project={} query=\"{}\" cues={} expansions={} latency={:.2}ms",
-        project_id,
-        req.query,
-        normalized_cues.len(),
-        expansions.len(),
-        latency_ms
-    );
     
     (StatusCode::OK, Json(serde_json::json!({
         "query_cues": normalized_cues,
