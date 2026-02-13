@@ -5,7 +5,7 @@ use serde::{Serialize, Deserialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH, Instant};
+use std::time::{SystemTime, UNIX_EPOCH};
 use ahash::RandomState;
 
 
@@ -247,7 +247,6 @@ where
     }
     
     pub fn reinforce_memory(&self, memory_id: &str, cues: Vec<String>) -> bool {
-        // Update last accessed
         if let Some(mut memory) = self.memories.get_mut(memory_id) {
             memory.touch();
             memory.stats.manual_boost(); // Manual reinforcement boost
@@ -346,7 +345,6 @@ where
         reinforce: bool,
         overwrite_cues: bool,
     ) -> String {
-        // If exists: handle update
         if self.memories.contains_key(&id) {
             {
                 if let Some(mut memory) = self.memories.get_mut(&id) {
@@ -939,7 +937,7 @@ where
     fn score_consolidated_candidates<'a>(
         &self, 
         candidates: Vec<(&'a str, Vec<(usize, usize, f64)>, f64)>, 
-        explain: bool, 
+        _explain: bool, 
         disable_salience_bias: bool, 
         disable_systems_consolidation: bool,
         heatmap: Option<&HashMap<String, f32>>
@@ -1574,7 +1572,7 @@ impl CueMapEngine<LexiconStats> {
         
         // Log top 5 items with bucket breakdown
         if !trending.is_empty() {
-             info!("Trending: Identification finished. Found {} candidates >= 1.0 velocity", trending.len());
+             tracing::info!("Trending: Identification finished. Found {} candidates >= 1.0 velocity", trending.len());
              for i in 0..trending.len().min(5) {
                  let (cue, velocity) = &trending[i];
                  if let Some(entry) = self.memories.get(cue) {
@@ -1582,7 +1580,7 @@ impl CueMapEngine<LexiconStats> {
                      let m_count = stats.minute_stats.len();
                      let d_count = stats.daily_stats.len();
                      let total = stats.total_count;
-                     info!("Trending: [Rank {}] Cue '{}' velocity={:.2}. Stats: totals={}, min_buckets={}, day_buckets={}, last_ref={}", 
+                     tracing::info!("Trending: [Rank {}] Cue '{}' velocity={:.2}. Stats: totals={}, min_buckets={}, day_buckets={}, last_ref={}", 
                         i+1, cue, velocity, total, m_count, d_count, stats.last_reinforced);
                  }
              }

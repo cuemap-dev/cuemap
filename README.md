@@ -42,16 +42,16 @@ To bridge the gap between user queries and stored memories, CueMap integrates **
 ### Build & Run
 
 ```bash
+# Production (optimized, with UI)
+cargo build --release --features ui
+./target/release/cuemap-rust --port 8080
+
 # Development (Backend only - Fast)
 cargo run
 
 # Development (With Embedded UI)
 # Note: Requires building the UI first (cd web_ui && npm run build)
 cargo run --features ui
-
-# Production (optimized, with UI)
-cargo build --release --features ui
-./target/release/cuemap-rust --port 8080
 ```
 
 ### Docker
@@ -64,6 +64,13 @@ docker run -p 8080:8080 cuemap/engine -v $(pwd)/local_snapshot_dir:/app/data
 ### CLI Commands
 
 CueMap provides a unified CLI for server management, ingestion, and interaction.
+
+Install CLI:
+
+```bash
+# Install CLI
+cargo install --path . --locked
+```
 
 ```bash
 cuemap <COMMAND> [OPTIONS]
@@ -87,22 +94,7 @@ cuemap <COMMAND> [OPTIONS]
 - **`alias`**: Manage aliases and semantic weights.
 - **`expand`**: Test context expansion (query suggestions).
 
-### Server Options (`start`)
-
-```bash
-cuemap start [OPTIONS]
-
-Options:
-  -p, --port <PORT>                    Server port [default: 8080]
-  -d, --data-dir <DATA_DIR>            Data directory [default: ./data]
-  --agent-dir <DIR>                    Path to watch for Self-Learning Agent
-  --detach                             Run server in the background
-  
-  # Cloud Backup
-  --cloud-backup <PROVIDER>            s3, gcs, azure, or local
-  --cloud-bucket <BUCKET>              Bucket name
-  --cloud-auto-backup                  Backup after every save
-```
+Hint: Use `cuemap --help` to see available commands and options.
 
 ## Embedded Web UI
 
@@ -140,9 +132,6 @@ CueMap includes a **Self-Learning Agent** that automatically watches local direc
 ### Automated Bootstrapping
 
 On startup, if `--agent-dir` is provided, CueMap initializes the **Self-Learning Agent**.
-1.  **Internal Engine (Fast)**: Uses the built-in Semantic Engine (WordNet) for rapid cue generation.
-2.  **Ollama Integration (Deep)**: If `LLM_ENABLED=true`, it ensures Ollama is ready with chosen model for deep fact extraction from documents.
-3.  **Real-Time Watching**: Monitors for file creations and modifications.
 
 ### Example
 
@@ -155,8 +144,7 @@ On startup, if `--agent-dir` is provided, CueMap initializes the **Self-Learning
 #    - Recursive tree-sitter extraction captures 'name:Calculator', 'selector:.btn', etc.
 # 2. Document & Data Parsing (PDF, Word, Excel, JSON, CSV, YAML, XML).
 #    - Extracts headers, keys, and metadata as grounded structural cues, in addition to cues inferred from content.
-# 3. LLM Fact Extraction (optional) to propose semantic cues.
-# 4. Immediate ingestion into the memory store. 
+# 3. Immediate ingestion into the memory store. 
 ```
 
 ## Project Management & Persistence
@@ -307,9 +295,26 @@ docker run -p 8080:8080 -v $(pwd)/local_snapshot_dir:/app/data \
 - Rotate keys regularly
 - Use HTTPS in production to protect keys in transit
 
+## Encryption
+
+CueMap supports **encryption-at-rest** for all memory content using modern authenticated encryption.
+
+- **Algorithm**: XChaCha20-Poly1305 (via `chacha20poly1305` crate).
+- **Key Derivation**: PBKDF2-HMAC-SHA256 with 100,000 iterations to derive a 32-byte key from a user passphrase.
+- **Nonce**: A random 12-byte nonce is generated for every memory encryption operation and stored alongside the ciphertext.
+- **Zero-Knowledge**: The engine does not persist the master key to disk; it must be provided at startup (via env var or prompt) and is kept only in RAM.
+
+## Compression
+
+To optimize storage efficiency, especially for large textual memories, CueMap employs transparent compression.
+
+- **Algorithm**: Zstandard (Zstd), configured for a balanced compression level (3).
+- **Strategy**: Content is compressed *before* encryption. This ensures maximum entropy reduction before the data is scrambled, often resulting in 40-60% storage savings for English text.
+- **Performance**: Zstd provides extremely fast decompression speeds, ensuring that the "hot path" for reading memories remains sub-millisecond even with compression enabled.
+
 ## Performance
 
-### Benchmark Results (v0.6.2)
+### Benchmark Results (v0.6.3)
 
 Tests performed on **Real-World Data** (Wikipedia Articles), processing full natural language sentences with the complete NLP pipeline.
 
@@ -331,15 +336,14 @@ Tests performed on **Real-World Data** (Wikipedia Articles), processing full nat
 
 | Dataset Scale | Operation | Avg Latency | P50 (Median) | P99 (Tail) |
 |:---|:---|:---|:---|:---|
-| **100,000** | **Smart Recall** (With PC) | 2.76 ms | 2.58 ms | 5.40 ms |
-| | **Raw Recall** (No PC) | 2.90 ms | 2.85 ms | 5.37 ms |
-| **1,000,000** | **Smart Recall** (With PC) | 3.83 ms | **3.70 ms** | 7.02 ms |
-| | **Raw Recall** (No PC) | 3.70 ms | **3.44 ms** | 8.78 ms |
+| **100,000** | **Smart Recall** (With PC) | 1.37 ms | 1.33 ms | 2.62 ms |
+| | **Raw Recall** (No PC) | 1.34 ms | 1.26 ms | 2.45 ms |
+| **1,000,000** | **Smart Recall** (With PC) | 1.70 ms | **1.63 ms** | 3.16 ms |
+| | **Raw Recall** (No PC) | 1.69 ms | **1.61 ms** | 3.35 ms |
 
 **Key Metrics**:
 - ✅ **2ms Ingestion Speed:** Full NLP processing and indexing happens in <3ms.
-- ✅ **Perceptually Instant Search:** 1M item smart recall (3.70ms) is faster than a 60Hz screen refresh (16ms).
-- ✅ **Self-Healing Architecture:** P99 latency stabilizes and improves under load.
+- ✅ **Perceptually Instant Search:** 1M item smart recall (1.63ms) is ~10x faster than a 60Hz screen refresh (16ms).
 - ✅ **Provable O(1) Writes:** Ingestion speed is decoupled from dataset size.
 
 ## Architecture
@@ -347,9 +351,11 @@ Tests performed on **Real-World Data** (Wikipedia Articles), processing full nat
 ### Core Components
 
 - **Axum**: Minimal overhead async web framework
-- **DashMap**: Lock-free concurrent hash map (128 shards)
+- **DashMap + aHash**: Lock-free concurrent hash map with high-speed hashing
 - **IndexSet**: O(1) move-to-front operations
 - **Bincode**: Fast binary serialization for persistence
+- **Zstd**: High-ratio, real-time compression for storage
+- **ChaCha20-Poly1305**: Authenticated encryption at rest
 
 ### Optimizations
 
@@ -360,11 +366,9 @@ Tests performed on **Real-World Data** (Wikipedia Articles), processing full nat
 
 ## API
 
-### LLM Integration
+### Built-in Semantic Engine
 
-CueMap can automatically propose cues for your memories using **Semantic Engine** or **LLMs**
-
-#### Built-in Semantic Engine (Default)
+CueMap can automatically propose cues for your memories using **Semantic Engine**.
 
 **No LLM required!** By default, CueMap uses its internal **Semantic Engine** (WordNet) and **Global Context** to generate cues instantly.
 
@@ -382,17 +386,6 @@ curl -X POST http://localhost:8080/memories \
   }'
 # Internal Engine proposes: ["payment", "service", "timeout", "outage", "failure", "payment_service", ...]
 ```
-
-#### Optional: Local LLM (Ollama)
-
-For deeper reasoning or document summarization, you can enable Ollama:
-
-**Configuration**:
-- `CUE_GEN_STRATEGY=default` (Uses internal Semantic Engine. Set to `ollama` to force LLM usage).
-- `LLM_ENABLED=true|false` (Default: false)
-- `LLM_PROVIDER=ollama` (Default *if* LLM Strategy is selected).
-- `OLLAMA_URL=http://localhost:11434` (default)
-
 
 ## API Reference
 
@@ -600,8 +593,8 @@ Exposes internal system metrics for scraping (Prometheus format).
 ```bash
 curl http://localhost:8080/metrics
 # Output:
-# cuemap_ingestion_rate 0.0
-# cuemap_recall_latency_p99 0.0
+# cuemap_ingestion_rate 120.0
+# cuemap_recall_latency_p99 0.8
 # cuemap_memory_usage_bytes 1024
 # ...
 ```
@@ -663,7 +656,7 @@ The "Hallucination Guardrail" module. Deterministically greedy-fills a token bud
     "selected": [...],
     "excluded_top": [...]
   },
-  "engine_latency_ms": 1.45
+  "engine_latency_ms": 0.83
 }
 ```
 
@@ -699,7 +692,7 @@ graph TB
     
     subgraph "Multi-Tenant Core"
         MT[MultiTenantEngine]
-        MAIN[CueMap Engine<br/>DashMap + IndexSet]
+        MAIN[CueMap Engine<br/>DashMap + aHash]
         LEX[Lexicon Engine<br/>Token → Cue]
         ALIAS[Alias Engine<br/>Synonyms]
     end
@@ -713,11 +706,10 @@ graph TB
     subgraph "Intelligence"
         NL[NL Tokenizer<br/>Lemmatization + RAKE]
         SEMANTIC[Semantic Engine<br/>WordNet]
-        LLM[Optional LLM<br/>Ollama]
     end
     
     subgraph "Persistence"
-        PERSIST[Bincode Snapshots]
+        PERSIST[Snapshots<br/>Zstd + ChaCha20]
     end
     
     SDK --> AXUM
@@ -734,7 +726,6 @@ graph TB
     SCHED -.-> QUEUE
     
     QUEUE --> SEMANTIC
-    QUEUE --> LLM
     QUEUE --> LEX
     
     MAIN <-.-> PERSIST
@@ -775,7 +766,7 @@ sequenceDiagram
     Main-->>API: memory_id
     
     API-->>C: 200 {id, cues, latency_ms}
-    Note over C,API: ✅ Synchronous ~1ms
+    Note over C,API: ✅ Synchronous ~2ms
     
     par Buffered Background Jobs
         API->>Q: Buffer ProposeCues
@@ -806,8 +797,10 @@ sequenceDiagram
     
     API->>API: Merge & Normalize cues
     
-    API->>Alias: expand_query_cues(cues)
-    Alias-->>API: weighted_cues[(cue, weight)]
+    opt disable_alias_expansion = false
+        API->>Alias: expand_query_cues(cues)
+        Alias-->>API: weighted_cues[(cue, weight)]
+    end
     
     API->>Main: recall_weighted(cues, limit, options)
     Main->>Main: Pattern Completion (CA3)
@@ -1082,8 +1075,6 @@ Debug your search relevance with the `explain=true` flag.
   ]
 }
 ```
-
-
 
 ## License
 

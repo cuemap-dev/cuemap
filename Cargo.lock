@@ -664,7 +664,7 @@ dependencies = [
 
 [[package]]
 name = "cuemap"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "ahash",
  "async-trait",

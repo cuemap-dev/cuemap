@@ -2,6 +2,14 @@
 
 All notable changes to the CueMap Rust Engine will be documented in this file.
 
+## [0.6.3] - 2026-02-14
+
+### Added
+
+-- **Encryption**: Memory encryption using ChaCha20-Poly1305.
+-- **Compression**: Compression of memories using Zstd
+-- **CLI**: Enhanced CLI with all API features.
+
 ## [0.6.2] - 2026-01-24
 
 ### Added

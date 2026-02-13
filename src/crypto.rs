@@ -4,7 +4,6 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce
 };
 use rand::{RngCore, thread_rng};
-use std::io::Write;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 use sha2::Sha256;
 use hmac::Hmac;
