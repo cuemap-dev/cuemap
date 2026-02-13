@@ -1,4 +1,4 @@
-use cuemap_rust::jobs::*;
+use cuemap::jobs::*;
 
 #[test]
 fn test_lexicon_trainability() {

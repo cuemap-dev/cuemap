@@ -1,10 +1,11 @@
-use cuemap_rust::engine::CueMapEngine;
+use cuemap::engine::CueMapEngine;
+use cuemap::structures::MainStats;
 
 #[test]
 fn test_memory_cues_storage() {
     let engine = CueMapEngine::new();
     let cues = vec!["a".to_string(), "b".to_string()];
-    let memory_id = engine.add_memory("test content".to_string(), cues.clone(), None, false);
+    let memory_id = engine.add_memory("test content".to_string(), cues.clone(), None, MainStats::default(), false);
 
     let memory = engine.get_memory(&memory_id).unwrap();
     assert_eq!(memory.cues, cues);
@@ -14,7 +15,7 @@ fn test_memory_cues_storage() {
 fn test_attach_cues() {
     let engine = CueMapEngine::new();
     let initial_cues = vec!["a".to_string()];
-    let memory_id = engine.add_memory("test content".to_string(), initial_cues.clone(), None, false);
+    let memory_id = engine.add_memory("test content".to_string(), initial_cues.clone(), None, MainStats::default(), false);
 
     // Attach new cues
     let new_cues = vec!["b".to_string(), "c".to_string()];
@@ -41,8 +42,8 @@ fn test_freshness_boost() {
     let engine = CueMapEngine::new();
     
     // Add two memories with the same cue
-    let _id1 = engine.add_memory("oldest".to_string(), vec!["topic".to_string()], None, false);
-    let id2 = engine.add_memory("newest".to_string(), vec!["topic".to_string()], None, false);
+    let _id1 = engine.add_memory("oldest".to_string(), vec!["topic".to_string()], None, MainStats::default(), false);
+    let id2 = engine.add_memory("newest".to_string(), vec!["topic".to_string()], None, MainStats::default(), false);
     
     let results = engine.recall(vec!["topic".to_string()], 10, true, None);
     
@@ -64,7 +65,7 @@ fn test_scoring_gradient() {
     // Add many memories to create a deep list
     let mut ids = Vec::new();
     for i in 0..10 {
-        ids.push(engine.add_memory(format!("content {}", i), vec![cue.clone()], None, false));
+        ids.push(engine.add_memory(format!("content {}", i), vec![cue.clone()], None, MainStats::default(), false));
     }
     
     let results = engine.recall(vec![cue], 10, false, None);
@@ -78,17 +79,17 @@ fn test_scoring_gradient() {
 #[test]
 fn test_log_frequency_scaling() {
     let engine = CueMapEngine::new();
-    let id1 = engine.add_memory("frequent".to_string(), vec!["cue".to_string()], None, false);
-    let id2 = engine.add_memory("rare".to_string(), vec!["cue".to_string()], None, false);
+    let id1 = engine.add_memory("frequent".to_string(), vec!["cue".to_string()], None, MainStats::default(), false);
+    let id2 = engine.add_memory("rare".to_string(), vec!["cue".to_string()], None, MainStats::default(), false);
     
     // id1 gets 100 reinforcements
     for _ in 0..100 {
-        engine.upsert_memory_with_id(id1.clone(), "frequent".to_string(), vec!["cue".to_string()], None, true);
+        engine.upsert_memory_with_id(id1.clone(), "frequent".to_string(), vec!["cue".to_string()], None, Some(MainStats::default()), true, true);
     }
     
     // id2 gets 10 reinforcements
     for _ in 0..10 {
-        engine.upsert_memory_with_id(id2.clone(), "rare".to_string(), vec!["cue".to_string()], None, true);
+        engine.upsert_memory_with_id(id2.clone(), "rare".to_string(), vec!["cue".to_string()], None, Some(MainStats::default()), true, true);
     }
     
     let results = engine.recall(vec!["cue".to_string()], 10, false, None);

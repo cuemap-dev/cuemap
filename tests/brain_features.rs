@@ -1,4 +1,4 @@
-use cuemap_rust::engine::CueMapEngine;
+use cuemap::engine::CueMapEngine;
 use std::collections::HashMap;
 
 #[test]

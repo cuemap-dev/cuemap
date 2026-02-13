@@ -1,4 +1,4 @@
-use cuemap_rust::engine::CueMapEngine;
+use cuemap::engine::CueMapEngine;
 use super::{GoldenTrace, NormalizedRecall};
 use serde::{Deserialize, Serialize};
 use std::fs;

@@ -1,9 +1,9 @@
-use cuemap_rust::agent::chunker::Chunker;
-use cuemap_rust::agent::ingester::{Ingester, CrawlResult};
-use cuemap_rust::agent::AgentConfig;
-use cuemap_rust::jobs::{JobQueue, JobProgress, IngestionPhase};
-use cuemap_rust::multi_tenant::MultiTenantEngine;
-use cuemap_rust::config::CueGenStrategy;
+use cuemap::agent::chunker::Chunker;
+use cuemap::agent::ingester::{Ingester, CrawlResult};
+use cuemap::agent::AgentConfig;
+use cuemap::jobs::{JobQueue, JobProgress, IngestionPhase};
+use cuemap::multi_tenant::MultiTenantEngine;
+use cuemap::config::CueGenStrategy;
 use cuemap_rust::semantic::SemanticEngine;
 use std::sync::Arc;
 

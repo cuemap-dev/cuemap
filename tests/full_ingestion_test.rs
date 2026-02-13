@@ -3,7 +3,7 @@
 //! This test ingests files from data/agent-test/ and verifies that chunking
 //! produces meaningful results with correct cues.
 
-use cuemap_rust::agent::chunker::Chunker;
+use cuemap::agent::chunker::Chunker;
 use std::path::PathBuf;
 use std::fs;
 

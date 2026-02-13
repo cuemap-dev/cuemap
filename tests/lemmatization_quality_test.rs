@@ -1,4 +1,4 @@
-use cuemap_rust::nl::stem_word;
+use cuemap::nl::stem_word;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;

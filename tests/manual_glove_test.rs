@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use cuemap_rust::semantic::SemanticEngine;
+    use cuemap::semantic::SemanticEngine;
     use std::path::Path;
     use std::sync::Arc;
 

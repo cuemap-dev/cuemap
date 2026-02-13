@@ -1,4 +1,4 @@
-use cuemap_rust::engine::CueMapEngine;
+use cuemap::engine::CueMapEngine;
 use super::super::runner::{Eval, EvalResult};
 
 pub struct ParaphraseInvarianceEval {

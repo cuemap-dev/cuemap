@@ -1,4 +1,4 @@
-use cuemap_rust::projects::*;
+use cuemap::projects::*;
 use std::sync::Arc;
 
 #[test]

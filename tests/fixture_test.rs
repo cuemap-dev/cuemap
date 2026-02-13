@@ -1,5 +1,5 @@
-use cuemap_rust::persistence::PersistenceManager;
-use cuemap_rust::engine::CueMapEngine;
+use cuemap::persistence::PersistenceManager;
+use cuemap::engine::CueMapEngine;
 use std::path::PathBuf;
 use std::fs;
 

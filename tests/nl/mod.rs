@@ -1,4 +1,4 @@
-use cuemap_rust::nl::*;
+use cuemap::nl::*;
 
 #[test]
 fn test_tokenizer_basic() {

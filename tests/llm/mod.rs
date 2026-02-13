@@ -1,4 +1,4 @@
-use cuemap_rust::llm::*;
+use cuemap::llm::*;
 
 #[test]
 fn test_extract_facts_parsing_robustness() {

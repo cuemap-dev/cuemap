@@ -1,4 +1,4 @@
-use cuemap_rust::normalization::*;
+use cuemap::normalization::*;
 
 #[test]
 fn test_basic_normalization() {

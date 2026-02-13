@@ -1,4 +1,4 @@
-use cuemap_rust::taxonomy::*;
+use cuemap::taxonomy::*;
 use std::collections::HashMap;
 
 #[test]

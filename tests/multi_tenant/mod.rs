@@ -1,6 +1,6 @@
-use cuemap_rust::multi_tenant::*;
-use cuemap_rust::semantic::SemanticEngine;
-use cuemap_rust::config::CueGenStrategy;
+use cuemap::multi_tenant::*;
+use cuemap::semantic::SemanticEngine;
+use cuemap::config::CueGenStrategy;
 use std::fs;
 use tempfile::tempdir;
 

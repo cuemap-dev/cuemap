@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use cuemap_rust::engine::RecallResult;
+use cuemap::engine::RecallResult;
 
 pub mod runner;
 pub mod evals;
