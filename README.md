@@ -14,29 +14,6 @@ CueMap implements a **Continuous Gradient Algorithm** inspired by biological mem
 
 Built with Rust for maximum performance and reliability.
 
-## Brain-Inspired Advanced Recall
-
-CueMap introduces deep biological inspiration into the deterministic recall engine:
-
-### Hippocampal Pattern Completion
-Given partial cues, the engine recalls the whole memory by maintaining an incremental cue co-occurrence matrix. This expansion happens strictly at retrieval-time and can be toggled off via `disable_pattern_completion: true` for pure deterministic matching.
-
-### Temporal Episode Chunking
-Experiences are automatically chunked into episodes. Memories created in close temporal proximity with high cue overlap are tagged with `episode:<id>`, allowing the engine to recall entire "storylines" from a single member. Can be disabled per-request via `disable_temporal_chunking: true`.
-
-### Salience Bias (Amygdala)
-Not all memories are created equal. The engine calculates a **Salience Multiplier** based on cue density, reinforcement frequency, and rare cue combinations. Salient memories persist longer in the "warm" cache and rank higher than routine events. Can be disabled per-recall via `disable_salience_bias: true`.
-
-### Systems Consolidation
-Old, highly overlapping memories are periodically merged into summarized "gist" memories. This process is strictly additive: it keeps the original high-resolution memories intact as Ground Truth while creating new consolidated summaries to aid high-level recall. Can be toggled at retrieval via `disable_systems_consolidation: true`.
-
-### Match Integrity
-Every recall result now includes a **Match Integrity** score. This internal diagnostic combines intersection strength, reinforcement history, and context agreement to tell you how structurally reliable a specific recall result is.
-
-### Semantic Bootstrapping (WordNet)
-To bridge the gap between user queries and stored memories, CueMap integrates **WordNet** lookups during cue generation. This allows the engine to propose synonym-rich cues, ensuring that a memory tagged with "payment" is retrievable via "transaction" or "billing".
-
-
 ## Quick Start
 
 ### Build & Run
@@ -436,6 +413,28 @@ curl -X POST http://localhost:8080/recall \
   }'
 ```
 Returns memories matching tokens mapped via the local Lexicon CueMap. Use `"explain": true` to see how the query was normalized and expanded.
+
+```json
+{
+  "explain": {
+    "query_cues": ["payments"],
+    "expanded_cues": [
+      ["payments", 1.0],
+      ["service:payments", 0.85]
+    ]
+  },
+  "results": [
+    {
+      "content": "...",
+      "score": 145.2,
+      "explain": {
+        "intersection_weighted": 1.85,
+        "recency_component": 0.5
+      }
+    }
+  ]
+}
+```
 
 ### Reinforce Memory
 
@@ -1035,46 +1034,27 @@ Intersection + Recency scoring:
 
 The Lexicon **adapts to your domain's semantics** automatically. No manual disambiguation rules needed!
 
-### Weighted Recall & Aliasing
-Not all matches are equal. CueMap introduces a sophisticated weighting engine:
+### 3. Brain-Inspired Advanced Recall
 
-*   **Native Aliasing**: Define synonyms like `payments-service` → `service:payments`.
-*   **Weighted Intersection**: Unlike standard tag stores, CueMap calculates scores based on signal strength. A direct cue match counts as 1.0, while an alias might count as 0.85. This ensures that exact terminology always ranks higher than loose synonyms.
+CueMap introduces deep biological inspiration into the deterministic recall engine:
 
-### Asynchronous Intelligence Pipeline
-Writes are instantaneous. Intelligence is eventual.
+#### Hippocampal Pattern Completion
+Given partial cues, the engine recalls the whole memory by maintaining an incremental cue co-occurrence matrix. This expansion happens strictly at retrieval-time and can be toggled off via `disable_pattern_completion: true` for pure deterministic matching.
 
-*   **Non-Blocking API**: `POST /memories` returns a success ID with basic and cleaned cues.
-*   **Background Jobs**:
-    *   **Cue Expansion**: Memory cues are expanded with WordNet synonyms and antonyms.
-    *   **LLM Enrichment**: If configured, an LLM (OpenAI/Gemini) analyzes the content in the background to propose additional canonical cues, which are then validated and attached.
-    *   **Lexicon Training**: The Lexicon is trained in the background to learn from the new memories.
-    *   **Alias Discovery**: A background scanner periodically analyzes the cue index to find cues with >90% memory overlap (set similarity). If "prod" and "production" point to the same memories, the system proposes "prod" as a weighted alias (0.95) for "production", automatically merging their signal in future searches.
+#### Temporal Episode Chunking
+Experiences are automatically chunked into episodes. Memories created in close temporal proximity with high cue overlap are tagged with `episode:<id>`, allowing the engine to recall entire "storylines" from a single member. Can be disabled per-request via `disable_temporal_chunking: true`.
 
-### Explainable AI
-Debug your search relevance with the `explain=true` flag.
+#### Salience Bias (Amygdala)
+Not all memories are created equal. The engine calculates a **Salience Multiplier** based on cue density, reinforcement frequency, and rare cue combinations. Salient memories persist longer in the "warm" cache and rank higher than routine events. Can be disabled per-recall via `disable_salience_bias: true`.
 
-```json
-{
-  "explain": {
-    "query_cues": ["payments"],
-    "expanded_cues": [
-      ["payments", 1.0],
-      ["service:payments", 0.85]
-    ]
-  },
-  "results": [
-    {
-      "content": "...",
-      "score": 145.2,
-      "explain": {
-        "intersection_weighted": 1.85,
-        "recency_component": 0.5
-      }
-    }
-  ]
-}
-```
+#### Systems Consolidation
+Old, highly overlapping memories are periodically merged into summarized "gist" memories. This process is strictly additive: it keeps the original high-resolution memories intact as Ground Truth while creating new consolidated summaries to aid high-level recall. Can be toggled at retrieval via `disable_systems_consolidation: true`.
+
+#### Match Integrity
+Every recall result now includes a **Match Integrity** score. This internal diagnostic combines intersection strength, reinforcement history, and context agreement to tell you how structurally reliable a specific recall result is.
+
+#### Semantic Bootstrapping (WordNet)
+To bridge the gap between user queries and stored memories, CueMap integrates **WordNet** lookups during cue generation. This allows the engine to propose synonym-rich cues, ensuring that a memory tagged with "payment" is retrievable via "transaction" or "billing".
 
 ## License
 
