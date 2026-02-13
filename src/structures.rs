@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use crate::crypto::{self, EncryptionKey};
+use ahash::RandomState;
 
 // =============================================================================
 // Stats Types - Specialized payloads for different memory engines
@@ -144,9 +145,6 @@ impl MemoryStats for LexiconStats {
 // Generic Memory Struct
 // =============================================================================
 
-// MemoryPayload removed in favor of direct Vec<u8> with magic byte detection
-
-
 /// Generic Memory wrapper for all memory types.
 /// The `stats` field contains type-specific payload (MainStats or LexiconStats).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -252,13 +250,13 @@ impl Memory<MainStats> {
 /// for a 1M memory dataset with 5 cues per memory.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OrderedSet {
-    pub items: IndexSet<String>,
+    pub items: IndexSet<String, RandomState>,
 }
 
 impl OrderedSet {
     pub fn new() -> Self {
         Self {
-            items: IndexSet::new(),
+            items: IndexSet::with_hasher(RandomState::new()),
         }
     }
     

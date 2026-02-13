@@ -25,6 +25,7 @@ use crate::engine::CueMapEngine;
 use crate::structures::{Memory, OrderedSet, MemoryStats};
 use bytes::Bytes;
 use dashmap::DashMap;
+use ahash::RandomState;
 use object_store::{
     aws::AmazonS3Builder,
     azure::MicrosoftAzureBuilder,
@@ -139,7 +140,7 @@ impl PersistenceManager {
     /// Load engine state from a specific path (used by multi-tenant)
     pub fn load_from_path<T>(
         path: &Path,
-    ) -> Result<(DashMap<String, Memory<T>>, DashMap<String, OrderedSet>), Box<dyn std::error::Error>> 
+    ) -> Result<(DashMap<String, Memory<T>, RandomState>, DashMap<String, OrderedSet, RandomState>), Box<dyn std::error::Error>> 
     where T: Serialize + for<'de> Deserialize<'de> + Clone + Default + Send + Sync + MemoryStats + 'static
     {
         if !path.exists() {
@@ -160,12 +161,12 @@ impl PersistenceManager {
         );
         
         // Convert to DashMaps
-        let memories = DashMap::new();
+        let memories = DashMap::with_hasher(RandomState::new());
         for (id, memory) in state.memories {
             memories.insert(id, memory);
         }
         
-        let cue_index = DashMap::new();
+        let cue_index = DashMap::with_hasher(RandomState::new());
         for (cue, memory_ids) in state.cue_index {
             let mut ordered_set = OrderedSet::new();
             for memory_id in memory_ids {
@@ -222,14 +223,14 @@ impl PersistenceManager {
     
     pub fn load_state<T>(
         &self,
-    ) -> Result<(DashMap<String, Memory<T>>, DashMap<String, OrderedSet>), Box<dyn std::error::Error>> 
+    ) -> Result<(DashMap<String, Memory<T>, RandomState>, DashMap<String, OrderedSet, RandomState>), Box<dyn std::error::Error>> 
     where T: Serialize + for<'de> Deserialize<'de> + Clone + Default + Send + Sync + MemoryStats + 'static
     {
         let snapshot_path = self.snapshot_path();
         
         if !snapshot_path.exists() {
             info!("No existing snapshot found, starting with empty state");
-            return Ok((DashMap::new(), DashMap::new()));
+            return Ok((DashMap::with_hasher(RandomState::new()), DashMap::with_hasher(RandomState::new())));
         }
         
         info!("Loading state from {:?}", snapshot_path);
@@ -246,12 +247,12 @@ impl PersistenceManager {
         );
         
         // Convert to DashMaps
-        let memories = DashMap::new();
+        let memories = DashMap::with_hasher(RandomState::new());
         for (id, memory) in state.memories {
             memories.insert(id, memory);
         }
         
-        let cue_index = DashMap::new();
+        let cue_index = DashMap::with_hasher(RandomState::new());
         for (cue, memory_ids) in state.cue_index {
             let mut ordered_set = OrderedSet::new();
             for memory_id in memory_ids {

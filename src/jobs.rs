@@ -660,7 +660,7 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>, metrics: &Op
                       .unwrap_or(crate::nl::Language::Default);
 
                   // 1. Resolve known cues (Lexicon recall)
-                  let (mut known_cues, _) = ctx.resolve_cues_from_text_with_lang(&content, false, lang);
+                  let (mut known_cues, _, _) = ctx.resolve_cues_from_text_with_lang(&content, false, lang);
 
                  
                  // 2. Bootstrap if needed (for static strategies to have something to expand)
@@ -977,7 +977,7 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>, metrics: &Op
                     match category {
                         ChunkCategory::Conversation => {
                             resolved_cues = structural_cues_clone;
-                            let (normalized_tokens, _) = ctx_clone.resolve_cues_from_text_with_lang(&content_clone, true, lang);
+                            let (normalized_tokens, _, _) = ctx_clone.resolve_cues_from_text_with_lang(&content_clone, true, lang);
                             for token in normalized_tokens {
                                 if !resolved_cues.contains(&token) {
                                     resolved_cues.push(token);
@@ -987,7 +987,7 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>, metrics: &Op
                         // Treat all other categories similarly: Just get tokens.
                         // Prose/WebContent getting WordNet expansion is now handled by Lexicon Training below.
                         _ => {
-                             let (normalized_tokens, _) = ctx_clone.resolve_cues_from_text_with_lang(&content_clone, true, lang);
+                             let (normalized_tokens, _, _) = ctx_clone.resolve_cues_from_text_with_lang(&content_clone, true, lang);
                              resolved_cues = normalized_tokens;
                         }
                     }

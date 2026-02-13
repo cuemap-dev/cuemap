@@ -1,6 +1,6 @@
 [package]
 name = "cuemap"
-version = "0.6.2"
+version = "0.6.3"
 edition = "2021"
 
 [[bin]]
@@ -78,6 +78,7 @@ pbkdf2 = "0.12"
 zeroize = { version = "1.7", features = ["derive"] }
 rpassword = "7.3"
 base64 = "0.21"
+ahash = "0.8"
 
 [features]
 default = []
@@ -133,3 +134,9 @@ path = "tests/llm/mod.rs"
 [[test]]
 name = "agent"
 path = "tests/agent/mod.rs"
+
+
+
+
+
+

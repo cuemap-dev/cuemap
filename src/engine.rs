@@ -1,12 +1,12 @@
 use crate::structures::{Memory, OrderedSet, MainStats, LexiconStats, MemoryStats};
 use crate::crypto::EncryptionKey;
-use tracing::info;
 use dashmap::DashMap;
 use serde::{Serialize, Deserialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH, Instant};
+use ahash::RandomState;
 
 
 #[derive(Debug, Clone, Serialize)]
@@ -23,6 +23,23 @@ pub struct RecallResult {
     pub metadata: HashMap<String, serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub explain: Option<serde_json::Value>,
+
+}
+
+#[derive(Debug, Clone)]
+
+pub struct ScoredMemoryCandidate {
+    pub memory_id: String,
+    pub score: f64,
+    pub match_integrity: f64,
+    pub intersection_count: usize,
+    pub recency_score: f64,
+    pub reinforcement_score: f64,
+    pub salience_score: f64,
+    pub created_at: f64,
+    // Raw values for late materialization
+    pub intersection_weighted: f64,
+    pub match_count: f64,
 }
 
 #[derive(Clone)]
@@ -30,17 +47,15 @@ pub struct CueMapEngine<T>
 where
     T: Serialize + for<'de> Deserialize<'de> + Clone + Default + Send + Sync + MemoryStats + 'static
 {
-    memories: Arc<DashMap<String, Memory<T>>>,
-    cue_index: Arc<DashMap<String, OrderedSet>>,
+    memories: Arc<DashMap<String, Memory<T>, RandomState>>,
+    cue_index: Arc<DashMap<String, OrderedSet, RandomState>>,
     // Pattern Completion: cue co-occurrence matrix
-    cue_co_occurrence: Arc<DashMap<String, DashMap<String, u64>>>,
-    // Temporal Chunking: track last event per session/project (using a dummy key for now or extending API)
-    last_events: Arc<DashMap<String, (String, f64, Vec<String>)>>,
-    // Performance: Atomic counter to avoid DashMap::len() contention
+    cue_co_occurrence: Arc<DashMap<String, DashMap<String, u64, RandomState>, RandomState>>,
+    // Temporal Chunking: track last event per session/project
+    last_events: Arc<DashMap<String, (String, f64, Vec<String>), RandomState>>,
+    
     memory_count: Arc<AtomicUsize>,
-    // Performance: Atomic counter for cues
     cue_count: Arc<AtomicUsize>,
-    // Security: Master key for encryption (optional)
     master_key: Option<Arc<EncryptionKey>>,
 }
 
@@ -52,10 +67,10 @@ where
 {
     pub fn new() -> Self {
         Self {
-            memories: Arc::new(DashMap::new()),
-            cue_index: Arc::new(DashMap::new()),
-            cue_co_occurrence: Arc::new(DashMap::new()),
-            last_events: Arc::new(DashMap::new()),
+            memories: Arc::new(DashMap::with_hasher(RandomState::new())),
+            cue_index: Arc::new(DashMap::with_hasher(RandomState::new())),
+            cue_co_occurrence: Arc::new(DashMap::with_hasher(RandomState::new())),
+            last_events: Arc::new(DashMap::with_hasher(RandomState::new())),
             memory_count: Arc::new(AtomicUsize::new(0)),
             cue_count: Arc::new(AtomicUsize::new(0)),
             master_key: None,
@@ -79,16 +94,16 @@ where
 
     
     pub fn from_state(
-        memories: DashMap<String, Memory<T>>,
-        cue_index: DashMap<String, OrderedSet>,
+        memories: DashMap<String, Memory<T>, RandomState>,
+        cue_index: DashMap<String, OrderedSet, RandomState>,
     ) -> Self {
         let count = memories.len();
         let cue_count_val = cue_index.len();
         let engine = Self {
             memories: Arc::new(memories),
             cue_index: Arc::new(cue_index),
-            cue_co_occurrence: Arc::new(DashMap::new()), 
-            last_events: Arc::new(DashMap::new()),
+            cue_co_occurrence: Arc::new(DashMap::with_hasher(RandomState::new())), 
+            last_events: Arc::new(DashMap::with_hasher(RandomState::new())),
             memory_count: Arc::new(AtomicUsize::new(count)),
             cue_count: Arc::new(AtomicUsize::new(cue_count_val)),
             master_key: None,
@@ -106,11 +121,11 @@ where
     }
     
     // Expose internal state for persistence
-    pub fn get_memories(&self) -> &Arc<DashMap<String, Memory<T>>> {
+    pub fn get_memories(&self) -> &Arc<DashMap<String, Memory<T>, RandomState>> {
         &self.memories
     }
     
-    pub fn get_cue_index(&self) -> &Arc<DashMap<String, OrderedSet>> {
+    pub fn get_cue_index(&self) -> &Arc<DashMap<String, OrderedSet, RandomState>> {
         &self.cue_index
     }
     
@@ -126,7 +141,7 @@ where
                 // Update A -> B
                 self.cue_co_occurrence
                     .entry(cue_a.clone())
-                    .or_insert_with(DashMap::new)
+                    .or_insert_with(|| DashMap::with_hasher(RandomState::new()))
                     .entry(cue_b.clone())
                     .and_modify(|c| *c += 1)
                     .or_insert(1);
@@ -134,7 +149,7 @@ where
                 // Update B -> A
                 self.cue_co_occurrence
                     .entry(cue_b.clone())
-                    .or_insert_with(DashMap::new)
+                    .or_insert_with(|| DashMap::with_hasher(RandomState::new()))
                     .entry(cue_a.clone())
                     .and_modify(|c| *c += 1)
                     .or_insert(1);
@@ -191,10 +206,6 @@ where
             }
         }
         self.last_events.insert(project_id, (memory_id.clone(), memory.created_at, memory.cues.clone()));
-
-        // 2. Update co-occurrence matrix (MOVED TO BACKGROUND JOB)
-        // self.update_cue_co_occurrence(&memory.cues);
-        
         if self.memories.insert(memory_id.clone(), memory).is_none() {
             self.memory_count.fetch_add(1, Ordering::Relaxed);
         }
@@ -205,7 +216,6 @@ where
             if cue_lower.is_empty() { continue; }
 
             // 1. Index full cue
-            // 1. Index full cue
             if !self.cue_index.contains_key(&cue_lower) {
                  self.cue_count.fetch_add(1, Ordering::Relaxed);
             }
@@ -214,35 +224,6 @@ where
                 .or_insert_with(OrderedSet::new)
                 .add(memory_id.clone());
 
-            // For now, let's just accept that `cue_count` might be slightly off if we don't track it perfectly,
-            // OR we fix it by not using DashMap::len() for stats.
-            
-            // Re-think: Is `cue_index.len()` actually O(N)?
-            // DashMap::len() locks all shards to sum them up. Yes.
-            
-            // Correct approach: increment only if we add a NEW key.
-            // But we already have the entry lock.
-            // If the set was empty (newly created), it's a new cue?
-            // No, OrderedSet::new() creates empty.
-            // Basic logic: if we call `or_insert_with`, and it runs the closure, it's new.
-            // But `entry` returns a RefMut, we don't know if closure ran.
-            
-            // Alternative: check if key exists first? No, race condition.
-            // Alternative 2: Trust DashMap::len() is slow, but maybe we only need it occasionally?
-            // No, UI calls it every 10s.
-            
-            // Let's implement roughly correct counting:
-            // We can't easily know if it's a new key without checking.
-            // Let's use `if !self.cue_index.contains_key(...)` fast check? No races.
-            
-            // Wait, we are inside `add_memory` which is basically single-writer per memory...
-            // But concurrent add_memories happen.
-            
-            // Let's just use `cue_index.len()` inside `new/from_state`, 
-            // and checking `if self.cue_index.insert(...)` returns None?
-            // But we use `entry().or_insert()`.
-            
-            // OK, let's change logic to:
             if !self.cue_index.contains_key(&cue_lower) {
                  self.cue_count.fetch_add(1, Ordering::Relaxed);
             }
@@ -460,7 +441,6 @@ where
             }
 
         }
-        
         self.update_cue_co_occurrence(&cues);
         
         id
@@ -603,7 +583,7 @@ where
         }
 
         // 1. Normalize and collect cue sets with sizes
-        let mut cue_sets: Vec<(String, f64, dashmap::mapref::one::Ref<String, OrderedSet>)> = Vec::new();
+        let mut cue_sets = Vec::new();
         for (cue, weight) in &query_cues {
             let cue_lower = cue.to_lowercase();
             let cue_trimmed = cue_lower.trim().to_string();
@@ -834,16 +814,53 @@ where
 
         results.truncate(limit);
         
-        results
+        // Finalize results by accessing content only for the top K
+        let mut final_results = Vec::with_capacity(results.len());
+        
+        for candidate in results {
+             if let Some(memory) = self.memories.get(&candidate.memory_id) {
+                 
+                 let explain_data = if explain {
+                    Some(serde_json::json!({
+                        "intersection_weighted": candidate.intersection_weighted,
+                        "score": candidate.score,
+                        "match_integrity": candidate.match_integrity,
+                        "intersection_count": candidate.intersection_count,
+                        "recency_score": candidate.recency_score,
+                        "reinforcement_score": candidate.reinforcement_score,
+                        "salience_score": candidate.salience_score,
+                    }))
+                 } else {
+                     None
+                 };
+
+                 let content = memory.access_content(self.master_key.as_deref()).unwrap_or_else(|_| "<decryption failed>".to_string());
+                 final_results.push(RecallResult {
+                     memory_id: candidate.memory_id,
+                     content,
+                     score: candidate.score,
+                     match_integrity: candidate.match_integrity,
+                     intersection_count: candidate.intersection_count,
+                     recency_score: candidate.recency_score,
+                     reinforcement_score: candidate.reinforcement_score,
+                     salience_score: candidate.salience_score,
+                     created_at: candidate.created_at,
+                     metadata: memory.metadata.clone(),
+                     explain: explain_data,
+                 });
+             }
+        }
+
+        final_results
     }
     
-    fn consolidated_search(&self, query_cues: &[(String, f64)], limit: usize, explain: bool, disable_salience_bias: bool, disable_systems_consolidation: bool, heatmap: Option<&HashMap<String, f32>>) -> Vec<RecallResult> {
+    fn consolidated_search(&self, query_cues: &[(String, f64)], limit: usize, explain: bool, disable_salience_bias: bool, disable_systems_consolidation: bool, heatmap: Option<&HashMap<String, f32>>) -> Vec<ScoredMemoryCandidate> {
         if query_cues.is_empty() {
             return Vec::new();
         }
 
         // 1. Gather cue data with set sizes for sorting
-        let mut cue_data: Vec<(String, f64, dashmap::mapref::one::Ref<String, OrderedSet>)> = Vec::with_capacity(query_cues.len());
+        let mut cue_data = Vec::with_capacity(query_cues.len());
         let total_memories = self.memories.len() as f64;
         
         for (cue, weight) in query_cues {
@@ -892,11 +909,11 @@ where
                 let mut positions_info = Vec::with_capacity(cue_data.len());
 
                 // 3. For each NEW candidate, probe ALL query cue lists to get full intersection data
-                for (other_idx, (other_cue, other_weight, other_set)) in cue_data.iter().enumerate() {
+                for (other_idx, (_other_cue, other_weight, other_set)) in cue_data.iter().enumerate() {
                     // Optimization: if it's the current set we're iterating, we know it's there
                     if other_idx == cue_idx {
                         total_weight += *other_weight;
-                        positions_info.push((pos_rev, other_set.len(), *other_weight, other_cue.clone()));
+                        positions_info.push((pos_rev, other_set.len(), *other_weight));
                         continue;
                     }
 
@@ -904,34 +921,37 @@ where
                     if let Some(oldest_idx) = other_set.get_index_of(memory_id) {
                         total_weight += *other_weight;
                         let recency_pos = (other_set.len() - 1) - oldest_idx;
-                        positions_info.push((recency_pos, other_set.len(), *other_weight, other_cue.clone()));
+                        positions_info.push((recency_pos, other_set.len(), *other_weight));
                     }
                 }
 
                 // 4. Collect candidate
-                candidates.push(((*memory_id).clone(), positions_info, total_weight));
+                candidates.push((memory_id.as_str(), positions_info, total_weight));
             }
         }
-
+        
         // 5. Score candidates
-        self.score_consolidated_candidates(candidates, explain, disable_salience_bias, disable_systems_consolidation, heatmap)
+        let results = self.score_consolidated_candidates(candidates, explain, disable_salience_bias, disable_systems_consolidation, heatmap);
+
+        results
     }
 
-    fn score_consolidated_candidates(
+    fn score_consolidated_candidates<'a>(
         &self, 
-        candidates: Vec<(String, Vec<(usize, usize, f64, String)>, f64)>, 
+        candidates: Vec<(&'a str, Vec<(usize, usize, f64)>, f64)>, 
         explain: bool, 
         disable_salience_bias: bool, 
         disable_systems_consolidation: bool,
         heatmap: Option<&HashMap<String, f32>>
-    ) -> Vec<RecallResult> {
+    ) -> Vec<ScoredMemoryCandidate> {
         const MAX_REC_WEIGHT: f64 = 20.0;
         const MAX_FREQ_WEIGHT: f64 = 5.0;
         
         let mut results = Vec::with_capacity(candidates.len());
         
-        for (memory_id, positions_info, total_weight) in candidates {
-            if let Some(memory) = self.memories.get(&memory_id) {
+        for (memory_id_ref, positions_info, total_weight) in candidates {
+            
+            if let Some(memory) = self.memories.get(memory_id_ref) {
                 // Skip consolidated summaries if disabled
                 if disable_systems_consolidation && memory.cues.iter().any(|c| c == "type:summary") {
                     continue;
@@ -939,10 +959,9 @@ where
                 let mut total_recency = 0.0;
                 let mut total_w_rec = 0.0;
                 let mut total_w_freq = 0.0;
-                
                 let match_count = positions_info.len() as f64;
 
-                for (pos, list_len, _weight, _cue_name) in &positions_info {
+                for (pos, list_len, _weight) in &positions_info {
                     let pos_f64 = *pos as f64;
                     let list_len_f64 = *list_len as f64;
                     let sigma = list_len_f64.sqrt();
@@ -968,7 +987,7 @@ where
                     0.0
                 };
                 
-                let (salience_score, effective_salience, market_lift) = if disable_salience_bias {
+                let (_salience_score, _effective_salience, _market_lift) = if disable_salience_bias {
                     (0.0, 0.0, 0.0)
                 } else {
                     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -990,7 +1009,7 @@ where
                 
                 // Final score includes salience
                 // We use salience_score (Effective + Market) here
-                let score = intersection_score + (recency_score * avg_w_rec) + (frequency_score * avg_w_freq) + (salience_score * 10.0);
+                let score = intersection_score + (recency_score * avg_w_rec) + (frequency_score * avg_w_freq) + (_salience_score * 10.0);
                 
                 // Match integrity calculation
                 // 1. Intersection strength (relative to match count)
@@ -1003,48 +1022,19 @@ where
                 };
                 // 3. Reinforcement boost (capped)
                 let reinforcement_boost = (frequency_score / 2.0).min(1.0);
-                
                 let match_integrity = (intersection_strength * 0.5 + context_agreement * 0.3 + reinforcement_boost * 0.2).min(1.0);
 
-                tracing::info!(
-                    "Scoring Memory {}: score={:.2} [int={:.2} rec={:.2} freq={:.2} sal={:.2} (eff={:.2}, mkt={:.2})]",
-                    memory_id, score, intersection_score, recency_score * avg_w_rec, frequency_score * avg_w_freq, salience_score * 10.0, effective_salience, market_lift
-                );
-
-                let explain_data = if explain {
-                    Some(serde_json::json!({
-                        "intersection_weighted": total_weight,
-                        "intersection_score": intersection_score,
-                        "recency_component": recency_score,
-                        "frequency_component": frequency_score,
-                        "salience_score": salience_score,
-                        "effective_salience": effective_salience,
-                        "market_lift": market_lift,
-                        "match_integrity": match_integrity,
-                        "weights": {
-                            "recency": avg_w_rec,
-                            "frequency": avg_w_freq,
-                            "salience": 10.0
-                        },
-                        "match_count": match_count,
-                        "matched_cues": positions_info.iter().map(|(_, _, _, name)| name.clone()).collect::<Vec<_>>()
-                    }))
-                } else {
-                    None
-                };
-
-                results.push(RecallResult {
-                    memory_id,
-                    content: memory.access_content(self.master_key.as_deref()).unwrap_or_else(|_| "<decryption failed>".to_string()),
+                results.push(ScoredMemoryCandidate {
+                    memory_id: memory_id_ref.to_string(),
                     score,
                     match_integrity,
                     intersection_count: match_count as usize,
                     recency_score,
                     reinforcement_score: frequency_score,
-                    salience_score,
+                    salience_score: _salience_score,
                     created_at: memory.created_at,
-                    metadata: memory.metadata.clone(),
-                    explain: explain_data,
+                    intersection_weighted: total_weight,
+                    match_count,
                 });
             }
         }

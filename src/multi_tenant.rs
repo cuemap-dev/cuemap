@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use crate::semantic::SemanticEngine;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use ahash::RandomState;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -31,7 +32,7 @@ pub struct ProjectStats {
 
 #[derive(Clone)]
 pub struct MultiTenantEngine {
-    projects: Arc<DashMap<ProjectId, Arc<ProjectContext>>>,
+    projects: Arc<DashMap<ProjectId, Arc<ProjectContext>, RandomState>>,
     snapshots_dir: PathBuf,
     cuegen_strategy: CueGenStrategy,
     semantic_engine: SemanticEngine,
@@ -53,7 +54,7 @@ impl MultiTenantEngine {
         }
         
         Self {
-            projects: Arc::new(DashMap::new()),
+            projects: Arc::new(DashMap::with_hasher(RandomState::new())),
             snapshots_dir,
             cuegen_strategy,
             semantic_engine,
@@ -231,7 +232,7 @@ impl MultiTenantEngine {
             main: main_engine,
             aliases: aliases_engine,
             lexicon: lexicon_engine,
-            query_cache: DashMap::new(),
+            query_cache: DashMap::with_hasher(RandomState::new()),
             normalization: NormalizationConfig::default(),
             taxonomy: Taxonomy::default(),
             cuegen_strategy: self.cuegen_strategy.clone(),

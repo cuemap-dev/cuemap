@@ -62,6 +62,8 @@ pub struct RecallRequest {
     pub disable_salience_bias: bool,
     #[serde(default)]
     pub disable_systems_consolidation: bool,
+    #[serde(default = "default_true")]
+    pub disable_alias_expansion: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -83,6 +85,8 @@ pub struct RecallGroundedRequest {
     pub disable_systems_consolidation: bool,
     #[serde(default)]
     pub min_intersection: Option<usize>,
+    #[serde(default = "default_true")]
+    pub disable_alias_expansion: bool,
 }
 
 fn default_true() -> bool {
@@ -502,7 +506,7 @@ async fn recall(
     Json(req): Json<RecallRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     use std::time::Instant;
-    
+    let start = Instant::now();
     let EngineState { ref mt_engine, ref job_queue, .. } = &state;
     
     // --- Path 1: Cross-domain query ---
@@ -522,9 +526,9 @@ async fn recall(
                 let mut cues_to_process = req.cues.clone();
                 
                 let (original_tokens, _lexicon_mids) = if let Some(text) = &req.query_text {
-                     let (resolved, lex_mids) = ctx.resolve_cues_from_text(text, false);
+                     let (resolved, lex_mids, tokens) = ctx.resolve_cues_from_text(text, false);
                      cues_to_process.extend(resolved);
-                     (crate::nl::tokenize_to_cues(text), lex_mids)
+                     (tokens, lex_mids)
                 } else {
                     (req.cues.clone(), Vec::new())
                 };
@@ -537,7 +541,11 @@ async fn recall(
                 }
                 
                 // Expand aliases
-                let expanded_cues = ctx.expand_query_cues(normalized_cues, &original_tokens);
+                let expanded_cues = if req.disable_alias_expansion {
+                    normalized_cues.into_iter().map(|c| (c, 1.0)).collect()
+                } else {
+                    ctx.expand_query_cues(normalized_cues, &original_tokens)
+                };
                 
                 // Read Market Heatmap (scoped locally inside this closure, no awaits here, so it's safe)
                 let heatmap = ctx.market_heatmap.read().ok();
@@ -635,8 +643,7 @@ async fn recall(
         Ok(id) => id,
         Err(e) => return e,
     };
-    
-    let start = Instant::now();
+
     let ctx = match mt_engine.get_or_create_project(project_id.clone()) {
         Ok(c) => c,
         Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": e}))),
@@ -645,44 +652,41 @@ async fn recall(
     // Collect cues
     let mut cues_to_process = req.cues.clone();
     
-    let t_lex = Instant::now();
     let mut lexicon_memory_ids: Vec<String> = Vec::new();
+    let mut tokens_from_text = Vec::new();
     if let Some(ref text) = req.query_text {
          // 1. Lexicon Recall
-         let (resolved, lex_mids) = ctx.resolve_cues_from_text(text, false);
+         let (resolved, lex_mids, tokens) = ctx.resolve_cues_from_text(text, false);
          cues_to_process.extend(resolved);
          lexicon_memory_ids = lex_mids;
 
          // 2. Raw Token Fallback
-         let tokens = crate::nl::tokenize_to_cues(text);
-         for token in tokens {
-             if !cues_to_process.contains(&token) {
-                 cues_to_process.push(token);
+         tokens_from_text = tokens;
+         for token in &tokens_from_text {
+             if !cues_to_process.contains(token) {
+                 cues_to_process.push(token.clone());
              }
          }
     }
-    let lex_ms = t_lex.elapsed().as_secs_f64() * 1000.0;
     
     // Normalize query cues
-    let t_norm = Instant::now();
     let mut normalized_cues = Vec::new();
     for cue in &cues_to_process {
         let (normalized, _) = normalize_cue(cue, &ctx.normalization);
         normalized_cues.push(normalized);
     }
-    let norm_ms = t_norm.elapsed().as_secs_f64() * 1000.0;
     
     // Expand aliases
-    let t_expand = Instant::now();
-    let original_tokens = if let Some(ref text) = req.query_text {
-        crate::nl::tokenize_to_cues(text)
+    let expanded_cues = if req.disable_alias_expansion {
+        normalized_cues.into_iter().map(|c| (c, 1.0)).collect()
     } else {
-        req.cues.clone()
+        let original_tokens = if req.query_text.is_some() {
+            tokens_from_text // Reuse tokens computed earlier
+        } else {
+            req.cues.clone()
+        };
+        ctx.expand_query_cues(normalized_cues, &original_tokens)
     };
-    let expanded_cues = ctx.expand_query_cues(normalized_cues, &original_tokens);
-    let expand_ms = t_expand.elapsed().as_secs_f64() * 1000.0;
-    
-    let t_search = Instant::now();
 
     let results = {
         let heatmap = ctx.market_heatmap.read().ok();
@@ -700,25 +704,9 @@ async fn recall(
             heatmap_ref
         )
     }; 
-
-    let search_ms = t_search.elapsed().as_secs_f64() * 1000.0;
     
-    let elapsed = start.elapsed();
-    
+    let elapsed = start.elapsed();    
     let engine_latency_ms = elapsed.as_secs_f64() * 1000.0;
-    
-    tracing::debug!(
-        "Recall breakdown: lex={:.2}ms norm={:.2}ms expand={:.2}ms search={:.2}ms | cues={} expanded={}",
-        lex_ms, norm_ms, expand_ms, search_ms, cues_to_process.len(), expanded_cues.len()
-    );
-    
-    tracing::debug!(
-        "POST /recall project={} cues={} results={} latency={:.2}ms",
-        project_id,
-        cues_to_process.len(),
-        results.len(),
-        engine_latency_ms
-    );
     
     // Async reinforcement via background job (doesn't block response)
     if req.auto_reinforce && !results.is_empty() {
@@ -957,14 +945,19 @@ async fn recall_grounded(
         };
         
         // 1. Standard CueMap Recall
-        let (resolved, _lexicon_memory_ids) = ctx.resolve_cues_from_text(&req.query_text, false);
+        let (resolved, _lexicon_memory_ids, tokens) = ctx.resolve_cues_from_text(&req.query_text, false);
         let mut normalized_cues = Vec::new();
         for cue in &resolved {
             let (normalized, _) = crate::normalization::normalize_cue(cue, &ctx.normalization);
             normalized_cues.push(normalized);
         }
-        let original_tokens = crate::nl::tokenize_to_cues(&req.query_text);
-        let expanded_cues = ctx.expand_query_cues(normalized_cues, &original_tokens);
+
+        let expanded_cues = if req.disable_alias_expansion {
+            normalized_cues.into_iter().map(|c| (c, 1.0)).collect()
+        } else {
+            // tokens were computed in step 1, reuse them!
+            ctx.expand_query_cues(normalized_cues, &tokens)
+        };
         
         let heatmap = ctx.market_heatmap.read().ok();
         let heatmap_ref = heatmap.as_deref();

@@ -270,6 +270,9 @@ struct RecallArgs {
     /// Disable systems consolidation (long-term memory integration)
     #[arg(long)]
     disable_systems_consolidation: bool,
+    /// Enable alias expansion (default: disabled)
+    #[arg(long)]
+    enable_alias_expansion: bool,
     /// Enable grounded recall (RAG context)
     #[arg(short, long)]
     grounded: bool,
@@ -872,6 +875,7 @@ async fn handle_recall(args: RecallArgs) {
             disable_salience_bias: args.disable_salience_bias,
             disable_systems_consolidation: args.disable_systems_consolidation,
             min_intersection: args.min_intersection,
+            disable_alias_expansion: !args.enable_alias_expansion,
         };
         let res = client.post(format!("{}/recall/grounded", args.url))
             .header("X-Project-ID", project)
@@ -934,6 +938,7 @@ async fn handle_recall(args: RecallArgs) {
             disable_pattern_completion: args.disable_pattern_completion,
             disable_salience_bias: args.disable_salience_bias,
             disable_systems_consolidation: args.disable_systems_consolidation,
+            disable_alias_expansion: !args.enable_alias_expansion,
         };
         let res = client.post(format!("{}/recall", args.url))
             .header("X-Project-ID", project)

@@ -10,12 +10,13 @@ use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::Value;
+use ahash::RandomState;
 
 pub struct ProjectContext {
     pub main: CueMapEngine<MainStats>,
     pub aliases: CueMapEngine<MainStats>,
     pub lexicon: CueMapEngine<LexiconStats>,
-    pub query_cache: DashMap<String, Vec<String>>,
+    pub query_cache: DashMap<String, Vec<String>, RandomState>,
     pub normalization: NormalizationConfig,
     pub taxonomy: Taxonomy,
     pub cuegen_strategy: CueGenStrategy,
@@ -31,7 +32,7 @@ impl ProjectContext {
             main: CueMapEngine::new(),
             aliases: CueMapEngine::new(),
             lexicon: CueMapEngine::new(),
-            query_cache: DashMap::new(),
+            query_cache: DashMap::with_hasher(RandomState::new()),
             normalization,
             taxonomy,
             cuegen_strategy,
@@ -77,35 +78,36 @@ impl ProjectContext {
     /// - Tokenization
     /// - Normalization
     /// - Taxonomy validation
-    pub fn resolve_cues_from_text(&self, text: &str, skip_lexicon: bool) -> (Vec<String>, Vec<String>) {
+    pub fn resolve_cues_from_text(&self, text: &str, skip_lexicon: bool) -> (Vec<String>, Vec<String>, Vec<String>) {
         self.resolve_cues_from_text_with_lang(text, skip_lexicon, crate::nl::Language::Default)
     }
 
-    pub fn resolve_cues_from_text_with_lang(&self, text: &str, skip_lexicon: bool, lang: crate::nl::Language) -> (Vec<String>, Vec<String>) {
+    pub fn resolve_cues_from_text_with_lang(&self, text: &str, skip_lexicon: bool, lang: crate::nl::Language) -> (Vec<String>, Vec<String>, Vec<String>) {
         use std::time::Instant;
         let t_start = Instant::now();
         
+        // Tokenize first - we need tokens for return value regardless of cache
+        let t_tok = Instant::now();
+        let tokens = crate::nl::tokenize_to_cues_with_lang(text, lang);
+        let tok_ms = t_tok.elapsed().as_secs_f64() * 1000.0;
+
+        if tokens.is_empty() {
+            return (Vec::new(), Vec::new(), Vec::new());
+        }
+
         let normalized_text = if lang == crate::nl::Language::Default {
             crate::nl::normalize_text(text)
         } else {
-            // Include language tag in cache key to avoid collisions between languages with same text but different stopwords
+            // Include language tag in cache key to avoid collisions
             format!("{:?}:{}", lang, crate::nl::normalize_text(text))
         };
         
         // Check cache (cache only stores cues, not memory IDs) - skip if lexicon disabled
         if !skip_lexicon {
             if let Some(cues) = self.query_cache.get(&normalized_text) {
-                return (cues.clone(), Vec::new());  // No memory IDs from cache
+                // Return cached cues, empty memory IDs, and the raw tokens we just computed
+                return (cues.clone(), Vec::new(), tokens);
             }
-        }
-        
-        // Tokenize
-        let t_tok = Instant::now();
-        let tokens = crate::nl::tokenize_to_cues_with_lang(text, lang);
-        let tok_ms = t_tok.elapsed().as_secs_f64() * 1000.0;
-        
-        if tokens.is_empty() {
-            return (Vec::new(), Vec::new());
         }
         
         let t_lex = Instant::now();
@@ -165,7 +167,7 @@ impl ProjectContext {
             self.query_cache.insert(normalized_text, accepted.clone());
         }
         
-        (accepted, lexicon_memory_ids)
+        (accepted, lexicon_memory_ids, tokens)
     }
     
     pub fn expand_query_cues(&self, cues: Vec<String>, original_tokens: &[String]) -> Vec<(String, f64)> {
@@ -226,13 +228,13 @@ impl ProjectContext {
 }
 
 pub struct ProjectStore {
-    pub projects: DashMap<String, Arc<ProjectContext>>,
+    pub projects: DashMap<String, Arc<ProjectContext>, RandomState>,
 }
 
 impl ProjectStore {
     pub fn new() -> Self {
         Self {
-            projects: DashMap::new(),
+            projects: DashMap::with_hasher(RandomState::new()),
         }
     }
 
