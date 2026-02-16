@@ -44,7 +44,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy binary from builder
-COPY --from=builder /build/target/release/cuemap-rust /app/cuemap-rust
+COPY --from=builder /build/target/release/cuemap /app/cuemap
 # Copy tokenizer and assets to ASSETS directory (separate from data volume)
 COPY --from=builder /build/en_tokenizer.bin /app/assets/en_tokenizer.bin
 COPY data /app/assets
@@ -68,4 +68,4 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8080/ || exit 1
 
 # Run the binary
-CMD ["/app/cuemap-rust", "--port", "8080", "--data-dir", "/app/data", "--assets-dir", "/app/assets", "--snapshot-interval", "60"]
+CMD ["/app/cuemap", "--port", "8080", "--data-dir", "/app/data", "--assets-dir", "/app/assets", "--snapshot-interval", "60"]
