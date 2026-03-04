@@ -1,4 +1,5 @@
 use crate::structures::{Memory, OrderedSet, MainStats, LexiconStats, MemoryStats};
+use crate::config::TuningConfig;
 use crate::crypto::EncryptionKey;
 use dashmap::DashMap;
 use serde::{Serialize, Deserialize};
@@ -57,6 +58,7 @@ where
     memory_count: Arc<AtomicUsize>,
     cue_count: Arc<AtomicUsize>,
     master_key: Option<Arc<EncryptionKey>>,
+    tuning: Arc<TuningConfig>,
 }
 
 
@@ -74,7 +76,14 @@ where
             memory_count: Arc::new(AtomicUsize::new(0)),
             cue_count: Arc::new(AtomicUsize::new(0)),
             master_key: None,
+            tuning: Arc::new(TuningConfig::default()),
         }
+    }
+
+    pub fn with_tuning(tuning: TuningConfig) -> Self {
+        let mut engine = Self::new();
+        engine.tuning = Arc::new(tuning);
+        engine
     }
 
     pub fn with_key(key: Option<EncryptionKey>) -> Self {
@@ -85,6 +94,10 @@ where
 
     pub fn set_master_key(&mut self, key: Option<Arc<EncryptionKey>>) {
         self.master_key = key;
+    }
+
+    pub fn set_tuning_config(&mut self, tuning: TuningConfig) {
+        self.tuning = Arc::new(tuning);
     }
 
     pub fn get_master_key(&self) -> Option<Arc<EncryptionKey>> {
@@ -105,8 +118,9 @@ where
             cue_co_occurrence: Arc::new(DashMap::with_hasher(RandomState::new())), 
             last_events: Arc::new(DashMap::with_hasher(RandomState::new())),
             memory_count: Arc::new(AtomicUsize::new(count)),
-            cue_count: Arc::new(AtomicUsize::new(cue_count_val)),
+            cue_count: Arc::new(AtomicUsize::new(0)), // Cues will be lazy counted or we need to pass it
             master_key: None,
+            tuning: Arc::new(TuningConfig::default()),
         };
 
 
@@ -868,7 +882,7 @@ where
                 // making it much more aggressive at demoting high-frequency cues.
                 // e.g. at df=40% of corpus: old formula gave 0.91, BM25 gives 0.40
                 let df = ordered_set.len() as f64;
-                let idf = ((total_memories - df + 0.5) / (df + 0.5)).ln().max(0.1);
+                let idf = ((total_memories - df + 0.5) / (df + 0.5)).ln().max(self.tuning.idf_threshold_percent);
                 let adjusted_weight = weight * idf;
                 
                 cue_data.push((cue.clone(), adjusted_weight, ordered_set));
@@ -885,8 +899,8 @@ where
 
         // OPTIMIZATION 2: Adaptive scan limit based on requested limit
         // For limit=5, we don't need to scan 10k items per cue
-        // Scale: limit * 100, capped at 2000 for safety
-        let adaptive_scan_limit = (limit * 100).min(2000);
+        // Scale: limit * factor, capped at max for safety
+        let adaptive_scan_limit = (limit * self.tuning.adaptive_scan_factor).min(self.tuning.adaptive_scan_max);
 
         // 2. Perform Union-based search with O(1) Probing
         let mut candidates = Vec::new();
@@ -942,8 +956,8 @@ where
         disable_systems_consolidation: bool,
         heatmap: Option<&HashMap<String, f32>>
     ) -> Vec<ScoredMemoryCandidate> {
-        const MAX_REC_WEIGHT: f64 = 20.0;
-        const MAX_FREQ_WEIGHT: f64 = 5.0;
+        let max_rec_weight = self.tuning.max_rec_weight;
+        let max_freq_weight = self.tuning.max_freq_weight;
         
         let mut results = Vec::with_capacity(candidates.len());
         
@@ -965,8 +979,8 @@ where
                     let sigma = list_len_f64.sqrt();
                     let ratio = pos_f64 / sigma;
                     
-                    let w_rec = MAX_REC_WEIGHT / (ratio + 1.0);
-                    let w_freq = 1.0 + (MAX_FREQ_WEIGHT * (1.0 - (1.0 / (ratio + 1.0))));
+                    let w_rec = max_rec_weight / (ratio + 1.0);
+                    let w_freq = 1.0 + (max_freq_weight * (1.0 - (1.0 / (ratio + 1.0))));
                     
                     let recency_component = 1.0 / (pos_f64 + 1.0);
                     
@@ -1003,11 +1017,11 @@ where
                     (eff + lift, eff, lift)
                 };
                 
-                let intersection_score = total_weight * 100.0;
+                let intersection_score = total_weight * self.tuning.intersection_score_multiplier;
                 
                 // Final score includes salience
                 // We use salience_score (Effective + Market) here
-                let score = intersection_score + (recency_score * avg_w_rec) + (frequency_score * avg_w_freq) + (_salience_score * 10.0);
+                let score = intersection_score + (recency_score * avg_w_rec) + (frequency_score * avg_w_freq) + (_salience_score * self.tuning.salience_score_multiplier);
                 
                 // Match integrity calculation
                 // 1. Intersection strength (relative to match count)

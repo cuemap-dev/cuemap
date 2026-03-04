@@ -122,9 +122,10 @@ impl GroundingEngine {
         let mut block = String::from("[VERIFIED CONTEXT]\n");
         for (idx, item) in selected.iter().enumerate() {
             block.push_str(&format!(
-                "({}) {} (source={}, score={:.2}, ts={})\n",
+                "({}) {} (source={}, id={}, score={:.2}, ts={})\n",
                 idx + 1,
                 item.content,
+                item.source,
                 item.memory_id,
                 item.score,
                 item.timestamp

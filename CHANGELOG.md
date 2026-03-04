@@ -2,6 +2,23 @@
 
 All notable changes to the CueMap Rust Engine will be documented in this file.
 
+## [0.6.4] - 2026-03-04
+
+### Added
+- **Configuration System**: Unified `server_config.toml` with layered loading (CLI > Env > Config > Profiles).
+- **Tuning Config**: Centralized engine tuning parameters (scoring, search, expansion) in `[tuning]` section.
+- **Project Watch Dir**: `set-watch-dir` command to configure agent watch directories per project.
+- **Multi-Hop Recall**: `depth` parameter in recall requests to enable multi-hop associative retrieval.
+
+### Security
+- **Dynamic Signing Key**: `CryptoEngine` now loads `CUEMAP_SECRET_KEY` from environment for signing grounded recall.
+- **Per-Install Salt**: Implemented secure, per-install salt generation for PBKDF2 key derivation.
+- **Grounded Recall Fix**: Corrected `source` field formatting in grounded recall context blocks.
+
+### Changed
+- **Ollama Setup**: Removed automatic installation of Ollama via Homebrew. Users must now install Ollama manually if they wish to use it.
+
+
 ## [0.6.3] - 2026-02-14
 
 ### Added

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::engine::CueMapEngine;
 use crate::normalization::NormalizationConfig;
 use crate::taxonomy::Taxonomy;
-use crate::config::CueGenStrategy;
+use crate::config::{CueGenStrategy, TuningConfig, LlmConfig};
 use crate::semantic::SemanticEngine;
 use dashmap::DashMap;
 use std::sync::{Arc, RwLock};
@@ -24,14 +24,16 @@ pub struct ProjectContext {
     pub last_activity: AtomicU64,
     // Shared Context (holds top 10k cues)
     pub market_heatmap: Arc<RwLock<HashMap<String, f32>>>,
+    pub tuning: Arc<TuningConfig>,
+    pub llm_config: Arc<LlmConfig>,
 }
 
 impl ProjectContext {
-    pub fn new(normalization: NormalizationConfig, taxonomy: Taxonomy, cuegen_strategy: CueGenStrategy, semantic_engine: SemanticEngine) -> Self {
+    pub fn new(normalization: NormalizationConfig, taxonomy: Taxonomy, cuegen_strategy: CueGenStrategy, semantic_engine: SemanticEngine, tuning: Arc<TuningConfig>, llm_config: Arc<LlmConfig>) -> Self {
         Self {
-            main: CueMapEngine::new(),
-            aliases: CueMapEngine::new(),
-            lexicon: CueMapEngine::new(),
+            main: CueMapEngine::with_tuning(tuning.as_ref().clone()),
+            aliases: CueMapEngine::with_tuning(tuning.as_ref().clone()),
+            lexicon: CueMapEngine::with_tuning(tuning.as_ref().clone()),
             query_cache: DashMap::with_hasher(RandomState::new()),
             normalization,
             taxonomy,
@@ -44,6 +46,8 @@ impl ProjectContext {
                     .as_secs()
             ),
             market_heatmap: Arc::new(RwLock::new(HashMap::new())),
+            tuning,
+            llm_config,
         }
     }
     
@@ -249,6 +253,8 @@ impl ProjectStore {
             Taxonomy::default(),
             CueGenStrategy::default(),
             SemanticEngine::new(None),
+            Arc::new(TuningConfig::default()),
+            Arc::new(LlmConfig::default()),
         ));
 
         self.projects.insert(project_id.to_string(), ctx.clone());

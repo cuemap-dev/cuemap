@@ -8,6 +8,7 @@ use axum::{
 use std::collections::HashSet;
 use std::env;
 use tracing::info;
+use crate::config::SecurityConfig;
 
 #[derive(Clone)]
 pub struct AuthConfig {
@@ -17,9 +18,20 @@ pub struct AuthConfig {
 
 impl AuthConfig {
     pub fn new() -> Self {
+        Self::from_config(&SecurityConfig::default())
+    }
+
+    pub fn from_config(config: &SecurityConfig) -> Self {
         let mut api_keys = HashSet::new();
         
-        // Load API keys from environment
+        // Load keys from config
+        for key in &config.api_keys {
+             if !key.is_empty() {
+                 api_keys.insert(key.clone());
+             }
+        }
+        
+        // Load API keys from environment (Migration/Compat)
         if let Ok(keys_str) = env::var("CUEMAP_API_KEYS") {
             for key in keys_str.split(',') {
                 let key = key.trim();
@@ -37,12 +49,12 @@ impl AuthConfig {
             }
         }
         
-        let require_auth = !api_keys.is_empty();
+        let require_auth = config.require_auth || !api_keys.is_empty();
         
         if require_auth {
             info!("Authentication enabled ({} API keys configured)", api_keys.len());
         } else {
-            info!("Authentication disabled (no API keys configured)");
+            info!("Authentication disabled");
         }
         
         Self {

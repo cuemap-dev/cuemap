@@ -7,7 +7,7 @@ use crate::projects::ProjectContext;
 use crate::crypto::EncryptionKey;
 use crate::normalization::NormalizationConfig;
 use crate::taxonomy::Taxonomy;
-use crate::config::CueGenStrategy;
+use crate::config::{CueGenStrategy, TuningConfig, LlmConfig};
 use std::collections::HashMap;
 use crate::semantic::SemanticEngine;
 use dashmap::DashMap;
@@ -30,6 +30,28 @@ pub struct ProjectStats {
     pub last_activity: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectMeta {
+    pub project_id: ProjectId,
+    pub created_at: u64,
+    pub watch_dir: Option<String>,
+    pub agent_enabled: bool,
+}
+
+impl ProjectMeta {
+    pub fn new(project_id: ProjectId) -> Self {
+        Self {
+            project_id,
+            created_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            watch_dir: None,
+            agent_enabled: false,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct MultiTenantEngine {
     projects: Arc<DashMap<ProjectId, Arc<ProjectContext>, RandomState>>,
@@ -37,15 +59,17 @@ pub struct MultiTenantEngine {
     cuegen_strategy: CueGenStrategy,
     semantic_engine: SemanticEngine,
     master_key: Option<Arc<EncryptionKey>>,
+    tuning: Arc<TuningConfig>,
+    llm_config: Arc<LlmConfig>,
 }
 
 impl MultiTenantEngine {
     #[allow(dead_code)]
     pub fn new(cuegen_strategy: CueGenStrategy, semantic_engine: SemanticEngine) -> Self {
-        Self::with_snapshots_dir("./snapshots", cuegen_strategy, semantic_engine)
+        Self::with_snapshots_dir("./snapshots", cuegen_strategy, semantic_engine, TuningConfig::default(), LlmConfig::default())
     }
     
-    pub fn with_snapshots_dir<P: AsRef<Path>>(dir: P, cuegen_strategy: CueGenStrategy, semantic_engine: SemanticEngine) -> Self {
+    pub fn with_snapshots_dir<P: AsRef<Path>>(dir: P, cuegen_strategy: CueGenStrategy, semantic_engine: SemanticEngine, tuning: TuningConfig, llm_config: LlmConfig) -> Self {
         let snapshots_dir = dir.as_ref().to_path_buf();
         
         // Create snapshots directory if it doesn't exist
@@ -59,6 +83,8 @@ impl MultiTenantEngine {
             cuegen_strategy,
             semantic_engine,
             master_key: None,
+            tuning: Arc::new(tuning),
+            llm_config: Arc::new(llm_config),
         }
     }
 
@@ -79,6 +105,8 @@ impl MultiTenantEngine {
                 Taxonomy::default(),
                 self.cuegen_strategy.clone(),
                 self.semantic_engine.clone(),
+                self.tuning.clone(),
+                self.llm_config.clone(),
             );
             
             // Set master key on engines
@@ -87,7 +115,13 @@ impl MultiTenantEngine {
             ctx_obj.lexicon.set_master_key(self.master_key.clone());
             
             let ctx = Arc::new(ctx_obj);
-            self.projects.insert(project_id, ctx.clone());
+            self.projects.insert(project_id.clone(), ctx.clone());
+            
+            // Ensure meta exists
+            if let Ok(meta) = self.load_project_meta(&project_id) {
+                let _ = self.save_project_meta(&meta);
+            }
+            
             Ok(ctx)
         }
     }
@@ -193,6 +227,7 @@ impl MultiTenantEngine {
             .map_err(|e| format!("Failed to load main engine: {}", e))?;
         let mut main_engine = CueMapEngine::from_state(memories, cue_index);
         main_engine.set_master_key(self.master_key.clone());
+        main_engine.set_tuning_config(self.tuning.as_ref().clone());
         
         // Load aliases engine (optional - may not exist for older snapshots)
         let mut aliases_engine = if aliases_path.exists() {
@@ -210,6 +245,7 @@ impl MultiTenantEngine {
             CueMapEngine::new()
         };
         aliases_engine.set_master_key(self.master_key.clone());
+        aliases_engine.set_tuning_config(self.tuning.as_ref().clone());
         
         // Load lexicon engine (optional - may not exist for older snapshots)
         let mut lexicon_engine = if lexicon_path.exists() {
@@ -227,6 +263,7 @@ impl MultiTenantEngine {
             CueMapEngine::new()
         };
         lexicon_engine.set_master_key(self.master_key.clone());
+        lexicon_engine.set_tuning_config(self.tuning.as_ref().clone());
         
         let ctx = Arc::new(ProjectContext {
             main: main_engine,
@@ -244,6 +281,8 @@ impl MultiTenantEngine {
                     .as_secs()
             ),
             market_heatmap: Arc::new(RwLock::new(HashMap::new())),
+            tuning: self.tuning.clone(),
+            llm_config: self.llm_config.clone(),
         });
         
         self.projects.insert(project_id.clone(), ctx.clone());
@@ -290,7 +329,57 @@ impl MultiTenantEngine {
     #[allow(dead_code)]
     pub fn delete_snapshot(&self, project_id: &ProjectId) -> Result<(), String> {
         let snapshot_path = self.snapshots_dir.join(format!("{}.bin", project_id));
+        let meta_path = self.snapshots_dir.join(format!("{}.meta.json", project_id));
+        
+        // Try to delete meta if exists
+        if meta_path.exists() {
+             let _ = fs::remove_file(meta_path);
+        }
+
         PersistenceManager::delete_snapshot(&snapshot_path)
+    }
+
+    /// Load project metadata
+    pub fn load_project_meta(&self, project_id: &ProjectId) -> Result<ProjectMeta, String> {
+        let meta_path = self.snapshots_dir.join(format!("{}.meta.json", project_id));
+        if meta_path.exists() {
+            let content = fs::read_to_string(&meta_path).map_err(|e| e.to_string())?;
+            let meta: ProjectMeta = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+            Ok(meta)
+        } else {
+            // Return default if not found (legacy projects)
+            Ok(ProjectMeta::new(project_id.clone()))
+        }
+    }
+
+    /// Save project metadata
+    pub fn save_project_meta(&self, meta: &ProjectMeta) -> Result<(), String> {
+        let meta_path = self.snapshots_dir.join(format!("{}.meta.json", meta.project_id));
+        let content = serde_json::to_string_pretty(meta).map_err(|e| e.to_string())?;
+        fs::write(meta_path, content).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Set watch directory for a project
+    pub fn set_project_watch_dir(&self, project_id: &str, watch_dir: Option<String>) -> Result<(), String> {
+        // Validation
+        if let Some(dir) = &watch_dir {
+            let path = Path::new(dir);
+            if !path.exists() {
+                return Err(format!("Directory '{}' does not exist", dir));
+            }
+        }
+
+        // Get current meta
+        let mut meta = self.load_project_meta(&project_id.to_string())?;
+        
+        meta.watch_dir = watch_dir;
+        // Auto-enable agent if watch dir is set
+        meta.agent_enabled = meta.watch_dir.is_some();
+        
+        self.save_project_meta(&meta)?;
+        
+        Ok(())
     }
     
     pub fn get_global_stats(&self) -> HashMap<String, serde_json::Value> {

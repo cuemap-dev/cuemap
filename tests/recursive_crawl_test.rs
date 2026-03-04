@@ -4,7 +4,7 @@ use cuemap::agent::AgentConfig;
 use cuemap::jobs::{JobQueue, JobProgress, IngestionPhase};
 use cuemap::multi_tenant::MultiTenantEngine;
 use cuemap::config::CueGenStrategy;
-use cuemap_rust::semantic::SemanticEngine;
+use cuemap::semantic::SemanticEngine;
 use std::sync::Arc;
 
 /// Test basic URL chunking (single page, no recursion)
@@ -14,7 +14,7 @@ async fn test_single_url_chunking() {
     // Use a simple, stable page for testing
     let test_url = "https://example.com";
     
-    let result = Chunker::chunk_url(test_url).await;
+    let result = Chunker::chunk_url(test_url, false).await;
     
     match result {
         Ok(chunks) => {
@@ -53,11 +53,13 @@ async fn test_recursive_crawl_depth_1() {
     // Create a minimal engine for testing
     let semantic_engine = SemanticEngine::new(None);
     let engine = Arc::new(MultiTenantEngine::new(CueGenStrategy::Default, semantic_engine));
-    let job_queue = Arc::new(JobQueue::new(engine.clone(), true)); // Disable bg jobs for testing
+    let job_queue = Arc::new(JobQueue::new(engine.clone(), None, true)); // Disable bg jobs for testing
     
     let config = AgentConfig {
+        project_id: "test-project".to_string(),
         watch_dir: String::new(),
         throttle_ms: 100, // Throttle to be polite
+        state_file: None,
     };
     
     let mut ingester = Ingester::new(config, job_queue.clone());
@@ -123,11 +125,13 @@ async fn test_job_phase_ordering() {
     
     let semantic_engine = SemanticEngine::new(None);
     let engine = Arc::new(MultiTenantEngine::new(CueGenStrategy::Default, semantic_engine));
-    let job_queue = Arc::new(JobQueue::new(engine.clone(), true));
+    let job_queue = Arc::new(JobQueue::new(engine.clone(), None, true));
     
     let config = AgentConfig {
+        project_id: "phase-test".to_string(),
         watch_dir: String::new(),
         throttle_ms: 0,
+        state_file: None,
     };
     
     let mut ingester = Ingester::new(config, job_queue.clone());

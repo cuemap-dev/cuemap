@@ -1,5 +1,6 @@
 use cuemap::persistence::PersistenceManager;
 use cuemap::engine::CueMapEngine;
+use cuemap::structures::MainStats;
 use std::path::PathBuf;
 use std::fs;
 
@@ -11,13 +12,13 @@ fn test_fixture_loading_and_recall() {
     {
         // Scope to drop engine
         let engine = CueMapEngine::new();
-        engine.add_memory("Test Content".to_string(), vec!["test_cue".to_string()], None, false);
+        engine.add_memory("Test Content".to_string(), vec!["test_cue".to_string()], None, MainStats::default(), false);
         PersistenceManager::save_to_path(&engine, &fixture_path).expect("Failed to save fixture");
     }
     
     // 2. Load it back
-    let (memories, cue_index) = PersistenceManager::load_from_path(&fixture_path).expect("Failed to load fixture");
-    let loaded_engine = CueMapEngine::from_state(memories, cue_index);
+    let (memories, cue_index) = PersistenceManager::load_from_path::<MainStats>(&fixture_path).expect("Failed to load fixture");
+    let loaded_engine = CueMapEngine::<MainStats>::from_state(memories, cue_index);
     
     // 3. Verify state
     assert_eq!(loaded_engine.get_memories().len(), 1);

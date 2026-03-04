@@ -81,23 +81,23 @@ pub fn decrypt(data: &[u8], key: &EncryptionKey) -> Result<Vec<u8>, String> {
 }
 
 /// Helper struct for signing context (used by Grounded Recall)
-pub struct CryptoEngine;
+pub struct CryptoEngine {
+    secret: Vec<u8>,
+}
 
 impl CryptoEngine {
-    pub fn new() -> Self {
-        Self
+    pub fn new(secret: Vec<u8>) -> Self {
+        Self { secret }
     }
 
-    /// Sign data using HMAC-SHA256 with a compiled-in secret
+    /// Sign data using HMAC-SHA256 with the provided secret
     pub fn sign(&self, data: &str) -> String {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
         
         type HmacSha256 = Hmac<Sha256>;
         
-        // Use a static secret for context signing proof
-        let secret = b"cuemap-context-signature-secret-v1";
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(secret).expect("HMAC can take key of any size");
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(&self.secret).expect("HMAC can take key of any size");
         mac.update(data.as_bytes());
         let result = mac.finalize();
         hex::encode(result.into_bytes())

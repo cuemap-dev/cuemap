@@ -65,6 +65,7 @@ cuemap <COMMAND> [OPTIONS]
 - **`ingest`**: Ingest data from files or URLs.
 - **`projects`**: Create and list projects.
 - **`set-project`**: Set the default project for the current session.
+- **`set-watch-dir`**: Set a watch directory for a project (enables agent).
 
 #### Knowledge Graph
 - **`lexicon`**: Inspect lexicon entries and wire/unwire cues.
@@ -102,6 +103,16 @@ cd web_ui && npm run dev
 
 The Vite config proxies all API requests to the engine on port 8080.
 
+## Configuration
+
+CueMap uses a layered configuration system that prioritizes settings in the following order:
+**CLI Args** > **Env Vars** > **`server_config.toml`** > **Defaults**.
+
+This system allows you to:
+1.  **Centralize Settings**: Manage server options, security keys, and engine tuning in `~/.cuemap/server_config.toml`.
+2.  **Fine-Tune Performance**: Adjust critical engine parameters like scoring weights, search depth, and expansion thresholds via the `[tuning]` section without recompiling.
+3.  **Manage Project Context**: Use `set-watch-dir` to persist project-specific settings (like agent watch paths) in `.meta.json` files alongside your data.
+
 ## Self-Learning Agent (Zero-Friction Ingestion)
 
 CueMap includes a **Self-Learning Agent** that automatically watches local directories, extracts structured "facts", and ingests them into your memory store.
@@ -123,6 +134,40 @@ On startup, if `--agent-dir` is provided, CueMap initializes the **Self-Learning
 #    - Extracts headers, keys, and metadata as grounded structural cues, in addition to cues inferred from content.
 # 3. Immediate ingestion into the memory store. 
 ```
+
+## AI Agent Integration (MCP Server)
+
+CueMap provides a native Model Context Protocol (MCP) server, allowing AI coding assistants (like Claude Desktop, Cursor, and Windsurf) to instantly recall codebase context using the engine.
+
+### Setup
+
+The MCP Server is located in the `mcp-server` directory and depends on Node.js.
+
+1. Build the MCP Server:
+```bash
+cd mcp-server
+npm install
+npm run build
+```
+
+2. Add the MCP server to your AI agent's configuration:
+```json
+{
+  "mcpServers": {
+    "cuemap": {
+      "command": "node",
+      "args": [
+        "/absolute/path/to/cuemap/mcp-server/build/index.js"
+      ],
+      "env": {
+        "CUEMAP_URL": "http://localhost:8080"
+      }
+    }
+  }
+}
+```
+
+3. Ensure the CueMap rust engine is running (`cargo run -- start`). The AI Agent can now use the `cuemap_recall` tool to query your codebase memories.
 
 ## Project Management & Persistence
 
@@ -276,7 +321,7 @@ docker run -p 8080:8080 -v $(pwd)/local_snapshot_dir:/app/data \
 
 CueMap supports **encryption-at-rest** for all memory content using modern authenticated encryption.
 
-- **Algorithm**: XChaCha20-Poly1305 (via `chacha20poly1305` crate).
+- **Algorithm**: ChaCha20-Poly1305 (IETF) (via `chacha20poly1305` crate).
 - **Key Derivation**: PBKDF2-HMAC-SHA256 with 100,000 iterations to derive a 32-byte key from a user passphrase.
 - **Nonce**: A random 12-byte nonce is generated for every memory encryption operation and stored alongside the ciphertext.
 - **Zero-Knowledge**: The engine does not persist the master key to disk; it must be provided at startup (via env var or prompt) and is kept only in RAM.
@@ -397,7 +442,8 @@ curl -X POST http://localhost:8080/recall \
   -H "Content-Type: application/json" \
   -d '{
     "cues": ["api", "rate_limit"],
-    "limit": 10
+    "limit": 10,
+    "depth": 2
   }'
 ```
 
@@ -1056,8 +1102,14 @@ Every recall result now includes a **Match Integrity** score. This internal diag
 #### Semantic Bootstrapping (WordNet)
 To bridge the gap between user queries and stored memories, CueMap integrates **WordNet** lookups during cue generation. This allows the engine to propose synonym-rich cues, ensuring that a memory tagged with "payment" is retrievable via "transaction" or "billing".
 
+#### Multi-Hop Recall (Depth)
+Iteratively expands contextual reach by using the top retrieved memories from an initial recall as pivot points to discover deeper associations, all seamlessly orchestrated in a single request via the `depth` parameter while automatically mitigating context drift.
+
 ## License
 
-AGPLv3 - See LICENSE for details
+BSL-1.1 (Business Source License 1.1) converting to Apache 2.0 after 4 years.
+See `LICENSE` for details.
 
-For commercial licensing (closed-source SaaS), contact: hello@cuemap.dev
+This allows full use for development, testing, and self-hosting, while preventing the software from being offered as a competing managed Database Service.
+
+For commercial licensing (closed-source SaaS or offering as a service), contact: hello@cuemap.dev

@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use cuemap::engine::CueMapEngine;
+    use cuemap::structures::MainStats;
     use std::collections::HashMap;
 
     #[test]
@@ -12,6 +13,7 @@ mod tests {
             "Function definition content".to_string(),
             vec!["type:function".to_string(), "name:ComputeTax".to_string()],
             None,
+            MainStats::default(),
             false
         );
         
@@ -37,6 +39,7 @@ mod tests {
             "Specific content".to_string(),
             vec!["category:secret".to_string()],
             None,
+            MainStats::default(),
             false
         );
 

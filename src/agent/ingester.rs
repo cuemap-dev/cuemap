@@ -217,7 +217,7 @@ impl Ingester {
         let chunks = Chunker::chunk_file(&path, content_str.as_deref().unwrap_or(""));
         
         // 4. Send to Job Queue
-        let project_id = "main".to_string();
+        let project_id = self.config.project_id.clone();
         let mut valid_memory_ids = Vec::new();
         
         let session = self.job_queue.session_manager.get_or_create(&project_id);
@@ -314,7 +314,7 @@ impl Ingester {
                 self.memory_hashes.remove(&m_id);
                 // Explicitly delete from engine
                 self.job_queue.enqueue(Job::DeleteMemory {
-                    project_id: "main".to_string(),
+                    project_id: self.config.project_id.clone(),
                     memory_id: m_id,
                 }).await;
             }

@@ -14,6 +14,14 @@ use rayon::prelude::*;
 use smallvec::SmallVec;
 use uuid::Uuid;
 
+// Alias Job Constants
+pub const ALIAS_MIN_CUE_MEMORIES: usize = 3;
+pub const ALIAS_MAX_CUE_MEMORIES: usize = 5000;
+pub const ALIAS_MAX_CANDIDATES: usize = 500;
+pub const ALIAS_SAMPLE_SIZE: usize = 50;
+pub const ALIAS_SIZE_SIMILARITY_MAX_RATIO: f64 = 0.5;
+pub const ALIAS_OVERLAP_THRESHOLD: f64 = 0.65;
+
 #[derive(Debug)]
 pub enum Job {
     ProposeCues { project_id: String, memory_id: String, content: String },
@@ -683,8 +691,8 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>, metrics: &Op
                  
                  // IDF Filtering: Identify expansion candidates (rare cues only)
                  let total = ctx.total_memories();
-                 // Threshold: 10% of corpus, minimum 20 memories.
-                 let threshold = (total as f64 * 0.1).max(20.0) as usize;
+                 // Threshold: % of corpus, minimum count.
+                 let threshold = (total as f64 * ctx.tuning.idf_threshold_percent).max(ctx.tuning.idf_min_count as f64) as usize;
 
                  // PERF/QUALITY: Use raw tokens for expansion to avoid Lexicon Pollution loop.
                  // We only expand what is explicitly in the content.
@@ -697,8 +705,10 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>, metrics: &Op
                  
                  
                  // 3. Static Semantic Expansion (Always on - WordNet)
-                 let wn_result = ctx.semantic_engine.expand_wordnet(&content, &expansion_candidates, 0.65, 3);
-                 wordnet_cues.extend(wn_result);
+                 if ctx.tuning.expansion_threshold > 0.0 {
+                     let wn_result = ctx.semantic_engine.expand_wordnet(&content, &expansion_candidates, ctx.tuning.expansion_threshold as f32, ctx.tuning.expansion_limit);
+                     wordnet_cues.extend(wn_result);
+                 }
                  
                 // 4. Strategy Specific Expansion
                 match ctx.cuegen_strategy {
@@ -717,12 +727,16 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>, metrics: &Op
                     },
                      CueGenStrategy::Ollama => {
                          // LLM Expansion
-                         if let Some(config) = LlmConfig::from_strategy(&ctx.cuegen_strategy) {
+                         // Use global config or fallback if enabled
+                         if ctx.llm_config.enabled || matches!(ctx.cuegen_strategy, CueGenStrategy::Ollama) {
                              let content_ref = content.clone();
                              let known_cues_ref = known_cues.clone();
-                             let config_clone = config.clone();
+                             // Convert to legacy config for llm module
+                             let legacy_config = ctx.llm_config.to_legacy();
+                             
                              match rt_handle.block_on(async move {
-                                 propose_cues(&content_ref, &config_clone, &known_cues_ref).await
+                                 // ensure we are using the function from llm module
+                                 crate::llm::propose_cues(&content_ref, &legacy_config, &known_cues_ref).await
                              }) {
                                  Ok(result) => llm_cues.extend(result),
                                  Err(e) => error!("Job: LLM failed: {}", e),

@@ -11,34 +11,12 @@ use tracing::{info, error};
 pub mod setup {
      use super::*;
 
-     pub fn check_and_install_ollama() -> bool {
-         let status = Command::new("which")
+     pub fn is_ollama_installed() -> bool {
+         Command::new("which")
              .arg("ollama")
-             .output();
-             
-         if status.is_ok() && status.unwrap().status.success() {
-             return true;
-         }
-         
-         info!("Ollama not found. Attempting to install via brew...");
-         
-         let install = Command::new("brew")
-             .arg("install")
-             .arg("ollama")
-             .stdout(Stdio::inherit())
-             .stderr(Stdio::inherit())
-             .status();
-             
-         match install {
-             Ok(s) if s.success() => {
-                 info!("Ollama installed successfully.");
-                 true
-             },
-             _ => {
-                 error!("Failed to install Ollama via brew. Please install manually.");
-                 false
-             }
-         }
+             .output()
+             .map(|output| output.status.success())
+             .unwrap_or(false)
      }
      
      pub async fn ensure_ollama_running(config: &LlmConfig) -> bool {
@@ -46,7 +24,8 @@ pub mod setup {
              return true;
          }
          
-         if !check_and_install_ollama() {
+         if !is_ollama_installed() {
+             error!("Ollama not found. Please install it manually: https://ollama.com");
              return false;
          }
 

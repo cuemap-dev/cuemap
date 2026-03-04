@@ -64,6 +64,12 @@ pub struct RecallRequest {
     pub disable_systems_consolidation: bool,
     #[serde(default = "default_true")]
     pub disable_alias_expansion: bool,
+    #[serde(default = "default_depth")]
+    pub depth: usize,
+}
+
+fn default_depth() -> usize {
+    1
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -187,6 +193,11 @@ pub struct CreateProjectRequest {
     pub project_id: String,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SetWatchDirRequest {
+    pub watch_dir: String,
+}
+
 // Context API - Query Expansion
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ContextExpandRequest {
@@ -237,6 +248,8 @@ pub struct EngineState {
     pub job_queue: Arc<JobQueue>,
     pub metrics: Arc<MetricsCollector>,
     pub cloud_backup: Option<Arc<CloudBackupManager>>,
+    pub signing_key: Option<Arc<Vec<u8>>>,
+    pub agent_manager: Arc<crate::agent::manager::AgentManager>,
 }
 
 /// API Routes
@@ -247,6 +260,8 @@ pub fn routes(
     auth_config: AuthConfig, 
     read_only: bool,
     cloud_backup: Option<Arc<CloudBackupManager>>,
+    signing_key: Option<Arc<Vec<u8>>>,
+    agent_manager: Arc<crate::agent::manager::AgentManager>,
 ) -> Router {
     let mut router = Router::new()
         .route("/", get(root))
@@ -259,6 +274,7 @@ pub fn routes(
         .route("/projects", get(list_projects).post(create_project))
         .route("/recall/grounded", post(recall_grounded))
         .route("/projects/:id", delete(delete_project))
+        .route("/projects/:id/watch-dir", post(set_project_watch_dir))
         .route("/aliases", post(add_alias).get(get_aliases))
         .route("/aliases/merge", post(merge_aliases))
         .route("/graph", get(get_graph))
@@ -286,6 +302,8 @@ pub fn routes(
             job_queue,
             metrics,
             cloud_backup,
+            signing_key,
+            agent_manager,
         });
     
     // Add auth middleware if enabled
@@ -520,27 +538,78 @@ async fn recall(
                 }
                 
                 // Expand aliases
-                let expanded_cues = if req.disable_alias_expansion {
+                let mut expanded_cues = if req.disable_alias_expansion {
                     normalized_cues.into_iter().map(|c| (c, 1.0)).collect()
                 } else {
                     ctx.expand_query_cues(normalized_cues, &original_tokens)
                 };
                 
-                // Read Market Heatmap (scoped locally inside this closure, no awaits here, so it's safe)
-                let heatmap = ctx.market_heatmap.read().ok();
-                let heatmap_ref = heatmap.as_deref();
+                let mut all_results: Vec<crate::engine::RecallResult> = Vec::new();
+                let mut used_pivot_memory_ids = std::collections::HashSet::new();
+                let limit = req.limit.max(1);
+                let depth = req.depth.max(1);
+                
+                for hop in 1..=depth {
+                    let current_limit = (limit as f64 / hop as f64).ceil() as usize;
+                    
+                    let mut results = {
+                        let heatmap = ctx.market_heatmap.read().ok();
+                        let heatmap_ref = heatmap.as_deref();
 
-                let results = ctx.main.recall_weighted(
-                    expanded_cues.clone(), 
-                    req.limit, 
-                    false,
-                    req.min_intersection,
-                    req.explain,
-                    req.disable_pattern_completion,
-                    req.disable_salience_bias,
-                    req.disable_systems_consolidation,
-                    heatmap_ref
-                );
+                        ctx.main.recall_weighted(
+                            expanded_cues.clone(), 
+                            current_limit, 
+                            false,
+                            req.min_intersection,
+                            req.explain,
+                            req.disable_pattern_completion,
+                            req.disable_salience_bias,
+                            req.disable_systems_consolidation,
+                            heatmap_ref
+                        )
+                    };
+                    
+                    // Add hop metadata
+                    for r in &mut results {
+                        if !r.metadata.contains_key("hop") {
+                            r.metadata.insert("hop".to_string(), serde_json::json!(hop));
+                        }
+                    }
+                    
+                    // Merge results, avoiding duplicates
+                    for r in results {
+                        if !all_results.iter().any(|existing| existing.memory_id == r.memory_id) {
+                            all_results.push(r);
+                        }
+                    }
+                    
+                    if hop < depth {
+                        let mut pivot_memory = None;
+                        for r in &all_results {
+                            if !used_pivot_memory_ids.contains(&r.memory_id) {
+                                pivot_memory = ctx.main.get_memory(&r.memory_id);
+                                if pivot_memory.is_some() {
+                                    used_pivot_memory_ids.insert(r.memory_id.clone());
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        if let Some(mem) = pivot_memory {
+                            let existing_cues: std::collections::HashSet<String> = expanded_cues.iter().map(|(c, _)| c.clone()).collect();
+                            for cue in mem.cues {
+                                if !existing_cues.contains(&cue) {
+                                    expanded_cues.push((cue, 0.5f64.powi(hop as i32)));
+                                }
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                
+                all_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+                let results = all_results;
                 
                 let json_results: Vec<serde_json::Value> = results
                     .iter()
@@ -643,7 +712,7 @@ async fn recall(
     }
     
     // Expand aliases
-    let expanded_cues = if req.disable_alias_expansion {
+    let mut expanded_cues = if req.disable_alias_expansion {
         normalized_cues.into_iter().map(|c| (c, 1.0)).collect()
     } else {
         let original_tokens = if req.query_text.is_some() {
@@ -654,22 +723,72 @@ async fn recall(
         ctx.expand_query_cues(normalized_cues, &original_tokens)
     };
 
-    let results = {
-        let heatmap = ctx.market_heatmap.read().ok();
-        let heatmap_ref = heatmap.as_deref();
+    let mut all_results: Vec<crate::engine::RecallResult> = Vec::new();
+    let mut used_pivot_memory_ids = std::collections::HashSet::new();
+    let limit = req.limit.max(1);
+    let depth = req.depth.max(1);
 
-        ctx.main.recall_weighted(
-            expanded_cues.clone(), 
-            req.limit, 
-            false, 
-            req.min_intersection,
-            req.explain,
-            req.disable_pattern_completion,
-            req.disable_salience_bias,
-            req.disable_systems_consolidation,
-            heatmap_ref
-        )
-    }; 
+    for hop in 1..=depth {
+        let current_limit = (limit as f64 / hop as f64).ceil() as usize;
+        
+        let mut results = {
+            let heatmap = ctx.market_heatmap.read().ok();
+            let heatmap_ref = heatmap.as_deref();
+
+            ctx.main.recall_weighted(
+                expanded_cues.clone(), 
+                current_limit, 
+                false, 
+                req.min_intersection,
+                req.explain,
+                req.disable_pattern_completion,
+                req.disable_salience_bias,
+                req.disable_systems_consolidation,
+                heatmap_ref
+            )
+        }; 
+        
+        // Add hop metadata
+        for r in &mut results {
+            if !r.metadata.contains_key("hop") {
+                r.metadata.insert("hop".to_string(), serde_json::json!(hop));
+            }
+        }
+        
+        // Merge results, avoiding duplicates
+        for r in results {
+            if !all_results.iter().any(|existing| existing.memory_id == r.memory_id) {
+                all_results.push(r);
+            }
+        }
+        
+        if hop < depth {
+            let mut pivot_memory = None;
+            for r in &all_results {
+                if !used_pivot_memory_ids.contains(&r.memory_id) {
+                    pivot_memory = ctx.main.get_memory(&r.memory_id);
+                    if pivot_memory.is_some() {
+                        used_pivot_memory_ids.insert(r.memory_id.clone());
+                        break;
+                    }
+                }
+            }
+            
+            if let Some(mem) = pivot_memory {
+                let existing_cues: std::collections::HashSet<String> = expanded_cues.iter().map(|(c, _)| c.clone()).collect();
+                for cue in mem.cues {
+                    if !existing_cues.contains(&cue) {
+                        expanded_cues.push((cue, 0.5f64.powi(hop as i32)));
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+    }
+    
+    all_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    let results = all_results;
     
     let elapsed = start.elapsed();    
     let engine_latency_ms = elapsed.as_secs_f64() * 1000.0;
@@ -964,8 +1083,12 @@ async fn recall_grounded(
         let elapsed = start.elapsed();
         
         // 4. Sign Context
-        let crypto = crate::crypto::CryptoEngine::new();
-        let signature = crypto.sign(&context_block);
+        let signature = if let Some(key) = state.signing_key {
+            let crypto = crate::crypto::CryptoEngine::new(key.as_ref().clone());
+            crypto.sign(&context_block)
+        } else {
+             "error: CUEMAP_SECRET_KEY not set".to_string()
+        };
         
         (StatusCode::OK, Json(serde_json::json!({ 
             "verified_context": context_block,
@@ -1034,6 +1157,54 @@ async fn delete_project(
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Project not found"})),
         )
+    }
+}
+
+
+async fn set_project_watch_dir(
+    State(state): State<EngineState>,
+    Path(project_id): Path<String>,
+    Json(req): Json<SetWatchDirRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let EngineState { mt_engine, read_only, agent_manager, .. } = state;
+    
+    if read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "Read-only mode: modifications are not allowed"
+            })),
+        );
+    }
+    
+    match mt_engine.set_project_watch_dir(&project_id, Some(req.watch_dir.clone())) {
+        Ok(_) => {
+            // Immediately start/update the agent
+            let agent_config = crate::agent::AgentConfig {
+                project_id: project_id.clone(),
+                watch_dir: req.watch_dir.clone(),
+                throttle_ms: 100, // Small throttle to prevent CPU pinning
+                state_file: Some(std::path::PathBuf::from(format!("./snapshots/{}_agent_state.json", project_id))),
+            };
+            
+            // Spawn the starting of the agent securely
+            let project_id_clone = project_id.clone();
+            tokio::spawn(async move {
+                agent_manager.start_agent(&project_id_clone, agent_config).await;
+            });
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "updated",
+                    "project_id": project_id
+                })),
+            )
+        },
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        ),
     }
 }
 
@@ -1534,6 +1705,7 @@ async fn recall_web(
 
     // Create an ingester for this request
     let config = AgentConfig {
+        project_id: project_id.clone(),
         watch_dir: String::new(),
         throttle_ms: 0,
         state_file: None,
@@ -1654,6 +1826,7 @@ async fn recall_web(
         
         tokio::spawn(async move {
              let config = AgentConfig {
+                project_id: project_id_clone.clone(),
                 watch_dir: String::new(),
                 throttle_ms: 0,
                 state_file: None,
@@ -1722,6 +1895,7 @@ async fn ingest_url(
     
     // Create an ingester for this request
     let config = AgentConfig {
+        project_id: project_id.clone(),
         watch_dir: String::new(), // Not used for API-driven ingestion
         throttle_ms: 0,
         state_file: None,
@@ -1808,6 +1982,7 @@ async fn ingest_content(
     
     // Create an ingester for this request
     let config = AgentConfig {
+        project_id: project_id.clone(),
         watch_dir: String::new(),
         throttle_ms: 0,
         state_file: None,

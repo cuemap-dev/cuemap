@@ -2,6 +2,7 @@ pub mod chunker;
 pub mod watcher;
 pub mod ingester;
 pub mod search;
+pub mod manager;
 
 use crate::jobs::JobQueue;
 use crate::jobs::ProjectProvider;
@@ -11,6 +12,7 @@ use tracing::{info, warn};
 
 #[derive(Clone)]
 pub struct AgentConfig {
+    pub project_id: String,
     pub watch_dir: String,
     pub throttle_ms: u64,
     pub state_file: Option<std::path::PathBuf>,
@@ -33,7 +35,7 @@ impl Agent {
             config.watch_dir = abs_path.to_string_lossy().to_string();
         }
         
-        info!("Initializing Self-Learning Agent watching: {}", config.watch_dir);
+        info!("Initializing Self-Learning Agent watching `{}` for project '{}'", config.watch_dir, config.project_id);
 
         let mut ingester_obj = ingester::Ingester::new(
             config.clone(),

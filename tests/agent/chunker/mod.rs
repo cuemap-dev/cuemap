@@ -67,10 +67,10 @@ fn test_css_chunking() {
 
 #[test]
 fn test_detect_type() {
-    use cuemap_rust::agent::chunker::ChunkerType;
+    use cuemap::agent::chunker::ChunkerType;
     
-    assert_eq!(Chunker::detect_type(&PathBuf::from("test.py")), ChunkerType::Python);
-    assert_eq!(Chunker::detect_type(&PathBuf::from("test.csv")), ChunkerType::Csv);
-    assert_eq!(Chunker::detect_type(&PathBuf::from("test.pdf")), ChunkerType::Pdf);
-    assert_eq!(Chunker::detect_type(&PathBuf::from("test.docx")), ChunkerType::Office);
+    assert_eq!(Chunker::detect_type(&PathBuf::from("test.py")), Some(ChunkerType::Python));
+    assert_eq!(Chunker::detect_type(&PathBuf::from("test.csv")), Some(ChunkerType::Csv));
+    assert_eq!(Chunker::detect_type(&PathBuf::from("test.pdf")), Some(ChunkerType::Pdf));
+    assert_eq!(Chunker::detect_type(&PathBuf::from("test.docx")), Some(ChunkerType::Office));
 }

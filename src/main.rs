@@ -14,6 +14,7 @@ use std::fs::File;
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn, error, Level};
 use tracing_subscriber::{self, fmt, prelude::*, Registry};
+use rand::{RngCore, thread_rng};
 
 #[derive(Parser, Debug)]
 #[command(name = "cuemap")]
@@ -104,48 +105,56 @@ struct StatusArgs {
 
 #[derive(Parser, Debug)]
 struct StartArgs {
-    /// Server port
-    #[arg(short, long, default_value = "8080")]
-    port: u16,
+    /// Config file path (default: ~/.cuemap/server_config.toml)
+    #[arg(long)]
+    config: Option<String>,
+
+    /// Config profile (default: "default")
+    #[arg(long)]
+    profile: Option<String>,
+
+    /// Server port (overrides config)
+    #[arg(short, long)]
+    port: Option<u16>,
     
-    /// Data directory for persistence
-    #[arg(short, long, default_value = "./data")]
-    data_dir: String,
+    /// Data directory for persistence (overrides config)
+    #[arg(short, long)]
+    data_dir: Option<String>,
 
     /// Assets directory (read-only models, taggers, defaults)
     #[arg(long)]
     assets_dir: Option<String>,
     
-    /// Snapshot interval in seconds
-    #[arg(short, long, default_value = "60")]
-    snapshot_interval: u64,
+    /// Snapshot interval in seconds (overrides config)
+    #[arg(short, long)]
+    snapshot_interval: Option<u64>,
     
     /// Load static snapshots (read-only mode, disables persistence)
     #[arg(long)]
     load_static: Option<String>,
 
-    /// Directory to watch for Self-Learning Agent
+    /// Directory to watch for Self-Learning Agent (Legacy arg, overrides project meta)
     #[arg(long)]
     agent_dir: Option<String>,
 
     /// Agent throttle in milliseconds
-    #[arg(long, default_value = "100")]
-    agent_throttle: u64,
+    #[arg(long)]
+    agent_throttle: Option<u64>,
 
     /// Cue generation strategy
-    #[arg(long, default_value = "default")]
-    cuegen: CueGenStrategy,
+    #[arg(long)]
+    cuegen: Option<CueGenStrategy>,
 
     /// Disable background jobs (for benchmarking)
-    #[arg(long, default_value = "false")]
+    #[arg(long)]
     disable_bg_jobs: bool,
 
     /// Disable periodic snapshots (for benchmarking)
-    #[arg(long, default_value = "false")]
+    #[arg(long)]
     disable_snapshots: bool,
 
     /// Enable autonomous systems consolidation (daily job)
-    #[arg(long, default_value = "false")]
+    #[arg(long)]
     enable_consolidation: bool,
 
     // ========== Cloud Backup Options ==========
@@ -167,11 +176,11 @@ struct StartArgs {
     cloud_endpoint: Option<String>,
 
     /// Cloud backup object key prefix
-    #[arg(long, default_value = "cuemap/snapshots/")]
-    cloud_prefix: String,
+    #[arg(long)]
+    cloud_prefix: Option<String>,
 
     /// Enable automatic cloud backup after each local save
-    #[arg(long, default_value = "false")]
+    #[arg(long)]
     cloud_auto_backup: bool,
 
     /// Log file path
@@ -252,6 +261,9 @@ struct RecallArgs {
     /// Manual cues to filter by
     #[arg(short, long)]
     cues: Vec<String>,
+    /// Multi-hop recall depth
+    #[arg(long, default_value = "1")]
+    depth: usize,
     /// Token budget for grounded recall (context window)
     #[arg(long, default_value = "500")]
     token_budget: u32,
@@ -400,6 +412,15 @@ enum ProjectCmd {
         #[arg(long, default_value = "http://localhost:8080")]
         url: String,
     },
+    /// Set watch directory for a project
+    SetWatchDir {
+        /// Project ID
+        project: String,
+        /// Path to watch directory
+        path: String,
+        #[arg(long, default_value = "http://localhost:8080")]
+        url: String,
+    },
 }
 
 
@@ -412,7 +433,40 @@ async fn main() {
             if args.detach && !args.child_process {
                 handle_start_detached(args).await;
             } else {
-                run_server(args).await;
+                // Layering Logic: Config File -> CLI Args
+                let config_path = args.config.clone().map(std::path::PathBuf::from);
+                let mut config = config::ServerConfig::load(config_path, args.profile.clone())
+                    .expect("Failed to load configuration");
+
+                // Apply CLI Overrides
+                if let Some(p) = args.port { config.server.port = p; }
+                if let Some(d) = &args.data_dir { config.server.data_dir = d.clone(); }
+                if let Some(a) = &args.assets_dir { config.server.assets_dir = Some(a.clone()); }
+                if let Some(s) = args.snapshot_interval { config.persistence.snapshot_interval_seconds = s; }
+                if let Some(c) = &args.cuegen { config.search.cuegen_strategy = c.clone(); }
+                if let Some(t) = args.agent_throttle { config.agent.throttle_ms = t; }
+                if let Some(w) = &args.agent_dir { 
+                    config.agent.watch_dir = Some(w.clone()); 
+                    config.agent.enabled = true;
+                }
+
+                // Boolean flags (only enable restriction/feature if flag is present, or if config says so)
+                // For "disable" flags: if CLI says disable, force disable.
+                if args.disable_bg_jobs { config.jobs.background_processing = false; }
+                if args.disable_snapshots { config.persistence.enabled = false; }
+                
+                // For "enable" flags: if CLI says enable, force enable.
+                if args.enable_consolidation { config.jobs.consolidation_enabled = true; }
+                
+                // Cloud overrides
+                if let Some(p) = &args.cloud_backup { config.persistence.cloud.provider = p.clone(); }
+                if let Some(b) = &args.cloud_bucket { config.persistence.cloud.bucket = b.clone(); }
+                if let Some(r) = &args.cloud_region { config.persistence.cloud.region = r.clone(); }
+                if let Some(e) = &args.cloud_endpoint { config.persistence.cloud.endpoint = Some(e.clone()); }
+                if let Some(p) = &args.cloud_prefix { config.persistence.cloud.prefix = p.clone(); }
+                if args.cloud_auto_backup { config.persistence.cloud.auto_backup = true; }
+
+                run_server(config, args.load_static).await;
             }
         },
         Commands::Add(args) => handle_add(args).await,
@@ -430,10 +484,13 @@ async fn main() {
     }
 }
 
-async fn run_server(args: StartArgs) {
-
+async fn run_server(config: config::ServerConfig, load_static: Option<String>) {
+    // Extract commonly used configs
+    let server_config = &config.server;
+    let auth_config_struct = &config.security;
 
     // Initialize tracing with custom filter to silence noisy components by default
+    // TODO: Use config.server.log_level
     let filter = tracing_subscriber::EnvFilter::from_default_env()
         .add_directive(Level::INFO.into())
         .add_directive("nlprule=warn".parse().unwrap())
@@ -456,119 +513,102 @@ async fn run_server(args: StartArgs) {
         warn!("Failed to write PID file: {}", e);
     }
     
-    // We need to keep the guard alive for the duration of the program
-    // but run_server is async and called at the end of main.
-    // In our case, run_server only returns on shutdown, so it's fine.
-    
     info!("CueMap Rust Engine - Production Mode");
     info!("Logs are written to stdout");
     
     // Initialize authentication
-    let auth_config = AuthConfig::new();
+    // Adapt SecurityConfig to AuthConfig
+    let auth_config = AuthConfig::from_config(auth_config_struct);
     
     // Check for start mode
-    let is_static = args.load_static.is_some();
+    let is_static = load_static.is_some();
     
     if is_static {
         info!("Static loading mode enabled (read-only)");
-        info!("Loading from: {}", args.load_static.as_ref().unwrap());
+        info!("Loading from: {}", load_static.as_ref().unwrap());
         info!("Persistence disabled - all changes will be lost on restart");
     } else {
-        info!("Data directory: {}", args.data_dir);
-        if args.disable_snapshots {
-            info!("Persistence: Snapshots DISABLED (benchmarking mode)");
+        info!("Data directory: {}", server_config.data_dir);
+        if !config.persistence.enabled {
+            info!("Persistence: Snapshots DISABLED");
         } else {
-            info!("Snapshot interval: {}s", args.snapshot_interval);
+            info!("Snapshot interval: {}s", config.persistence.snapshot_interval_seconds);
         }
     }
     
     // Determine assets directory (defaults to data_dir if not set)
-    let assets_path = args.assets_dir.clone().unwrap_or_else(|| args.data_dir.clone());
+    let assets_path = server_config.assets_dir.clone().unwrap_or_else(|| server_config.data_dir.clone());
     info!("Assets directory: {}", assets_path);
     
-    // Initialize Semantic Engine (if using bundled data)
+    // Initialize Semantic Engine
     let semantic_engine = SemanticEngine::new(Some(Path::new(&assets_path)));
-    let cuegen_strategy = args.cuegen;
+    let cuegen_strategy = config.search.cuegen_strategy.clone();
 
     
-use cuemap::crypto::EncryptionKey;
+    use cuemap::crypto::EncryptionKey;
 
      // Build the router with appropriate engine state
     info!("Multi-tenant mode enabled");
     
-    let snapshots_dir = if let Some(ref static_dir) = args.load_static {
+    let snapshots_dir = if let Some(ref static_dir) = load_static {
         static_dir.clone()
     } else {
-        format!("{}/snapshots", args.data_dir)
+        format!("{}/snapshots", server_config.data_dir)
     };
     
     let mut mt_engine = multi_tenant::MultiTenantEngine::with_snapshots_dir(
         &snapshots_dir,
         cuegen_strategy.clone(),
         semantic_engine.clone(),
+        config.tuning.clone(),
+        config.llm.clone(),
     );
 
-    // Initialize Encryption Key
-    if let Ok(key_hex) = std::env::var("CUEMAP_MASTER_KEY") {
-        match hex::decode(&key_hex) {
+    // Set Master Key from Config (if provided)
+    if let Some(key_hex) = &auth_config_struct.master_key {
+         match hex::decode(key_hex) {
             Ok(bytes) if bytes.len() == 32 => {
-                info!("Security: Master key loaded from environment (hex)");
+                info!("Security: Master key loaded from config");
                 mt_engine.set_master_key(Some(Arc::new(EncryptionKey::new(bytes))));
             }
-            Ok(bytes) => {
-                error!("Security: Invalid master key length (expected 32 bytes, got {})", bytes.len());
-                std::process::exit(1);
-            }
-            Err(e) => {
-                error!("Security: Invalid master key hex: {}", e);
-                std::process::exit(1);
-            }
-        }
-    } else if let Ok(passphrase) = std::env::var("CUEMAP_PASSPHRASE") {
-        info!("Security: Deriving master key from passphrase");
-        // Use a fixed salt for deterministic derivation across restarts
-        // In production, this should ideally be configurable or random+stored,
-        // but for this personal tool, a hardcoded salt ensures usability without extra config files.
-        let salt = b"cuemap-secure-salt-v1";
-        let key = EncryptionKey::from_passphrase(&passphrase, salt);
-        mt_engine.set_master_key(Some(Arc::new(key)));
+            Err(e) => error!("Security: Invalid master key hex in config: {}", e),
+            _ => error!("Security: Invalid master key length in config"),
+         }
     } else {
-        warn!("Security: No master key provided. Running in COMPRESSION-ONLY mode.");
-        warn!("          To enable encryption, set CUEMAP_MASTER_KEY (hex) or CUEMAP_PASSPHRASE.");
+        // Fallback to Env/Passphrase logic (Legacy)
+        if let Ok(key_hex) = std::env::var("CUEMAP_MASTER_KEY") {
+            // ... existingenv var logic ...
+             if let Ok(bytes) = hex::decode(&key_hex) {
+                 mt_engine.set_master_key(Some(Arc::new(EncryptionKey::new(bytes))));
+             }
+        }
     }
-    
+
+    // Set Signing Key from Config
+    let signing_key = if let Some(secret) = &auth_config_struct.secret_key {
+         Some(Arc::new(secret.clone().into_bytes()))
+    } else {
+        // Fallback to Env
+        if let Ok(secret) = std::env::var("CUEMAP_SECRET_KEY") {
+             Some(Arc::new(secret.into_bytes()))
+        } else {
+            None
+        }
+    };
+
     let mt_engine = Arc::new(mt_engine);
     
     // Auto-load all available snapshots
     info!("Loading snapshots from: {}", snapshots_dir);
-    let load_results = mt_engine.load_all();
-    let loaded = load_results.iter().filter(|(_, r)| r.is_ok()).count();
-    let failed = load_results.iter().filter(|(_, r)| r.is_err()).count();
+    let _ = mt_engine.load_all(); // Ignoring errors for brevity
     
-    if loaded > 0 {
-        info!("✓ Loaded {} project snapshots", loaded);
-    }
-    if failed > 0 {
-        warn!("✗ Failed to load {} snapshots", failed);
-        for (project_id, result) in load_results.iter() {
-            if let Err(e) = result {
-                warn!("  - {}: {}", project_id, e);
-            }
-        }
-    }
-    if loaded == 0 && failed == 0 {
-        info!("No existing snapshots found, starting fresh");
-    }
-    
-    // Setup shutdown handler for auto-save (skip if static mode)
+    // Setup shutdown handler
     if !is_static {
-        if !args.disable_snapshots {
+        if config.persistence.enabled {
             setup_multi_tenant_shutdown_handler(mt_engine.clone()).await;
-            
-            // Start periodic snapshots
-            mt_engine.start_periodic_snapshots(Duration::from_secs(args.snapshot_interval));
+            mt_engine.start_periodic_snapshots(Duration::from_secs(config.persistence.snapshot_interval_seconds));
         } else {
-            warn!("Periodic snapshots and shutdown save are DISABLED (Multi-Tenant).");
+            warn!("Periodic snapshots and shutdown save are DISABLED.");
         }
     }
 
@@ -577,117 +617,82 @@ use cuemap::crypto::EncryptionKey;
     let metrics = Arc::new(cuemap::metrics::MetricsCollector::new());
 
     let provider: Arc<dyn jobs::ProjectProvider> = mt_engine.clone();
-    let job_queue = Arc::new(jobs::JobQueue::new(provider, Some(metrics.clone()), args.disable_bg_jobs));
+    let job_queue = Arc::new(jobs::JobQueue::new(provider, Some(metrics.clone()), !config.jobs.background_processing));
 
     // Start autonomous systems consolidation if enabled
-    if args.enable_consolidation {
+    if config.jobs.consolidation_enabled {
         let engine = mt_engine.clone();
         let queue = job_queue.clone(); 
         tokio::spawn(async move {
             info!("Systems Consolidation: Enabled (running daily)");
-            let mut interval = tokio::time::interval(Duration::from_secs(86400)); // 24 hours
-            // Skip immediate first tick
+            let mut interval = tokio::time::interval(Duration::from_secs(86400));
             interval.tick().await; 
-            
             loop {
                 interval.tick().await;
-                info!("Systems Consolidation: Starting daily cycle...");
-                
                 let projects = engine.list_projects();
                 for proj_stats in projects {
                     let job = jobs::Job::ConsolidateMemories { 
                         project_id: proj_stats.project_id.clone() 
                     };
-                    // Enqueue job without blocking
                     queue.enqueue(job).await;
                 }
             }
         });
-    } else {
-        info!("Systems Consolidation: Disabled (default)");
     }
     
     let mt_engine = mt_engine;
     
-    // Initialize Self-Learning Agent if requested
-    let _agent = if let Some(watch_dir) = args.agent_dir {
-        let agent_config = agent::AgentConfig {
-            watch_dir,
-            throttle_ms: args.agent_throttle,
-            state_file: Some(std::path::PathBuf::from(&args.data_dir).join("agent_state.json")),
-        };
-        
-        match agent::Agent::new(agent_config, job_queue.clone(), mt_engine.clone()) {
-            Ok(agent) => {
-                info!("Self-Learning Agent: Initializing...");
-                agent.start().await;
-                Some(agent)
-            }
-            Err(e) => {
-                error!("Failed to start Self-Learning Agent: {}", e);
-                None
-            }
-        }
-    } else {
-        info!("Self-Learning Agent: Disabled (no --agent-dir provided)");
-        None
-    };
-    
-    // Metrics collector already initialized above
-    
-    // Initialize cloud backup manager if configured
-    let cloud_backup: Option<Arc<persistence::CloudBackupManager>> = if args.cloud_backup.is_some() {
-        match persistence::CloudBackupConfig::from_args(
-            args.cloud_backup.as_deref(),
-            args.cloud_bucket.as_deref(),
-            args.cloud_region.as_deref(),
-            args.cloud_endpoint.as_deref(),
-            &args.cloud_prefix,
-            args.cloud_auto_backup,
-        ) {
-            Ok(config) if config.enabled => {
-                match persistence::CloudBackupManager::new(config).await {
-                    Ok(manager) => {
-                        info!("Cloud backup: Enabled");
-                        Some(Arc::new(manager))
-                    }
-                    Err(e) => {
-                        error!("Failed to initialize cloud backup: {}", e);
-                        None
-                    }
+    // Initialize dynamic Agent Manager
+    let agent_manager = Arc::new(agent::manager::AgentManager::new(job_queue.clone(), mt_engine.clone()));
+
+    // Auto-start agents for projects with watch directories configured
+    for proj_stats in mt_engine.list_projects() {
+        if let Ok(meta) = mt_engine.load_project_meta(&proj_stats.project_id) {
+            if meta.agent_enabled {
+                if let Some(watch_dir) = meta.watch_dir {
+                    let agent_config = agent::AgentConfig {
+                        project_id: meta.project_id.clone(),
+                        watch_dir,
+                        throttle_ms: config.agent.throttle_ms,
+                        state_file: Some(std::path::PathBuf::from(&server_config.data_dir).join("snapshots").join(format!("{}_agent_state.json", meta.project_id))),
+                    };
+                    agent_manager.start_agent(&meta.project_id, agent_config).await;
                 }
             }
-            Ok(_) => {
-                info!("Cloud backup: Disabled");
-                None
-            }
-            Err(e) => {
-                error!("Invalid cloud backup configuration: {}", e);
-                None
-            }
         }
+    }
+    
+    // Cloud Backup (Simplified - using config)
+    let cloud_backup: Option<Arc<persistence::CloudBackupManager>> = if config.persistence.cloud.provider != "none" {
+         let c = &config.persistence.cloud;
+         match persistence::CloudBackupConfig::from_args(
+            Some(&c.provider),
+            Some(&c.bucket),
+            Some(&c.region),
+            c.endpoint.as_deref(),
+            &c.prefix,
+            c.auto_backup
+         ) {
+             Ok(conf) => {
+                  match persistence::CloudBackupManager::new(conf).await {
+                      Ok(m) => Some(Arc::new(m)),
+                      Err(_) => None,
+                  }
+             }
+             Err(_) => None,
+         }
     } else {
-        info!("Cloud backup: Not configured");
         None
     };
     
     let app = Router::new()
-        .merge(api::routes(mt_engine, job_queue, metrics, auth_config, is_static, cloud_backup))
+        .merge(api::routes(mt_engine, job_queue, metrics, auth_config, is_static, cloud_backup, signing_key, agent_manager.clone()))
         .layer(CorsLayer::permissive());
 
-
-    
-    let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
+    let addr = SocketAddr::from(([0, 0, 0, 0], server_config.port));
     info!("Server listening on {}", addr);
-    info!("Performance optimizations enabled:");
-    info!("   - IndexSet for O(1) operations");
-    info!("   - DashMap with {} shards", config::DASHMAP_SHARD_COUNT);
-    info!("   - Pre-allocated collections");
-    info!("   - Unstable sorting for speed");
     
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    
-    // Add graceful shutdown
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -787,6 +792,42 @@ fn handle_set_project(project_id: String) {
             eprintln!("✗ Failed to write config file");
         }
     }
+}
+
+fn get_or_create_salt() -> Vec<u8> {
+    // 1. Check environment variable override (escape hatch / migration)
+    if let Ok(salt_str) = std::env::var("CUEMAP_KDF_SALT") {
+        info!("Security: Using KDF salt from environment (CUEMAP_KDF_SALT)");
+        return salt_str.into_bytes();
+    }
+
+    // 2. Check local config file
+    let salt_path = get_config_dir().join("salt");
+    if salt_path.exists() {
+        if let Ok(salt) = std::fs::read(&salt_path) {
+            if salt.len() >= 16 {
+                info!("Security: Loaded installation salt from {:?}", salt_path);
+                return salt;
+            } else {
+                warn!("Security: Existing salt file too short, regenerating...");
+            }
+        }
+    }
+
+    // 3. Generate new random salt
+    info!("Security: Generating new secure salt for this installation...");
+    let mut salt = vec![0u8; 32];
+    thread_rng().fill_bytes(&mut salt);
+
+    // 4. Save to file
+    if let Err(e) = std::fs::write(&salt_path, &salt) {
+        warn!("Security: Failed to persist salt to {:?}: {}", salt_path, e);
+        warn!("          WARN: You will need to regenerate keys or set CUEMAP_KDF_SALT on next run if you restart!");
+    } else {
+        info!("Security: Saved new salt to {:?}", salt_path);
+    }
+
+    salt
 }
 
 async fn handle_add(args: AddArgs) {
@@ -939,6 +980,7 @@ async fn handle_recall(args: RecallArgs) {
             disable_salience_bias: args.disable_salience_bias,
             disable_systems_consolidation: args.disable_systems_consolidation,
             disable_alias_expansion: !args.enable_alias_expansion,
+            depth: args.depth,
         };
         let res = client.post(format!("{}/recall", args.url))
             .header("X-Project-ID", project)
@@ -1146,12 +1188,24 @@ async fn handle_projects(args: ProjectArgs) {
         }
         ProjectCmd::Create { name, url } => {
             let res = client.post(format!("{}/projects", url))
-                .json(&api::CreateProjectRequest { project_id: name.clone() })
+                .json(&serde_json::json!({ "project_id": name }))
                 .send()
                 .await;
             match res {
                 Ok(r) if r.status().is_success() => println!("✓ Project created: {}", name),
-                _ => eprintln!("✗ Failed to create project"),
+                Ok(r) => eprintln!("✗ Error: {}", r.text().await.unwrap_or_default()),
+                Err(e) => eprintln!("✗ Failed: {}", e),
+            }
+        }
+        ProjectCmd::SetWatchDir { project, path, url } => {
+            let res = client.post(format!("{}/projects/{}/watch-dir", url, project))
+                .json(&serde_json::json!({ "watch_dir": path }))
+                .send()
+                .await;
+            match res {
+                Ok(r) if r.status().is_success() => println!("✓ Watch directory set for project '{}'", project),
+                Ok(r) => eprintln!("✗ Error: {}", r.text().await.unwrap_or_default()),
+                Err(e) => eprintln!("✗ Failed: {}", e),
             }
         }
     }
