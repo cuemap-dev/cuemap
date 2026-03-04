@@ -1,0 +1,95 @@
+name: Build and Publish Optional NPM Binaries
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch: # Allow manual triggering
+
+jobs:
+  build-and-publish:
+    name: Build & Publish (${{ matrix.os }} - ${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            arch: x64
+            npm_os: linux
+            npm_arch: x64
+            pkg_name: engine-linux-x64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            arch: x64
+            npm_os: darwin
+            npm_arch: x64
+            pkg_name: engine-darwin-x64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            arch: arm64
+            npm_os: darwin
+            npm_arch: arm64
+            pkg_name: engine-darwin-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            arch: x64
+            npm_os: win32
+            npm_arch: x64
+            pkg_name: engine-win32-x64
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build Rust Engine
+        run: cargo build --release --target ${{ matrix.target }}
+        
+      - name: Prepare NPM Package Structure
+        shell: bash
+        run: |
+          mkdir -p npm-packages/${{ matrix.pkg_name }}/bin
+          
+          # Copy binary based on OS extension (.exe for Windows)
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp target/${{ matrix.target }}/release/cuemap.exe npm-packages/${{ matrix.pkg_name }}/bin/cuemap.exe
+          else
+            cp target/${{ matrix.target }}/release/cuemap npm-packages/${{ matrix.pkg_name }}/bin/cuemap
+            chmod +x npm-packages/${{ matrix.pkg_name }}/bin/cuemap
+          fi
+          
+          # Create the package.json for this specific architecture package
+          cat <<EOF > npm-packages/${{ matrix.pkg_name }}/package.json
+          {
+            "name": "@cuemap/${{ matrix.pkg_name }}",
+            "version": "${{ github.event.release.tag_name || '0.6.4' }}",
+            "description": "Pre-compiled CueMap Engine for ${{ matrix.npm_os }} ${{ matrix.npm_arch }}",
+            "engines": {
+              "node": ">= 18"
+            },
+            "os": ["${{ matrix.npm_os }}"],
+            "cpu": ["${{ matrix.npm_arch }}"],
+            "bin": {
+              "cuemap": "bin/cuemap${{ matrix.os == 'windows-latest' && '.exe' || '' }}"
+            },
+            "author": "Kaan Demirel",
+            "license": "BSL-1.1"
+          }
+          EOF
+
+      - name: Publish to NPM
+        working-directory: npm-packages/${{ matrix.pkg_name }}
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
