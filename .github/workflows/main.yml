@@ -9,6 +9,10 @@ jobs:
   build-and-publish:
     name: Build & Publish (${{ matrix.os }} - ${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+    
     strategy:
       fail-fast: false
       matrix:
@@ -83,6 +87,10 @@ jobs:
             "bin": {
               "cuemap": "bin/cuemap${{ matrix.os == 'windows-latest' && '.exe' || '' }}"
             },
+            "repository": {
+              "type": "git",
+              "url": "https://github.com/cuemap-dev/cuemap.git"
+            },
             "author": "Kaan Demirel",
             "license": "BSL-1.1"
           }
@@ -90,6 +98,4 @@ jobs:
 
       - name: Publish to NPM
         working-directory: npm-packages/${{ matrix.pkg_name }}
-        run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance
