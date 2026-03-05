@@ -76,7 +76,7 @@ jobs:
           # Create the package.json for this specific architecture package
           cat <<EOF > npm-packages/${{ matrix.pkg_name }}/package.json
           {
-            "name": "@cuemap/${{ matrix.pkg_name }}",
+            "name": "@cuemap-dev/${{ matrix.pkg_name }}",
             "version": "${{ github.event.release.tag_name || '0.6.4' }}",
             "description": "Pre-compiled CueMap Engine for ${{ matrix.npm_os }} ${{ matrix.npm_arch }}",
             "engines": {
