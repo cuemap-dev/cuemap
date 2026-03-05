@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{info, warn, error};
+use tracing::{info, error};
 
 use crate::agent::{Agent, AgentConfig};
 use crate::jobs::{JobQueue, ProjectProvider};

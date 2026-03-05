@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::env;
 use std::fs;
-use tracing::{info, warn};
+
 
 /// Performance tuning configuration for CueMap engine
 
@@ -57,6 +57,15 @@ impl Default for ServerConfig {
     }
 }
 
+pub fn get_base_dir() -> PathBuf {
+    let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let path = PathBuf::from(home).join(".cuemap");
+    if !path.exists() {
+        let _ = fs::create_dir_all(&path);
+    }
+    path
+}
+
 impl ServerConfig {
     pub fn load(config_path: Option<PathBuf>, profile: Option<String>) -> Result<Self, String> {
         // 1. Start with defaults based on profile
@@ -65,8 +74,7 @@ impl ServerConfig {
 
         // 2. Load from config file matching profile (or just global config)
         let path = config_path.unwrap_or_else(|| {
-            let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            PathBuf::from(home).join(".cuemap").join("server_config.toml")
+            get_base_dir().join("server_config.toml")
         });
 
         if path.exists() {
@@ -140,7 +148,7 @@ impl Default for ServerSettings {
         Self {
             port: 8080,
             host: "0.0.0.0".to_string(),
-            data_dir: "./data".to_string(),
+            data_dir: get_base_dir().join("data").to_string_lossy().to_string(),
             assets_dir: None,
             log_level: "info".to_string(),
             read_only: false,

@@ -7,14 +7,15 @@ use axum::Router;
 use clap::Parser;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use rand::{RngCore, thread_rng};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, IsTerminal};
 use std::fs::File;
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn, error, Level};
 use tracing_subscriber::{self, fmt, prelude::*, Registry};
-use rand::{RngCore, thread_rng};
+
 
 #[derive(Parser, Debug)]
 #[command(name = "cuemap")]
@@ -466,7 +467,7 @@ async fn main() {
                 if let Some(p) = &args.cloud_prefix { config.persistence.cloud.prefix = p.clone(); }
                 if args.cloud_auto_backup { config.persistence.cloud.auto_backup = true; }
 
-                run_server(config, args.load_static).await;
+                run_server(config, args.load_static, args.child_process).await;
             }
         },
         Commands::Add(args) => handle_add(args).await,
@@ -484,7 +485,7 @@ async fn main() {
     }
 }
 
-async fn run_server(config: config::ServerConfig, load_static: Option<String>) {
+async fn run_server(config: config::ServerConfig, load_static: Option<String>, is_child: bool) {
     // Extract commonly used configs
     let server_config = &config.server;
     let auth_config_struct = &config.security;
@@ -508,7 +509,7 @@ async fn run_server(config: config::ServerConfig, load_static: Option<String>) {
     
     // Write PID file for the server
     let pid = std::process::id();
-    let pid_path = get_config_dir().join("server.pid");
+    let pid_path = config::get_base_dir().join("server.pid");
     if let Err(e) = std::fs::write(&pid_path, pid.to_string()) {
         warn!("Failed to write PID file: {}", e);
     }
@@ -553,7 +554,7 @@ async fn run_server(config: config::ServerConfig, load_static: Option<String>) {
     let snapshots_dir = if let Some(ref static_dir) = load_static {
         static_dir.clone()
     } else {
-        format!("{}/snapshots", server_config.data_dir)
+        PathBuf::from(&server_config.data_dir).join("snapshots").to_string_lossy().to_string()
     };
     
     let mut mt_engine = multi_tenant::MultiTenantEngine::with_snapshots_dir(
@@ -564,24 +565,56 @@ async fn run_server(config: config::ServerConfig, load_static: Option<String>) {
         config.llm.clone(),
     );
 
-    // Set Master Key from Config (if provided)
-    if let Some(key_hex) = &auth_config_struct.master_key {
-         match hex::decode(key_hex) {
-            Ok(bytes) if bytes.len() == 32 => {
-                info!("Security: Master key loaded from config");
-                mt_engine.set_master_key(Some(Arc::new(EncryptionKey::new(bytes))));
-            }
-            Err(e) => error!("Security: Invalid master key hex in config: {}", e),
-            _ => error!("Security: Invalid master key length in config"),
-         }
-    } else {
-        // Fallback to Env/Passphrase logic (Legacy)
-        if let Ok(key_hex) = std::env::var("CUEMAP_MASTER_KEY") {
-            // ... existingenv var logic ...
-             if let Ok(bytes) = hex::decode(&key_hex) {
-                 mt_engine.set_master_key(Some(Arc::new(EncryptionKey::new(bytes))));
+    // Master Key Discovery Hierarchy
+    let master_key = if let Ok(key_hex) = std::env::var("CUEMAP_MASTER_KEY") {
+         // 1. Env Var (Hex) - Highest priority for automation
+         match hex::decode(&key_hex) {
+             Ok(bytes) if bytes.len() == 32 => {
+                 info!("Security: Master key loaded from CUEMAP_MASTER_KEY (Hex)");
+                 Some(Arc::new(EncryptionKey::new(bytes)))
              }
+             _ => {
+                 error!("Security: CUEMAP_MASTER_KEY must be a 32-byte hex string");
+                 None
+             }
+         }
+    } else if let Ok(pass) = std::env::var("CUEMAP_MASTER_PASSWORD") {
+        // 2. Env Var (Passphrase) - Secondary automation path
+        info!("Security: Deriving master key from CUEMAP_MASTER_PASSWORD...");
+        let salt = get_or_create_salt();
+        Some(Arc::new(EncryptionKey::from_passphrase(&pass, &salt)))
+    } else if let Some(key_hex) = &auth_config_struct.master_key {
+        // 3. Config File (Hex)
+        match hex::decode(key_hex) {
+            Ok(bytes) if bytes.len() == 32 => {
+                info!("Security: Master key loaded from config file");
+                Some(Arc::new(EncryptionKey::new(bytes)))
+            }
+            _ => {
+                error!("Security: master_key in config must be a 32-byte hex string");
+                None
+            }
         }
+    } else if !is_child && std::io::stdin().is_terminal() {
+        // 4. Interactive Prompt (Fallback for humans)
+        println!("\n🔑 Encryption Required");
+        match rpassword::prompt_password("Enter Master Passphrase (will be derived via PBKDF2): ") {
+            Ok(pass) if !pass.is_empty() => {
+                let salt = get_or_create_salt();
+                info!("Security: Deriving master key from interactive passphrase...");
+                Some(Arc::new(EncryptionKey::from_passphrase(&pass, &salt)))
+            }
+            _ => {
+                warn!("Security: No passphrase entered. Server will run UNENCRYPTED.");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Some(key) = master_key {
+        mt_engine.set_master_key(Some(key));
     }
 
     // Set Signing Key from Config
@@ -761,17 +794,8 @@ async fn setup_multi_tenant_shutdown_handler(mt_engine: Arc<multi_tenant::MultiT
 
 // ========== CLI Client Handlers ==========
 
-fn get_config_dir() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let path = std::path::PathBuf::from(home).join(".cuemap");
-    if !path.exists() {
-        let _ = std::fs::create_dir_all(&path);
-    }
-    path
-}
-
 fn get_default_project() -> Option<String> {
-    let config_path = get_config_dir().join("config.json");
+    let config_path = config::get_base_dir().join("config.json");
     if let Ok(content) = std::fs::read_to_string(config_path) {
         if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
             return config.get("default_project").and_then(|v| v.as_str().map(|s| s.to_string()));
@@ -781,7 +805,7 @@ fn get_default_project() -> Option<String> {
 }
 
 fn handle_set_project(project_id: String) {
-    let config_path = get_config_dir().join("config.json");
+    let config_path = config::get_base_dir().join("config.json");
     let config = serde_json::json!({
         "default_project": project_id
     });
@@ -794,6 +818,8 @@ fn handle_set_project(project_id: String) {
     }
 }
 
+
+
 fn get_or_create_salt() -> Vec<u8> {
     // 1. Check environment variable override (escape hatch / migration)
     if let Ok(salt_str) = std::env::var("CUEMAP_KDF_SALT") {
@@ -802,7 +828,7 @@ fn get_or_create_salt() -> Vec<u8> {
     }
 
     // 2. Check local config file
-    let salt_path = get_config_dir().join("salt");
+    let salt_path = config::get_base_dir().join("salt");
     if salt_path.exists() {
         if let Ok(salt) = std::fs::read(&salt_path) {
             if salt.len() >= 16 {
@@ -1271,7 +1297,7 @@ async fn handle_status(args: StatusArgs) {
 
 async fn handle_logs(args: LogsArgs) {
     let log_path = args.path.unwrap_or_else(|| {
-        let mut path = get_config_dir();
+        let mut path = config::get_base_dir();
         path.push("server.log");
         path.to_string_lossy().to_string()
     });
@@ -1368,7 +1394,7 @@ async fn handle_start_detached(args: StartArgs) {
     
     // Determine log file path
     let log_path = args.log_file.clone().unwrap_or_else(|| {
-        let mut path = get_config_dir();
+        let mut path = config::get_base_dir();
         path.push("server.log");
         path.to_string_lossy().to_string()
     });
@@ -1443,7 +1469,7 @@ async fn handle_start_detached(args: StartArgs) {
 }
 
 async fn handle_stop(_args: StopArgs) {
-    let pid_path = get_config_dir().join("server.pid");
+    let pid_path = config::get_base_dir().join("server.pid");
     if !pid_path.exists() {
         eprintln!("✗ No server.pid found. Server might not be running or wasn't started with this version.");
         return;

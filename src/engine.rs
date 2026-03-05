@@ -111,7 +111,6 @@ where
         cue_index: DashMap<String, OrderedSet, RandomState>,
     ) -> Self {
         let count = memories.len();
-        let cue_count_val = cue_index.len();
         let engine = Self {
             memories: Arc::new(memories),
             cue_index: Arc::new(cue_index),

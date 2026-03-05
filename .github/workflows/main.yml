@@ -74,7 +74,7 @@ jobs:
           cat <<EOF > npm-packages/${{ matrix.pkg_name }}/package.json
           {
             "name": "@cuemap-dev/${{ matrix.pkg_name }}",
-            "version": "${{ github.event.release.tag_name || '0.6.5' }}",
+            "version": "${{ github.event.release.tag_name || '0.6.6' }}",
             "description": "Pre-compiled CueMap Engine for ${{ matrix.npm_os }} ${{ matrix.npm_arch }}",
             "engines": {
               "node": ">= 18"

@@ -322,9 +322,10 @@ docker run -p 8080:8080 -v $(pwd)/local_snapshot_dir:/app/data \
 CueMap supports **encryption-at-rest** for all memory content using modern authenticated encryption.
 
 - **Algorithm**: ChaCha20-Poly1305 (IETF) (via `chacha20poly1305` crate).
-- **Key Derivation**: PBKDF2-HMAC-SHA256 with 100,000 iterations to derive a 32-byte key from a user passphrase.
+- **Master Key**: Uses a 256-bit (32-byte) key for encryption.
+- **Key Derivation (PBKDF2)**: Supports deriving the master key from a human-readable passphrase using PBKDF2-HMAC-SHA256 with 100,000 iterations and a persistent installation-unique salt.
 - **Nonce**: A random 12-byte nonce is generated for every memory encryption operation and stored alongside the ciphertext.
-- **Zero-Knowledge**: The engine does not persist the master key to disk; it must be provided at startup (via env var or prompt) and is kept only in RAM.
+- **Zero-Knowledge**: The engine does not persist the master key to disk; it must be provided at startup via environment variables (`CUEMAP_MASTER_KEY` or `CUEMAP_MASTER_PASSWORD`), an interactive prompt (foreground only), or the configuration file. It is kept only in RAM.
 
 ## Compression
 
