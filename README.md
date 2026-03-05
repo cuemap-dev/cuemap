@@ -442,8 +442,7 @@ curl -X POST http://localhost:8080/recall \
   -H "Content-Type: application/json" \
   -d '{
     "cues": ["api", "rate_limit"],
-    "limit": 10,
-    "depth": 2
+    "limit": 10
   }'
 ```
 

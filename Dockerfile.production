@@ -6,7 +6,7 @@ RUN npm install
 COPY web_ui .
 RUN npm run build
 
-FROM rust:1.84-slim as builder
+FROM rust:1.93-slim as builder
 
 WORKDIR /build
 
