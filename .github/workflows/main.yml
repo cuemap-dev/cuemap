@@ -35,12 +35,6 @@ jobs:
             npm_os: darwin
             npm_arch: arm64
             pkg_name: engine-darwin-arm64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            arch: x64
-            npm_os: win32
-            npm_arch: x64
-            pkg_name: engine-win32-x64
 
     steps:
       - name: Checkout Repository
