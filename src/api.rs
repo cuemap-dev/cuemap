@@ -1103,7 +1103,7 @@ async fn list_projects(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let EngineState { mt_engine, .. } = state;
     let projects = mt_engine.list_projects();
-    (StatusCode::OK, Json(serde_json::json!({ "projects": projects })))
+    (StatusCode::OK, Json(serde_json::json!(projects)))
 }
 
 async fn create_project(

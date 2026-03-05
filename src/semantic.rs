@@ -36,6 +36,45 @@ impl SemanticEngine {
             // Priority 2: Standard Text format (Slow load, but common)
             let txt_path = dir.join("glove.6B.50d.txt");
 
+            // If neither exists, download the optimized .fifu from GitHub Releases
+            if !fifu_path.exists() && !txt_path.exists() {
+                tracing::info!("GloVe embeddings not found. Downloading from GitHub Releases (86MB)...");
+                let url = "https://github.com/cuemap-dev/cuemap/releases/download/v0.6.6/glove.50d.fifu";
+                
+                let fifu_clone = fifu_path.clone();
+                let dl_result = std::thread::spawn(move || -> Result<(), String> {
+                    // Create data directory if it doesn't exist
+                    if let Some(parent) = fifu_clone.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+
+                    match reqwest::blocking::get(url) {
+                        Ok(mut response) => {
+                            if response.status().is_success() {
+                                if let Ok(mut file) = std::fs::File::create(&fifu_clone) {
+                                    if let Err(e) = std::io::copy(&mut response, &mut file) {
+                                        let _ = std::fs::remove_file(&fifu_clone);
+                                        Err(format!("Failed to write downloaded GloVe file: {}", e))
+                                    } else {
+                                        Ok(())
+                                    }
+                                } else {
+                                    Err("Failed to create file for GloVe embeddings".to_string())
+                                }
+                            } else {
+                                Err(format!("Failed to download GloVe embeddings: HTTP {}", response.status()))
+                            }
+                        }
+                        Err(e) => Err(format!("Failed to download GloVe embeddings: {}", e))
+                    }
+                }).join().unwrap();
+
+                match dl_result {
+                    Ok(_) => tracing::info!("Successfully downloaded GloVe embeddings to {:?}", fifu_path),
+                    Err(e) => tracing::warn!("{}", e),
+                }
+            }
+
             if fifu_path.exists() {
                 debug!("Loading semantic memory from {:?}", fifu_path);
                 match File::open(&fifu_path) {
@@ -137,25 +176,38 @@ impl SemanticEngine {
         let cache = LruCache::new(NonZeroUsize::new(10000).unwrap());
 
         // Initialize POS tagger
-        let pos_tagger = if let Some(dir) = data_dir {
-            let weights_path = dir.join("tagger/weights.json");
-            let classes_path = dir.join("tagger/classes.txt");
-            let tags_path = dir.join("tagger/tags.json");
-            
-            if weights_path.exists() && classes_path.exists() {
-                // Paths must be strings for the library
-                let w_str = weights_path.to_str().unwrap_or_default();
-                let c_str = classes_path.to_str().unwrap_or_default();
-                let t_str = tags_path.to_str().unwrap_or_default();
-                
-                debug!("Loading POS tagger from {:?}", dir.join("tagger"));
-                Some(Arc::new(PerceptronTagger::new(w_str, c_str, t_str)))
-            } else {
-                warn!("POS tagger files not found in {:?}", dir.join("tagger"));
+        let pos_tagger = {
+            // Embed the files directly into the binary
+            let weights_data = include_bytes!("../data/tagger/weights.json");
+            let classes_data = include_bytes!("../data/tagger/classes.txt");
+            let tags_data = include_bytes!("../data/tagger/tags.json");
+
+            // Write them to temporary files so postagger can read them (since its API requires file paths)
+            let temp_dir = std::env::temp_dir().join("cuemap_tagger");
+            if let Err(e) = std::fs::create_dir_all(&temp_dir) {
+                warn!("Failed to create temp directory for POS tagger: {}", e);
                 None
+            } else {
+                let weights_path = temp_dir.join("weights.json");
+                let classes_path = temp_dir.join("classes.txt");
+                let tags_path = temp_dir.join("tags.json");
+
+                let mut success = true;
+                if let Err(e) = std::fs::write(&weights_path, weights_data) { warn!("Failed to write temp weights.json: {}", e); success = false; }
+                if let Err(e) = std::fs::write(&classes_path, classes_data) { warn!("Failed to write temp classes.txt: {}", e); success = false; }
+                if let Err(e) = std::fs::write(&tags_path, tags_data) { warn!("Failed to write temp tags.json: {}", e); success = false; }
+
+                if success {
+                    let w_str = weights_path.to_str().unwrap_or_default();
+                    let c_str = classes_path.to_str().unwrap_or_default();
+                    let t_str = tags_path.to_str().unwrap_or_default();
+                    
+                    debug!("Loading embedded POS tagger from {:?}", temp_dir);
+                    Some(Arc::new(PerceptronTagger::new(w_str, c_str, t_str)))
+                } else {
+                    None
+                }
             }
-        } else {
-            None
         };
 
         Self { 

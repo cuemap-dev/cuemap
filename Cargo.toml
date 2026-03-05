@@ -1,6 +1,6 @@
 [package]
 name = "cuemap"
-version = "0.6.4"
+version = "0.6.6"
 edition = "2021"
 license = "BSL-1.1"
 
@@ -28,7 +28,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 time = "=0.3.36"
 regex = "1.10"
-reqwest = { version = "0.12.26", features = ["json"] }
+reqwest = { version = "0.12.26", features = ["json", "blocking"] }
 smallvec = "1.15.1"
 notify = "8.2.0"
 ignore = "0.4.22"
