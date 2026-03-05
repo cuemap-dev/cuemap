@@ -43,8 +43,11 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
           registry-url: 'https://registry.npmjs.org'
+
+      - name: Update npm
+        run: npm install -g npm@latest
 
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -92,4 +95,4 @@ jobs:
 
       - name: Publish to NPM
         working-directory: npm-packages/${{ matrix.pkg_name }}
-        run: npm publish --access public --provenance
+        run: npm publish --access public
