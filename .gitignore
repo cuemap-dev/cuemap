@@ -2,6 +2,9 @@ target/
 *.rs.bk
 .DS_Store
 .env
-data/
 *.bin
 *.log
+*.fifu
+data/nlprule/
+data/reports/
+data/snapshots/

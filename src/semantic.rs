@@ -202,7 +202,7 @@ impl SemanticEngine {
                     let c_str = classes_path.to_str().unwrap_or_default();
                     let t_str = tags_path.to_str().unwrap_or_default();
                     
-                    debug!("Loading embedded POS tagger from {:?}", temp_dir);
+                    tracing::info!("Loading embedded POS tagger from {:?}", temp_dir);
                     Some(Arc::new(PerceptronTagger::new(w_str, c_str, t_str)))
                 } else {
                     None
