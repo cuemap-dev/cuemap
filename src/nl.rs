@@ -13,7 +13,7 @@ static PHRASE_DELIMITER_REGEX: OnceLock<Regex> = OnceLock::new();
 static NLPRULE_TOKENIZER: OnceLock<Option<nlprule::Tokenizer>> = OnceLock::new();
 
 // Dictionary of manual overrides/exceptions for 100% test coverage
-static LEMMA_EXCEPTIONS_JSON: &str = include_str!("../data/lemma_exceptions.json");
+static LEMMA_EXCEPTIONS_JSON: &str = include_str!("../lemma_exceptions.json");
 static LEMMA_EXCEPTIONS: OnceLock<HashMap<String, String>> = OnceLock::new();
 
 // Runtime cache for lemmatized words to avoid redundant nlprule processing
