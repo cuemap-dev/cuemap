@@ -95,4 +95,4 @@ jobs:
 
       - name: Publish to NPM
         working-directory: npm-packages/${{ matrix.pkg_name }}
-        run: npm publish --access public
+        run: npm publish --access public --verbose
