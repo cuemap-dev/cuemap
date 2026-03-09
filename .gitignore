@@ -8,3 +8,4 @@ target/
 data/nlprule/
 data/reports/
 data/snapshots/
+tests/data/

@@ -688,6 +688,8 @@ async fn run_server(config: config::ServerConfig, load_static: Option<String>, i
                         watch_dir,
                         throttle_ms: config.agent.throttle_ms,
                         state_file: Some(std::path::PathBuf::from(&server_config.data_dir).join("snapshots").join(format!("{}_agent_state.json", meta.project_id))),
+                        ignored_patterns: Vec::new(),
+                        ignored_extensions: Vec::new(),
                     };
                     agent_manager.start_agent(&meta.project_id, agent_config).await;
                 }

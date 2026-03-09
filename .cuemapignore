@@ -1,0 +1,12 @@
+tests/
+web_ui/
+package.json
+package-lock.json
+Cargo.toml
+Cargo.lock
+Dockerfile
+Dockerfile.production
+LICENSE
+data/
+.github/
+lemma_exceptions.json

@@ -24,6 +24,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY build.rs ./
 COPY data ./data
+COPY lemma_exceptions.json ./
 COPY --from=ui-builder /web_ui/dist ./web_ui/dist
 
 # Build release binary (with UI feature enabled)

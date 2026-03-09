@@ -39,30 +39,121 @@ impl Ingester {
         let mut gitignore = None;
         let mut builder = GitignoreBuilder::new(&watch_path);
         
-        // Search for .gitignore in watch_dir AND its parents up to the filesystem root
-        // This is important for monorepos where the root .gitignore is in a parent directory.
-        let mut current = Some(watch_path.as_path());
+        // Search for all .*ignore files recursively in watch_dir
+        // AND its parents (walking up from watch_dir)
         let mut found_any = false;
+
+        // 1. Walk UP from watch_dir to root
+        let mut current = Some(watch_path.as_path());
         while let Some(p) = current {
-            let p_gi = p.join(".gitignore");
-            if p_gi.exists() {
-                 debug!("Loading .gitignore from {:?}", p_gi);
-                 if let Some(err) = builder.add(&p_gi) {
-                    warn!("Error loading .gitignore at {:?}: {}", p_gi, err);
-                } else {
-                    found_any = true;
+            if let Ok(entries) = fs::read_dir(p) {
+                for entry in entries.flatten() {
+                    let file_name = entry.file_name();
+                    let name_str = file_name.to_string_lossy();
+                    if name_str.starts_with('.') && name_str.ends_with("ignore") {
+                        let p_gi = entry.path();
+                        if let Some(err) = builder.add(&p_gi) {
+                            warn!("Error loading ignore file at {:?}: {}", p_gi, err);
+                        } else {
+                            found_any = true;
+                        }
+                    }
                 }
             }
             current = p.parent();
         }
 
-        if found_any {
+        // 2. Walk DOWN from watch_dir (recursive)
+        for result in WalkBuilder::new(&watch_path)
+            .hidden(false)
+            .git_ignore(false)
+            .build() {
+            if let Ok(entry) = result {
+                let file_name = entry.file_name();
+                let name_str = file_name.to_string_lossy();
+                if name_str.starts_with('.') && name_str.ends_with("ignore") {
+                    let p_gi = entry.path();
+                    if let Some(err) = builder.add(&p_gi) {
+                        warn!("Error loading ignore file at {:?}: {}", p_gi, err);
+                    } else {
+                        found_any = true;
+                    }
+                }
+            }
+        }
+
+        // Add default "noise" patterns
+        let default_noise = [
+            // JS/TS
+            "package-lock.json",
+            "yarn.lock",
+            "pnpm-lock.yaml",
+            "bun.lockb",
+            "tsconfig.json",
+            "node_modules/",
+            ".npmrc",
+            ".eslintcache",
+            ".next/",
+            ".nuxt/",
+            "bower_components/",
+            "__snapshots__/",
+            // Rust
+            "Cargo.lock",
+            "target/",
+            // Python
+            "poetry.lock",
+            "Pipfile.lock",
+            "__pycache__/",
+            "venv/",
+            ".venv/",
+            "env/",
+            ".env/",
+            ".pytest_cache/",
+            ".ipynb_checkpoints/",
+            "*.pyc",
+            "*.pyo",
+            "*.pyd",
+            // Go
+            "go.sum",
+            // Java/JVM
+            ".gradle/",
+            ".m2/",
+            "build/", // covers Gradle, target/ is in Rust but also Maven
+            // PHP
+            "composer.lock",
+            // Ruby
+            "Gemfile.lock",
+            // iOS/macOS
+            "Pods/",
+            "DerivedData/",
+            "*.xcodeproj/",
+            "*.xcworkspace/",
+            // System & IDEs
+            ".DS_Store",
+            "Thumbs.db",
+            ".idea/",
+            ".vscode/",
+            ".history/",
+            ".git/",
+            ".svn/",
+            ".hg/",
+        ];
+        for pattern in default_noise {
+            let _ = builder.add_line(None, pattern);
+        }
+
+        // Add custom patterns from config
+        for pattern in &config.ignored_patterns {
+            let _ = builder.add_line(None, pattern);
+        }
+
+        if found_any || !default_noise.is_empty() || !config.ignored_patterns.is_empty() {
             match builder.build() {
                 Ok(gi) => gitignore = Some(gi),
                 Err(e) => warn!("Failed to build gitignore: {}", e),
             }
         } else {
-            debug!("No .gitignore files found in {:?} or its parents", watch_path);
+            debug!("No ignore files or patterns found");
         }
 
         let mut config = config;
@@ -119,9 +210,10 @@ impl Ingester {
         
         let path_str = self.config.watch_dir.clone();
         
-        // Use ignore crate to respect .gitignore
+        // Use ignore crate to respect .gitignore natively (for early pruning)
+        // All other .*ignore files are handled by our unified Gitignore check in process_file_path
         let walker = WalkBuilder::new(&path_str)
-            .hidden(true)
+            .hidden(false)
             .git_ignore(true)
             .build();
 
@@ -170,21 +262,31 @@ impl Ingester {
             }
         }
 
-        // 0.1 Hidden file check (matches behavior of scan_all)
-        // Check if any component starts with a dot (excluding '.' and '..')
-        if path.components().any(|c| {
-            let s = c.as_os_str().to_string_lossy();
-            s.starts_with('.') && s != "." && s != ".."
-        }) {
-            debug!("Skipping hidden path: {}", path_str);
-            return Ok(());
+        // 0.1 Hidden file check (only for files/dirs BELOW watch_dir)
+        if let Ok(rel) = path.strip_prefix(&self.config.watch_dir) {
+            if rel.components().any(|c| {
+                let s = c.as_os_str().to_string_lossy();
+                s.starts_with('.') && s != "." && s != ".." && s != ".gitignore" && s != ".cuemapignore" && s != ".antigravityignore"
+            }) {
+                debug!("Skipping hidden path: {}", path_str);
+                return Ok(());
+            }
         }
 
         // 0.1 Check Gitignore
         if let Some(gi) = &self.gitignore {
-            // gi.matched handles absolute paths by making them relative to the builder's root.
-            if gi.matched(&path, path.is_dir()).is_ignore() {
-                debug!("Skipping gitignored file: {}", path_str);
+            // gi.matched_path_or_any_parents handles absolute paths by making them relative to the builder's root.
+            let match_result = gi.matched_path_or_any_parents(&path, path.is_dir());
+            if match_result.is_ignore() {
+                debug!("Skipping ignored file: {}", path_str);
+                return Ok(());
+            }
+        }
+
+        // 0.2 Check custom ignored extensions
+        if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+            if self.config.ignored_extensions.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
+                debug!("Skipping blacklisted extension: {}", path_str);
                 return Ok(());
             }
         }
@@ -642,6 +744,10 @@ impl Ingester {
         debug!("Fetching and chunking URL: {}", url);
         // Immediate recall uses parallel chunking for speed
         Chunker::chunk_url(url, true).await
+    }
+
+    pub fn get_file_hashes(&self) -> &HashMap<String, String> {
+        &self.file_hashes
     }
 }
 

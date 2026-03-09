@@ -16,6 +16,8 @@ pub struct AgentConfig {
     pub watch_dir: String,
     pub throttle_ms: u64,
     pub state_file: Option<std::path::PathBuf>,
+    pub ignored_patterns: Vec<String>,
+    pub ignored_extensions: Vec<String>,
 }
 
 pub struct Agent {

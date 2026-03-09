@@ -196,6 +196,10 @@ pub struct CreateProjectRequest {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct SetWatchDirRequest {
     pub watch_dir: String,
+    #[serde(default)]
+    pub ignored_patterns: Option<Vec<String>>,
+    #[serde(default)]
+    pub ignored_extensions: Option<Vec<String>>,
 }
 
 // Context API - Query Expansion
@@ -1185,6 +1189,8 @@ async fn set_project_watch_dir(
                 watch_dir: req.watch_dir.clone(),
                 throttle_ms: 100, // Small throttle to prevent CPU pinning
                 state_file: Some(std::path::PathBuf::from(format!("./snapshots/{}_agent_state.json", project_id))),
+                ignored_patterns: req.ignored_patterns.unwrap_or_default(),
+                ignored_extensions: req.ignored_extensions.unwrap_or_default(),
             };
             
             // Spawn the starting of the agent securely
@@ -1709,6 +1715,8 @@ async fn recall_web(
         watch_dir: String::new(),
         throttle_ms: 0,
         state_file: None,
+        ignored_patterns: Vec::new(),
+        ignored_extensions: Vec::new(),
     };
     let ingester = Ingester::new(config.clone(), job_queue.clone());
     let ingester = std::sync::Arc::new(ingester); // Arc for sharing across tasks
@@ -1826,11 +1834,13 @@ async fn recall_web(
         
         tokio::spawn(async move {
              let config = AgentConfig {
-                project_id: project_id_clone.clone(),
-                watch_dir: String::new(),
-                throttle_ms: 0,
-                state_file: None,
-            };
+                 project_id: project_id_clone.clone(),
+                 watch_dir: String::new(),
+                 throttle_ms: 0,
+                 state_file: None,
+                 ignored_patterns: Vec::new(),
+                 ignored_extensions: Vec::new(),
+             };
             let mut async_ingester = Ingester::new(config, job_queue_clone);
             
             // For search results, we have mixed sources. `process_chunks` expects a single source?
@@ -1899,6 +1909,8 @@ async fn ingest_url(
         watch_dir: String::new(), // Not used for API-driven ingestion
         throttle_ms: 0,
         state_file: None,
+        ignored_patterns: Vec::new(),
+        ignored_extensions: Vec::new(),
     };
     let mut ingester = Ingester::new(config, job_queue);
     
@@ -1986,6 +1998,8 @@ async fn ingest_content(
         watch_dir: String::new(),
         throttle_ms: 0,
         state_file: None,
+        ignored_patterns: Vec::new(),
+        ignored_extensions: Vec::new(),
     };
     let mut ingester = Ingester::new(config, job_queue);
     
