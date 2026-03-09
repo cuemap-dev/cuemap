@@ -141,33 +141,27 @@ CueMap provides a native Model Context Protocol (MCP) server, allowing AI coding
 
 ### Setup
 
-The MCP Server is located in the `mcp-server` directory and depends on Node.js.
+We provide a zero-config NPM package that automatically downloads and manages the CueMap background engine.
 
-1. Build the MCP Server:
-```bash
-cd mcp-server
-npm install
-npm run build
-```
-
-2. Add the MCP server to your AI agent's configuration:
+Add the MCP server to your AI agent's configuration (e.g., Claude Desktop, Cursor, or Windsurf):
 ```json
 {
   "mcpServers": {
     "cuemap": {
-      "command": "node",
+      "command": "npx",
       "args": [
-        "/absolute/path/to/cuemap/mcp-server/build/index.js"
+        "-y",
+        "cuemap-mcp"
       ],
       "env": {
-        "CUEMAP_URL": "http://localhost:8080"
+        "CUEMAP_PORT": "8080"
       }
     }
   }
 }
 ```
 
-3. Ensure the CueMap rust engine is running (`cargo run -- start`). The AI Agent can now use the `cuemap_recall` tool to query your codebase memories.
+Once configured, the AI Agent can use the `cuemap_init` and `cuemap_recall` tools to query your codebase memories natively. There is no need to manually start the engine.
 
 ## Project Management & Persistence
 
