@@ -62,10 +62,14 @@ pub struct RecallRequest {
     pub disable_salience_bias: bool,
     #[serde(default)]
     pub disable_systems_consolidation: bool,
+    #[serde(default = "default_expansion_depth")]
+    pub expansion_depth: usize,
     #[serde(default = "default_true")]
     pub disable_alias_expansion: bool,
     #[serde(default = "default_depth")]
     pub depth: usize,
+    #[serde(default)]
+    pub external_lexicons: Option<Vec<String>>,
 }
 
 fn default_depth() -> usize {
@@ -93,6 +97,10 @@ pub struct RecallGroundedRequest {
     pub min_intersection: Option<usize>,
     #[serde(default = "default_true")]
     pub disable_alias_expansion: bool,
+    #[serde(default = "default_expansion_depth")]
+    pub expansion_depth: usize,
+    #[serde(default)]
+    pub external_lexicons: Option<Vec<String>>,
 }
 
 fn default_true() -> bool {
@@ -112,7 +120,11 @@ pub struct RecallGroundedResponse {
 }
 
 fn default_auto_reinforce() -> bool {
-    true
+    false
+}
+
+fn default_expansion_depth() -> usize {
+    1
 }
 
 fn default_limit() -> usize {
@@ -206,10 +218,12 @@ pub struct SetWatchDirRequest {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ContextExpandRequest {
     pub query: String,
-    #[serde(default = "default_context_limit")]
-    pub limit: usize,
+    #[serde(default)]
+    pub limit: Option<usize>,
     #[serde(default)]
     pub min_score: Option<f64>,
+    #[serde(default)]
+    pub external_lexicons: Option<Vec<String>>,
 }
 
 fn default_context_limit() -> usize {
@@ -229,6 +243,40 @@ pub struct ExpansionCandidate {
     pub score: f64,
     pub co_occurrence_count: u64,
     pub source_cues: Vec<String>,
+}
+
+// Context API - Speculative RAG Decoding
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ContextSpeculateRequest {
+    /// The current LLM output prefix to align against memories
+    pub prefix: String,
+    /// Maximum number of continuation candidates to return (default: 3)
+    #[serde(default = "default_speculate_limit")]
+    pub limit: usize,
+    /// Maximum words per continuation (default: 5)
+    #[serde(default = "default_max_continuation_words")]
+    pub max_continuation_words: usize,
+    /// Alignment mode: "strict" or "relaxed" (default: "relaxed")
+    #[serde(default = "default_alignment_mode")]
+    pub alignment_mode: String,
+}
+
+fn default_speculate_limit() -> usize { 3 }
+fn default_max_continuation_words() -> usize { 5 }
+fn default_alignment_mode() -> String { "relaxed".to_string() }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ContextSpeculateResponse {
+    pub continuations: Vec<SpeculationResult>,
+    pub latency_ms: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SpeculationResult {
+    pub words: Vec<String>,
+    pub source_memory_id: String,
+    pub alignment_score: f64,
+    pub recall_score: f64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -254,6 +302,7 @@ pub struct EngineState {
     pub cloud_backup: Option<Arc<CloudBackupManager>>,
     pub signing_key: Option<Arc<Vec<u8>>>,
     pub agent_manager: Arc<crate::agent::manager::AgentManager>,
+    pub global_lexicons: Arc<crate::external_lexicons::GlobalLexicons>,
 }
 
 /// API Routes
@@ -267,6 +316,9 @@ pub fn routes(
     signing_key: Option<Arc<Vec<u8>>>,
     agent_manager: Arc<crate::agent::manager::AgentManager>,
 ) -> Router {
+    let lexicons_dir = crate::config::get_base_dir().join("lexicons");
+    let global_lexicons = Arc::new(crate::external_lexicons::GlobalLexicons::load_from_dir(lexicons_dir));
+
     let mut router = Router::new()
         .route("/", get(root))
         .route("/memories", post(add_memory))
@@ -292,6 +344,7 @@ pub fn routes(
         .route("/ingest/file", post(ingest_file))
         .route("/jobs/status", get(jobs_status))
         .route("/context/expand", post(context_expand))
+        .route("/context/speculate", post(context_speculate))
         .route("/metrics", get(prometheus_metrics))
         // Cloud backup endpoints
         .route("/backup/upload", post(backup_upload))
@@ -308,6 +361,7 @@ pub fn routes(
             cloud_backup,
             signing_key,
             agent_manager,
+            global_lexicons,
         });
     
     // Add auth middleware if enabled
@@ -526,6 +580,12 @@ async fn recall(
                 // Collect cues
                 let mut cues_to_process = req.cues.clone();
                 
+                // Extract mandatory constraints from explicit cues
+                let mandatory_cues: Vec<String> = req.cues.iter()
+                    .map(|c| normalize_cue(c, &ctx.normalization).0)
+                    .collect();
+                let mandatory_cues_ref = if mandatory_cues.is_empty() { None } else { Some(&mandatory_cues) };
+                
                 let (original_tokens, _lexicon_mids) = if let Some(text) = &req.query_text {
                      let (resolved, lex_mids, tokens) = ctx.resolve_cues_from_text(text, false);
                      cues_to_process.extend(resolved);
@@ -565,11 +625,15 @@ async fn recall(
                             current_limit, 
                             false,
                             req.min_intersection,
+                            req.expansion_depth,
                             req.explain,
                             req.disable_pattern_completion,
                             req.disable_salience_bias,
                             req.disable_systems_consolidation,
-                            heatmap_ref
+                            heatmap_ref,
+                            Some(&state.global_lexicons),
+                            req.external_lexicons.as_ref(),
+                            mandatory_cues_ref
                         )
                     };
                     
@@ -691,6 +755,12 @@ async fn recall(
     // Collect cues
     let mut cues_to_process = req.cues.clone();
     
+    // Extract mandatory constraints from explicit cues
+    let mandatory_cues: Vec<String> = req.cues.iter()
+        .map(|c| normalize_cue(c, &ctx.normalization).0)
+        .collect();
+    let mandatory_cues_ref = if mandatory_cues.is_empty() { None } else { Some(&mandatory_cues) };
+    
     let mut lexicon_memory_ids: Vec<String> = Vec::new();
     let mut tokens_from_text = Vec::new();
     if let Some(ref text) = req.query_text {
@@ -744,11 +814,15 @@ async fn recall(
                 current_limit, 
                 false, 
                 req.min_intersection,
+                req.expansion_depth,
                 req.explain,
                 req.disable_pattern_completion,
                 req.disable_salience_bias,
                 req.disable_systems_consolidation,
-                heatmap_ref
+                heatmap_ref,
+                Some(&state.global_lexicons),
+                req.external_lexicons.as_ref(),
+                mandatory_cues_ref
             )
         }; 
         
@@ -1056,11 +1130,15 @@ async fn recall_grounded(
             req.limit.max(20),
             req.auto_reinforce, 
             req.min_intersection,
-            true,
+            req.expansion_depth,
+            true, // explain
             req.disable_pattern_completion,
             req.disable_salience_bias,
             req.disable_systems_consolidation,
-            heatmap_ref
+            heatmap_ref,
+            Some(&state.global_lexicons),
+            req.external_lexicons.as_ref(),
+            None // mandatory_cues not exposed in RecallGroundedRequest
         );
         drop(heatmap); // Guard must be dropped before async return to satisfy Send (even if implicit)
         
@@ -1368,10 +1446,9 @@ async fn lexicon_inspect(
         
         // 2. INCOMING: What tokens map to this canonical cue?
         let mut incoming: Vec<LexiconEntry> = Vec::new();
-        let key_lex = ctx.lexicon.get_master_key();
         for ref_multi in ctx.lexicon.get_memories().iter() {
             let memory = ref_multi.value();
-            let content = memory.access_content(key_lex.as_deref()).unwrap_or_default();
+            let content = ctx.lexicon.read_memory_content(memory).unwrap_or_default();
             if content.to_lowercase() == cue_lower {
                 for token in &memory.cues {
                     let affected = count_affected(token, &content);
@@ -1448,10 +1525,9 @@ async fn lexicon_graph(
         let mut token_to_canonical: HashMap<String, Vec<String>> = HashMap::new();
         
         // Return all entries (no limit)
-        let key = ctx.lexicon.get_master_key();
         for ref_multi in ctx.lexicon.get_memories().iter() {
             let memory = ref_multi.value();
-            let canonical = memory.access_content(key.as_deref()).unwrap_or_default();
+            let canonical = ctx.lexicon.read_memory_content(memory).unwrap_or_default();
             for token in &memory.cues {
                 token_to_canonical.entry(token.clone())
                     .or_default()
@@ -1563,7 +1639,7 @@ async fn lexicon_synonyms(
         
         for ref_multi in ctx.lexicon.get_memories().iter() {
             let memory = ref_multi.value();
-            let content = memory.access_content(ctx.lexicon.get_master_key().as_deref()).unwrap_or_default();
+            let content = ctx.lexicon.read_memory_content(memory).unwrap_or_default();
             let mem_canon = content.to_lowercase();
             
             if mem_canon == cue_lower || memory.cues.iter().any(|c| c.to_lowercase() == cue_lower) {
@@ -1596,11 +1672,10 @@ async fn lexicon_synonyms(
         let mut existing_in_graph: Vec<String> = Vec::new();
         let mut new_suggestions: Vec<String> = Vec::new();
         
-        let key = ctx.lexicon.get_master_key();
         for syn in &suggestions {
             let exists = ctx.lexicon.get_memories().iter().any(|ref_multi| {
                 let memory = ref_multi.value();
-                let content = memory.access_content(key.as_deref()).unwrap_or_default();
+                let content = ctx.lexicon.read_memory_content(memory).unwrap_or_default();
                 content.to_lowercase() == syn.to_lowercase() ||
                 memory.cues.iter().any(|c| c.to_lowercase() == syn.to_lowercase())
             });
@@ -2201,7 +2276,13 @@ async fn context_expand(
         .collect();
     
     // 3. Expand using co-occurrence graph
-    let raw_expansions = ctx.main.expand_cues_from_graph(&normalized_cues, req.limit);
+    let limit = req.limit.unwrap_or_else(default_context_limit);
+    let raw_expansions = ctx.main.expand_cues_from_graph(
+        &normalized_cues, 
+        limit, 
+        Some(&state.global_lexicons),
+        req.external_lexicons.as_ref()
+    );
     
     // 4. Filter by min_score if specified
     let expansions: Vec<ExpansionCandidate> = raw_expansions
@@ -2226,6 +2307,73 @@ async fn context_expand(
     (StatusCode::OK, Json(serde_json::json!({
         "query_cues": normalized_cues,
         "expansions": expansions,
+        "latency_ms": latency_ms
+    })))
+}
+
+/// Context API: Speculative RAG Decoding
+///
+/// Aligns the current LLM output prefix against recalled memories and returns
+/// predicted continuation words. Used inside the LLM decoding loop to apply
+/// logit biases that ground generation in stored facts.
+async fn context_speculate(
+    State(state): State<EngineState>,
+    headers: HeaderMap,
+    Json(req): Json<ContextSpeculateRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use std::time::Instant;
+    let start = Instant::now();
+
+    let EngineState { mt_engine, .. } = state;
+
+    // Extract project ID
+    let project_id = match extract_project_id(&headers) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+
+    // Get project context
+    let ctx = match mt_engine.get_or_create_project(project_id.clone()) {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": e}))),
+    };
+
+    if req.prefix.trim().is_empty() {
+        return (StatusCode::OK, Json(serde_json::json!({
+            "continuations": [],
+            "latency_ms": start.elapsed().as_secs_f64() * 1000.0
+        })));
+    }
+
+    // Parse alignment mode
+    let mode = match req.alignment_mode.as_str() {
+        "strict" => crate::engine::AlignmentMode::Strict,
+        _ => crate::engine::AlignmentMode::Relaxed,
+    };
+
+    // Run speculative alignment
+    let candidates = ctx.main.speculate_continuation(
+        &req.prefix,
+        req.limit,
+        req.max_continuation_words,
+        mode,
+        None,
+    );
+
+    let continuations: Vec<SpeculationResult> = candidates
+        .into_iter()
+        .map(|c| SpeculationResult {
+            words: c.words,
+            source_memory_id: c.source_memory_id,
+            alignment_score: c.alignment_score,
+            recall_score: c.recall_score,
+        })
+        .collect();
+
+    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "continuations": continuations,
         "latency_ms": latency_ms
     })))
 }

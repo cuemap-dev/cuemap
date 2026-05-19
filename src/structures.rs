@@ -158,6 +158,8 @@ pub struct Memory<T> {
     pub cues: Vec<String>,
     #[serde(default)]
     pub metadata: HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub disk_backed: bool,
     /// Type-specific stats payload
     pub stats: T,
 }
@@ -180,6 +182,7 @@ impl<T: Default> Memory<T> {
             last_accessed: now,
             cues: Vec::new(),
             metadata: metadata.unwrap_or_default(),
+            disk_backed: false,
             stats: T::default(),
         }
     }
@@ -191,28 +194,28 @@ impl<T: Default> Memory<T> {
             .as_secs_f64();
     }
     
-    /// Retrieve and decode content as String
-    /// Implements "Smart Access":
-    /// 1. Checks if data is Zstd compressed (Magic Bytes). If so, just decompress.
-    /// 2. If not, assumes Encrypted. Tries to decrypt using key, then decompress.
     pub fn access_content(&self, key: Option<&EncryptionKey>) -> Result<String, String> {
+        Self::decode_content_bytes(&self.content, key)
+    }
+
+    /// Decode content from raw bytes (used when fetching from disk)
+    pub fn decode_content_bytes(bytes: &[u8], key: Option<&EncryptionKey>) -> Result<String, String> {
         // 1. Try to detect if it's just compressed (not encrypted)
-        if crypto::is_compressed(&self.content) {
-            let bytes = crypto::decompress(&self.content)
+        if crypto::is_compressed(bytes) {
+            let decompressed = crypto::decompress(bytes)
                 .map_err(|e| format!("Decompression failed (plaintext): {}", e))?;
-            return String::from_utf8(bytes).map_err(|e| format!("Invalid UTF-8: {}", e));
+            return String::from_utf8(decompressed).map_err(|e| format!("Invalid UTF-8: {}", e));
         }
         
         // 2. Fallback: Assume Encrypted
-        // If content is not Zstd magic bytes, it must be encrypted (unless it's garbage)
         let k = key.ok_or_else(|| "Memory appears encrypted (no magic bytes) but no key provided".to_string())?;
         
-        let compressed = crypto::decrypt(&self.content, k)?;
+        let decrypted = crypto::decrypt(bytes, k)?;
         // The decrypted payload MUST be compressed zstd data
-        let bytes = crypto::decompress(&compressed)
+        let decompressed = crypto::decompress(&decrypted)
             .map_err(|e| format!("Decompression failed (after decrypt): {}", e))?;
             
-        String::from_utf8(bytes).map_err(|e| format!("Invalid UTF-8: {}", e))
+        String::from_utf8(decompressed).map_err(|e| format!("Invalid UTF-8: {}", e))
     }
     
     /// Create payload from string (compress and optionally encrypt)

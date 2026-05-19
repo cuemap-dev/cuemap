@@ -2,6 +2,14 @@
 
 All notable changes to the CueMap Rust Engine will be documented in this file.
 
+## [0.6.7] - 2026-03-15
+
+### Added
+- **Symbol-First BM25 Intent Router**: A high-performance, deterministic NL processing engine that extracts project symbols (via Aho-Corasick) and classifies intent (via BM25) for surgical code queries.
+- **Supercharged Tree-Sitter Ingestion**: Expanded structural `.scm` queries, capturing deep definitions, calls, and imports.
+- **Dynamic Context Expansion**: New `expansion_depth` parameter in recall to automatically retrieve and merge adjacent code chunks sharing a `parent_id` cue.
+- **Aho-Corasick Integration**: Integrated the `aho-corasick` crate for near-instant (nanosecond) project-wide symbol extraction from user queries.
+
 ## [0.6.4] - 2026-03-04
 
 ### Added

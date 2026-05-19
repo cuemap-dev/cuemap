@@ -82,3 +82,47 @@ fn test_stemming() {
     assert!(cues1.contains(&"add_comment".to_string()));
     assert!(cues2.contains(&"add_comment".to_string()));
 }
+
+#[test]
+fn test_symbol_router_intents() {
+    let mut symbols = std::collections::HashSet::new();
+    symbols.insert("process_data".to_string());
+    symbols.insert("UserStore".to_string());
+    symbols.insert("ingest".to_string());
+    
+    let router = SymbolRouter::new(symbols);
+    
+    // Test FIND_CALLS
+    let (intent, extracted) = router.route("where is process_data used?");
+    assert_eq!(intent, Intent::FindCalls);
+    assert_eq!(extracted, vec!["process_data"]);
+    
+    // Test FIND_DEF
+    let (intent, extracted) = router.route("what does the UserStore class do?");
+    assert_eq!(intent, Intent::FindDef);
+    assert_eq!(extracted, vec!["UserStore"]);
+    
+    // Test FIND_IMPORTS
+    let (intent, extracted) = router.route("show me imports for ingest");
+    assert_eq!(intent, Intent::FindImports);
+    assert_eq!(extracted, vec!["ingest"]);
+    
+    // Test Generic
+    let (intent, extracted) = router.route("hello process_data");
+    assert_eq!(intent, Intent::Generic);
+    assert_eq!(extracted, vec!["process_data"]);
+}
+
+#[test]
+fn test_symbol_router_compilation() {
+    let mut symbols = std::collections::HashSet::new();
+    symbols.insert("auth_service".to_string());
+    let router = SymbolRouter::new(symbols);
+    
+    let cues = router.compile_to_cues(Intent::FindCalls, vec!["auth_service".to_string()]);
+    assert!(cues.contains(&"calls_function:auth_service".to_string()));
+    assert!(cues.contains(&"calls_method:auth_service".to_string()));
+    
+    let cues_def = router.compile_to_cues(Intent::FindDef, vec!["auth_service".to_string()]);
+    assert!(cues_def.contains(&"defines_function:auth_service".to_string()));
+}

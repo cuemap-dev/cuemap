@@ -1,16 +1,16 @@
 # CueMap Rust Engine
 
-**High-performance temporal-associative memory store** that mimics the brain's recall mechanism.
+**High-performance temporal-associative memory store** designed for dynamic contextual retrieval.
 
 ## Overview
 
-CueMap implements a **Continuous Gradient Algorithm** inspired by biological memory:
+CueMap implements a **Continuous Gradient Algorithm** optimized for associative data structures:
 
 1.  **Intersection (Context Filter)**: Triangulates relevant memories by overlapping cues
 2.  **Pattern Completion (Associative Recall)**: Automatically infers missing cues from co-occurrence history, enabling recall from partial inputs.
-3.  **Recency & Salience (Signal Dynamics)**: Balances fresh data with salient, high-signal events prioritized by the Amygdala-inspired salience module.
-4.  **Reinforcement (Hebbian Learning)**: Frequently accessed memories gain signal strength, staying "front of mind" even as they age.
-5.  **Autonomous Consolidation**: Periodically merges overlapping memories into summaries, mimicking systems consolidation to preserve signal while reducing noise.
+3.  **Recency & Salience (Signal Dynamics)**: Balances fresh data with salient, high-signal events prioritized by an adaptive impact scoring module.
+4.  **Reinforcement (Access-based Learning)**: Frequently accessed memories gain signal strength, remaining highly accessible even as they age.
+5.  **Autonomous Consolidation**: Periodically merges overlapping memories into summaries using background index compaction to preserve signal while reducing noise.
 
 Built with Rust for maximum performance and reliability.
 
@@ -128,11 +128,11 @@ On startup, if `--agent-dir` is provided, CueMap initializes the **Self-Learning
 ./target/release/cuemap-rust --agent-dir ~/projects/my-app
 
 # The agent will automatically:
-# 1. Structural Chunking (Python, Rust, JS/TS, Go, Java, PHP, HTML, CSS).
-#    - Recursive tree-sitter extraction captures 'name:Calculator', 'selector:.btn', etc.
+# 1. Supercharged Structural Ingestion (Rust, Python, Go, JS/TS, PHP, Java).
+#    - Native tree-sitter queries capture definitions, calls, and imports as grounded cues.
 # 2. Document & Data Parsing (PDF, Word, Excel, JSON, CSV, YAML, XML).
-#    - Extracts headers, keys, and metadata as grounded structural cues, in addition to cues inferred from content.
-# 3. Immediate ingestion into the memory store. 
+#    - Extracts headers, keys, and metadata as structural metadata.
+# 3. Dynamic Linkage: Chunks share 'parent_id' for automatic context expansion during recall.
 ```
 
 ## AI Agent Integration (MCP Server)
@@ -387,7 +387,7 @@ Tests performed on **Real-World Data** (Wikipedia Articles), processing full nat
 
 CueMap can automatically propose cues for your memories using **Semantic Engine**.
 
-**No LLM required!** By default, CueMap uses its internal **Semantic Engine** (WordNet) and **Global Context** to generate cues instantly.
+**No LLM required!** By default, CueMap uses its internal **Semantic Engine** (WordNet + Internal Lexicon) and **Global Context** to generate cues instantly.
 
 ```bash
 # 1. Start CueMap (no Ollama needed)
@@ -441,18 +441,18 @@ curl -X POST http://localhost:8080/recall \
   }'
 ```
 
-#### Natural Language Search (Deterministic)
+#### Natural Language Search (Symbol-First Intent Routing)
 ```bash
 curl -X POST http://localhost:8080/recall \
   -H "X-Project-ID: default" \
   -H "Content-Type: application/json" \
   -d '{
-    "query_text": "payments service timeout",
+    "query_text": "where is process_data used?",
     "limit": 10,
-    "explain": true
+    "expansion_depth": 2
   }'
 ```
-Returns memories matching tokens mapped via the local Lexicon CueMap. Use `"explain": true` to see how the query was normalized and expanded.
+Returns surgical code recall. The engine uses a deterministic **Symbol-First Router** (Aho-Corasick + BM25) to convert fuzzy queries into structural cues (e.g., `calls_function:process_data`). Set `expansion_depth` to 2 to automatically include surrounding code blocks.
 
 ```json
 {
@@ -601,6 +601,28 @@ curl -X POST http://localhost:8080/context/expand \
 #     { "term": "SIGKILL", "score": 22.0, "co_occurrence_count": 8 }
 #   ]
 # }
+```
+
+### External Lexicons
+
+External lexicons pre-load Cuemap with domain-specific associations (e.g., StackOverflow data for specific programming languages), solving the **cold start problem**. By importing these pre-trained graphs, the engine gains an immediate semantic-ish understanding of technical jargon before you even ingest any internal memory.
+
+This leads to:
+1. **Better Cue Generation**: Identifies and extracts relevant architectural concepts that internal data alone might gloss over.
+2. **Surgical Recall**: Employs specificity weighting (IDF) to down-weight ubiquitous "hub" terms, ensuring highly domain-specific context expansion from fuzzy queries.
+
+To use an external lexicon, drop the trained `.bin` file into your `~/.cuemap/lexicons/` directory.
+
+You can selectively apply external lexicons during recall and expansion:
+```bash
+curl -X POST http://localhost:8080/context/expand \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "pdo",
+    "limit": 5,
+    "external_lexicons": ["php"]
+  }'
+# Response uses the dense external graph to infer: mysql, prepared-statement, bindparam...
 ```
 
 ### Cloud Backup Management
@@ -842,7 +864,7 @@ sequenceDiagram
     end
     
     API->>Main: recall_weighted(cues, limit, options)
-    Main->>Main: Pattern Completion (CA3)
+    Main->>Main: Pattern Completion
     Main->>Main: Salience Bias
     Main->>Main: Score & Rank
     
@@ -1074,21 +1096,21 @@ Intersection + Recency scoring:
 
 The Lexicon **adapts to your domain's semantics** automatically. No manual disambiguation rules needed!
 
-### 3. Brain-Inspired Advanced Recall
+### 3. Advanced Contextual Recall
 
-CueMap introduces deep biological inspiration into the deterministic recall engine:
+CueMap introduces advanced semantic capabilities into the deterministic recall engine:
 
-#### Hippocampal Pattern Completion
+#### Pattern Completion
 Given partial cues, the engine recalls the whole memory by maintaining an incremental cue co-occurrence matrix. This expansion happens strictly at retrieval-time and can be toggled off via `disable_pattern_completion: true` for pure deterministic matching.
 
 #### Temporal Episode Chunking
-Experiences are automatically chunked into episodes. Memories created in close temporal proximity with high cue overlap are tagged with `episode:<id>`, allowing the engine to recall entire "storylines" from a single member. Can be disabled per-request via `disable_temporal_chunking: true`.
+Experiences are automatically grouped into contextual episodes. Memories created in close temporal proximity with high cue overlap are tagged with `episode:<id>`, allowing the engine to recall related sequences of events from a single member. Can be disabled per-request via `disable_temporal_chunking: true`.
 
-#### Salience Bias (Amygdala)
-Not all memories are created equal. The engine calculates a **Salience Multiplier** based on cue density, reinforcement frequency, and rare cue combinations. Salient memories persist longer in the "warm" cache and rank higher than routine events. Can be disabled per-recall via `disable_salience_bias: true`.
+#### Adaptive Salience Bias
+Not all memories are created equal. The engine calculates a **Salience Multiplier** based on cue density, reinforcement frequency, and rare cue combinations. Important memories persist longer in the "warm" cache and rank higher than routine events. Can be disabled per-recall via `disable_salience_bias: true`.
 
-#### Systems Consolidation
-Old, highly overlapping memories are periodically merged into summarized "gist" memories. This process is strictly additive: it keeps the original high-resolution memories intact as Ground Truth while creating new consolidated summaries to aid high-level recall. Can be toggled at retrieval via `disable_systems_consolidation: true`.
+#### Background Index Consolidation
+Old, highly overlapping memories are periodically merged into summarized high-level memories. This process is strictly additive: it keeps the original high-resolution memories intact as Ground Truth while creating new consolidated summaries to aid broader recall. Can be toggled at retrieval via `disable_systems_consolidation: true`.
 
 #### Match Integrity
 Every recall result now includes a **Match Integrity** score. This internal diagnostic combines intersection strength, reinforcement history, and context agreement to tell you how structurally reliable a specific recall result is.

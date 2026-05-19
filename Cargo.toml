@@ -1,12 +1,20 @@
 [package]
 name = "cuemap"
-version = "0.6.6"
+version = "0.6.7"
 edition = "2021"
 license = "BSL-1.1"
 
 [[bin]]
 name = "cuemap"
 path = "src/main.rs"
+
+[[bin]]
+name = "check_bin"
+path = "src/bin/check_bin.rs"
+
+[[bin]]
+name = "so_lexicon_builder"
+path = "src/bin/so_lexicon_builder.rs"
 
 [dependencies]
 axum = { version = "0.7", features = ["macros"] }
@@ -28,6 +36,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 time = "=0.3.36"
 regex = "1.10"
+aho-corasick = "1.1"
 reqwest = { version = "0.12.26", features = ["json", "blocking"] }
 smallvec = "1.15.1"
 notify = "8.2.0"
@@ -81,6 +90,7 @@ rpassword = "7.3"
 base64 = "0.21"
 ahash = "0.8"
 toml = "1.0.3"
+quick-xml = "0.39.2"
 
 [features]
 default = []

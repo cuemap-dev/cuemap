@@ -634,7 +634,7 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>, metrics: &Op
                 tokio::task::spawn_blocking(move || {
                      // Fetch memory from main engine
                      if let Some(memory) = ctx_clone.main.get_memory(&memory_id_clone) {
-                         let content = memory.access_content(ctx_clone.main.get_master_key().as_deref()).unwrap_or_default();
+                         let content = ctx_clone.main.read_memory_content(&memory).unwrap_or_default();
                          train_lexicon_impl(&ctx_clone, &memory_id_clone, &content);
                      }
                 }).await.unwrap();
@@ -1118,7 +1118,7 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>, metrics: &Op
                                     .map(|c| crate::nl::Language::from(c.as_str()))
                                     .unwrap_or(crate::nl::Language::Default);
                                 // Use content as query
-                                let content = mem.access_content(ctx_clone.main.get_master_key().as_deref()).unwrap_or_default();
+                                let content = ctx_clone.main.read_memory_content(&mem).unwrap_or_default();
                                 let ripple_results = ctx_clone.main.recall_fast(
                                     crate::nl::tokenize_to_cues_with_lang(&content, lang), 
                                     10

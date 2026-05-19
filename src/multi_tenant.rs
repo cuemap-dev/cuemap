@@ -61,6 +61,7 @@ pub struct MultiTenantEngine {
     master_key: Option<Arc<EncryptionKey>>,
     tuning: Arc<TuningConfig>,
     llm_config: Arc<LlmConfig>,
+    config: crate::config::ServerConfig,
 }
 
 impl MultiTenantEngine {
@@ -85,6 +86,20 @@ impl MultiTenantEngine {
             master_key: None,
             tuning: Arc::new(tuning),
             llm_config: Arc::new(llm_config),
+            config: crate::config::ServerConfig::default(),
+        }
+    }
+    
+    pub fn with_config(config: crate::config::ServerConfig, snapshots_dir: PathBuf, semantic_engine: SemanticEngine) -> Self {
+        Self {
+            projects: Arc::new(DashMap::with_hasher(RandomState::new())),
+            snapshots_dir,
+            cuegen_strategy: config.search.cuegen_strategy.clone(),
+            semantic_engine,
+            master_key: None,
+            tuning: Arc::new(config.tuning.clone()),
+            llm_config: Arc::new(config.llm.clone()),
+            config,
         }
     }
 
@@ -107,6 +122,8 @@ impl MultiTenantEngine {
                 self.semantic_engine.clone(),
                 self.tuning.clone(),
                 self.llm_config.clone(),
+                self.config.clone(),
+                project_id.clone(),
             );
             
             // Set master key on engines
@@ -223,18 +240,21 @@ impl MultiTenantEngine {
         }
         
         // Load main engine (required)
-        let (memories, cue_index) = PersistenceManager::load_from_path::<MainStats>(&main_path)
+        let (memories, cue_index, main_graph, main_counts) = PersistenceManager::load_from_path::<MainStats>(&main_path)
             .map_err(|e| format!("Failed to load main engine: {}", e))?;
-        let mut main_engine = CueMapEngine::from_state(memories, cue_index);
+        let mut main_engine = CueMapEngine::from_state(memories, cue_index, main_graph, main_counts, self.config.clone(), project_id.clone());
         main_engine.set_master_key(self.master_key.clone());
         main_engine.set_tuning_config(self.tuning.as_ref().clone());
         
         // Load aliases engine (optional - may not exist for older snapshots)
         let mut aliases_engine = if aliases_path.exists() {
             match PersistenceManager::load_from_path::<MainStats>(&aliases_path) {
-                Ok((memories, cue_index)) => {
+                Ok((memories, cue_index, aliases_graph, aliases_counts)) => {
                     tracing::debug!("Loaded aliases for project '{}'", project_id);
-                    CueMapEngine::from_state(memories, cue_index)
+                    let mut local_config = self.config.clone();
+                    local_config.server.store_content_on_disk = false;
+                    let engine = CueMapEngine::from_state(memories, cue_index, aliases_graph, aliases_counts, local_config, project_id.clone());
+                    engine
                 }
                 Err(e) => {
                     tracing::warn!("Failed to load aliases for '{}': {}", project_id, e);
@@ -250,9 +270,12 @@ impl MultiTenantEngine {
         // Load lexicon engine (optional - may not exist for older snapshots)
         let mut lexicon_engine = if lexicon_path.exists() {
             match PersistenceManager::load_from_path::<LexiconStats>(&lexicon_path) {
-                Ok((memories, cue_index)) => {
+                Ok((memories, cue_index, lex_graph, lex_counts)) => {
                     tracing::debug!("Loaded lexicon for project '{}'", project_id);
-                    CueMapEngine::from_state(memories, cue_index)
+                    let mut local_config = self.config.clone();
+                    local_config.server.store_content_on_disk = false;
+                    let engine = CueMapEngine::from_state(memories, cue_index, lex_graph, lex_counts, local_config, project_id.clone());
+                    engine
                 }
                 Err(e) => {
                     tracing::warn!("Failed to load lexicon for '{}': {}", project_id, e);

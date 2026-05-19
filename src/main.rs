@@ -158,6 +158,10 @@ struct StartArgs {
     #[arg(long)]
     enable_consolidation: bool,
 
+    /// Store memory contents on disk instead of RAM to reduce memory usage
+    #[arg(long)]
+    disk_content: bool,
+
     // ========== Cloud Backup Options ==========
     
     /// Cloud backup provider (s3, gcs, azure, local)
@@ -268,6 +272,10 @@ struct RecallArgs {
     /// Token budget for grounded recall (context window)
     #[arg(long, default_value = "500")]
     token_budget: u32,
+
+    /// Server port (overrides config)
+    #[arg(long, default_value = "8080")]
+    pub port: u16,
     /// Disable automatic reinforcement during recall
     #[arg(long)]
     no_auto_reinforce: bool,
@@ -283,9 +291,16 @@ struct RecallArgs {
     /// Disable systems consolidation (long-term memory integration)
     #[arg(long)]
     disable_systems_consolidation: bool,
+    #[arg(long, default_value_t = 1)]
+    pub expansion_depth: usize,
+
+    /// External lexicons to include (comma-separated, e.g. "rust,python")
+    #[arg(long, value_delimiter = ',')]
+    pub external_lexicons: Option<Vec<String>>,
+
     /// Enable alias expansion (default: disabled)
     #[arg(long)]
-    enable_alias_expansion: bool,
+    pub enable_alias_expansion: bool,
     /// Enable grounded recall (RAG context)
     #[arg(short, long)]
     grounded: bool,
@@ -378,19 +393,23 @@ struct AliasArgs {
 #[derive(Parser, Debug)]
 struct ExpandArgs {
     /// Text to expand
-    text: String,
+    pub text: String,
     /// Project ID
     #[arg(short, long)]
-    project: Option<String>,
+    pub project: Option<String>,
     /// Limit candidates
     #[arg(short, long, default_value = "5")]
-    limit: usize,
+    pub limit: usize,
     /// Minimum similarity score (0.0 to 1.0)
     #[arg(short, long)]
-    min_score: Option<f64>,
+    pub min_score: Option<f64>,
     /// Server URL
     #[arg(long, default_value = "http://localhost:8080")]
-    url: String,
+    pub url: String,
+
+    /// External lexicons to include (comma-separated)
+    #[arg(long, value_delimiter = ',')]
+    pub external_lexicons: Option<Vec<String>>,
 }
 
 #[derive(Parser, Debug)]
@@ -458,6 +477,7 @@ async fn main() {
                 
                 // For "enable" flags: if CLI says enable, force enable.
                 if args.enable_consolidation { config.jobs.consolidation_enabled = true; }
+                if args.disk_content { config.server.store_content_on_disk = true; }
                 
                 // Cloud overrides
                 if let Some(p) = &args.cloud_backup { config.persistence.cloud.provider = p.clone(); }
@@ -543,7 +563,6 @@ async fn run_server(config: config::ServerConfig, load_static: Option<String>, i
     
     // Initialize Semantic Engine
     let semantic_engine = SemanticEngine::new(Some(Path::new(&assets_path)));
-    let cuegen_strategy = config.search.cuegen_strategy.clone();
 
     
     use cuemap::crypto::EncryptionKey;
@@ -557,12 +576,10 @@ async fn run_server(config: config::ServerConfig, load_static: Option<String>, i
         PathBuf::from(&server_config.data_dir).join("snapshots").to_string_lossy().to_string()
     };
     
-    let mut mt_engine = multi_tenant::MultiTenantEngine::with_snapshots_dir(
-        &snapshots_dir,
-        cuegen_strategy.clone(),
+    let mut mt_engine = multi_tenant::MultiTenantEngine::with_config(
+        config.clone(),
+        PathBuf::from(&snapshots_dir),
         semantic_engine.clone(),
-        config.tuning.clone(),
-        config.llm.clone(),
     );
 
     // Master Key Discovery Hierarchy
@@ -945,6 +962,8 @@ async fn handle_recall(args: RecallArgs) {
             disable_systems_consolidation: args.disable_systems_consolidation,
             min_intersection: args.min_intersection,
             disable_alias_expansion: !args.enable_alias_expansion,
+            expansion_depth: args.expansion_depth,
+            external_lexicons: args.external_lexicons.clone(),
         };
         let res = client.post(format!("{}/recall/grounded", args.url))
             .header("X-Project-ID", project)
@@ -1009,6 +1028,8 @@ async fn handle_recall(args: RecallArgs) {
             disable_systems_consolidation: args.disable_systems_consolidation,
             disable_alias_expansion: !args.enable_alias_expansion,
             depth: args.depth,
+            expansion_depth: args.expansion_depth,
+            external_lexicons: args.external_lexicons,
         };
         let res = client.post(format!("{}/recall", args.url))
             .header("X-Project-ID", project)
@@ -1176,8 +1197,9 @@ async fn handle_expand(args: ExpandArgs) {
     
     let payload = api::ContextExpandRequest {
         query: args.text,
-        limit: args.limit,
+        limit: Some(args.limit),
         min_score: args.min_score,
+        external_lexicons: args.external_lexicons,
     };
     
     let res = client.post(format!("{}/context/expand", args.url))

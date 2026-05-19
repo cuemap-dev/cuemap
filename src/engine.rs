@@ -43,6 +43,30 @@ pub struct ScoredMemoryCandidate {
     pub match_count: f64,
 }
 
+/// Result of speculative alignment: a predicted continuation from a recalled memory.
+#[derive(Debug, Clone, Serialize)]
+pub struct SpeculationCandidate {
+    /// The predicted next words (raw, preserving original casing from memory)
+    pub words: Vec<String>,
+    /// The memory ID this continuation came from
+    pub source_memory_id: String,
+    /// How well the prefix aligned with the memory (0.0 - 1.0)
+    pub alignment_score: f64,
+    /// The recall score of the source memory
+    pub recall_score: f64,
+}
+
+/// Controls how prefix-to-memory alignment is computed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlignmentMode {
+    /// Order-preserving subsequence matching. Higher precision,
+    /// but misses paraphrased content.
+    Strict,
+    /// Bag-of-words overlap with recency weighting (words near the
+    /// end of the prefix contribute more). Better for paraphrases.
+    Relaxed,
+}
+
 #[derive(Clone)]
 pub struct CueMapEngine<T>
 where
@@ -51,7 +75,7 @@ where
     memories: Arc<DashMap<String, Memory<T>, RandomState>>,
     cue_index: Arc<DashMap<String, OrderedSet, RandomState>>,
     // Pattern Completion: cue co-occurrence matrix
-    cue_co_occurrence: Arc<DashMap<String, DashMap<String, u64, RandomState>, RandomState>>,
+    cue_co_occurrence: Arc<DashMap<String, HashMap<String, u64>, RandomState>>,
     // Temporal Chunking: track last event per session/project
     last_events: Arc<DashMap<String, (String, f64, Vec<String>), RandomState>>,
     
@@ -59,6 +83,12 @@ where
     cue_count: Arc<AtomicUsize>,
     master_key: Option<Arc<EncryptionKey>>,
     tuning: Arc<TuningConfig>,
+    /// Global occurrences of each cue (for IDF weighting)
+    pub cue_global_counts: Arc<DashMap<String, u64, RandomState>>,
+    
+    // Storage context
+    pub config: crate::config::ServerConfig,
+    pub project_id: String,
 }
 
 
@@ -77,6 +107,9 @@ where
             cue_count: Arc::new(AtomicUsize::new(0)),
             master_key: None,
             tuning: Arc::new(TuningConfig::default()),
+            cue_global_counts: Arc::new(DashMap::with_hasher(RandomState::new())),
+            config: crate::config::ServerConfig::default(),
+            project_id: "default".to_string(),
         }
     }
 
@@ -109,27 +142,82 @@ where
     pub fn from_state(
         memories: DashMap<String, Memory<T>, RandomState>,
         cue_index: DashMap<String, OrderedSet, RandomState>,
+        loaded_co_occurrence: Option<DashMap<String, HashMap<String, u64>, RandomState>>,
+        loaded_global_counts: Option<DashMap<String, u64, RandomState>>,
+        config: crate::config::ServerConfig,
+        project_id: String,
     ) -> Self {
+        let cue_co_occurrence = loaded_co_occurrence
+            .map(Arc::new)
+            .unwrap_or_else(|| Arc::new(DashMap::with_hasher(RandomState::new())));
+            
+        let cue_global_counts = loaded_global_counts
+            .map(Arc::new)
+            .unwrap_or_else(|| Arc::new(DashMap::with_hasher(RandomState::new())));
+
         let count = memories.len();
         let engine = Self {
             memories: Arc::new(memories),
             cue_index: Arc::new(cue_index),
-            cue_co_occurrence: Arc::new(DashMap::with_hasher(RandomState::new())), 
+            cue_co_occurrence, 
+            cue_global_counts,
             last_events: Arc::new(DashMap::with_hasher(RandomState::new())),
             memory_count: Arc::new(AtomicUsize::new(count)),
-            cue_count: Arc::new(AtomicUsize::new(0)), // Cues will be lazy counted or we need to pass it
+            cue_count: Arc::new(AtomicUsize::new(0)),
             master_key: None,
             tuning: Arc::new(TuningConfig::default()),
+            config: config.clone(),
+            project_id: project_id.clone(),
         };
 
-
-        // Rehydrate co-occurrence matrix from existing memories
-        // This ensures the graph and pattern completion work after restart
-        for r in engine.memories.iter() {
-            let memory = r.value();
-            engine.update_cue_co_occurrence(&memory.cues);
+        // Migration logic: Sync RAM/Disk state with config
+        if config.server.store_content_on_disk {
+            // Move loaded memories to disk
+            let disk_dir = engine.get_disk_content_dir();
+            for mut entry in engine.memories.iter_mut() {
+                let memory = entry.value_mut();
+                if !memory.disk_backed && !memory.content.is_empty() {
+                    let path = disk_dir.join(format!("{}.bin", memory.id));
+                    if let Err(e) = std::fs::write(&path, &memory.content) {
+                        tracing::error!("Migration (RAM -> Disk): Failed for {}: {}", memory.id, e);
+                    } else {
+                        memory.content = vec![];
+                        memory.disk_backed = true;
+                    }
+                }
+            }
+        } else {
+            // Move disk-backed memories back to RAM
+            let disk_dir = engine.get_disk_content_dir();
+            let mut migrated_count = 0;
+            for mut entry in engine.memories.iter_mut() {
+                let memory = entry.value_mut();
+                if memory.disk_backed {
+                    let path = disk_dir.join(format!("{}.bin", memory.id));
+                    if path.exists() {
+                        match std::fs::read(&path) {
+                            Ok(bytes) => {
+                                memory.content = bytes;
+                                memory.disk_backed = false;
+                                migrated_count += 1;
+                                // Clean up disk file
+                                let _ = std::fs::remove_file(&path);
+                            }
+                            Err(e) => tracing::error!("Migration (Disk -> RAM): Failed to read {}: {}", memory.id, e),
+                        }
+                    }
+                }
+            }
+            if migrated_count > 0 {
+                tracing::info!("Migration (Disk -> RAM): Successfully restored {} memories to RAM", migrated_count);
+            }
         }
 
+        // Co-occurrence graph is populated lazily during normal operation.
+        // Rebuilding from all memories on load is O(N*M²) and causes massive
+        // memory spikes when loading many projects (e.g. 500 eval snapshots).
+        // The graph will naturally fill as new memories are added or recalled.
+        
         engine
     }
     
@@ -141,8 +229,19 @@ where
     pub fn get_cue_index(&self) -> &Arc<DashMap<String, OrderedSet, RandomState>> {
         &self.cue_index
     }
+
+    pub fn get_cue_co_occurrence(&self) -> &Arc<DashMap<String, HashMap<String, u64>, RandomState>> {
+        &self.cue_co_occurrence
+    }
     
     pub fn update_cue_co_occurrence(&self, cues: &[String]) {
+        // First, increment global counts for each cue
+        for cue in cues {
+            let normalized = cue.to_lowercase().trim().to_string();
+            if normalized.is_empty() { continue; }
+            *self.cue_global_counts.entry(normalized).or_insert(0) += 1;
+        }
+
         for i in 0..cues.len() {
             let cue_a = cues[i].to_lowercase().trim().to_string();
             if cue_a.is_empty() { continue; }
@@ -154,7 +253,7 @@ where
                 // Update A -> B
                 self.cue_co_occurrence
                     .entry(cue_a.clone())
-                    .or_insert_with(|| DashMap::with_hasher(RandomState::new()))
+                    .or_insert_with(HashMap::new)
                     .entry(cue_b.clone())
                     .and_modify(|c| *c += 1)
                     .or_insert(1);
@@ -162,11 +261,56 @@ where
                 // Update B -> A
                 self.cue_co_occurrence
                     .entry(cue_b.clone())
-                    .or_insert_with(|| DashMap::with_hasher(RandomState::new()))
+                    .or_insert_with(HashMap::new)
                     .entry(cue_a.clone())
                     .and_modify(|c| *c += 1)
                     .or_insert(1);
             }
+        }
+    }
+
+    pub fn increment_co_occurrence(&self, cue_a: &str, cue_b: &str) {
+        let a = cue_a.to_lowercase().trim().to_string();
+        let b = cue_b.to_lowercase().trim().to_string();
+        if a.is_empty() || b.is_empty() || a == b { return; }
+        
+        // Update A -> B
+        self.cue_co_occurrence
+            .entry(a.clone())
+            .or_insert_with(HashMap::new)
+            .entry(b.clone())
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
+        
+        // Update B -> A
+        self.cue_co_occurrence
+            .entry(b)
+            .or_insert_with(HashMap::new)
+            .entry(a)
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
+    }
+
+    /// Helper to determine the storage path for disk-backed contents
+    pub fn get_disk_content_dir(&self) -> std::path::PathBuf {
+        let path = std::path::PathBuf::from(&self.config.server.data_dir)
+            .join("contents")
+            .join(&self.project_id);
+            
+        if !path.exists() {
+            let _ = std::fs::create_dir_all(&path);
+        }
+        path
+    }
+
+    /// Read memory content dynamically, handling disk-backed resolution
+    pub fn read_memory_content(&self, memory: &Memory<T>) -> Result<String, String> {
+        if memory.disk_backed {
+            let path = self.get_disk_content_dir().join(format!("{}.bin", memory.id));
+            let bytes = std::fs::read(&path).map_err(|e| format!("Disk read error: {}", e))?;
+            Memory::<T>::decode_content_bytes(&bytes, self.master_key.as_deref())
+        } else {
+            memory.access_content(self.master_key.as_deref())
         }
     }
 
@@ -193,6 +337,17 @@ where
         // Store cues in memory
         memory.cues = cues.clone();
         memory.stats = stats;
+        
+        // Handle disk-backed contents
+        if self.config.server.store_content_on_disk {
+            let path = self.get_disk_content_dir().join(format!("{}.bin", memory.id));
+            if let Err(e) = std::fs::write(&path, &memory.content) {
+                tracing::error!("Failed to write memory content to disk: {}", e);
+            } else {
+                memory.content = vec![]; // Clear from RAM
+                memory.disk_backed = true;
+            }
+        }
         
         // 1. Temporal Chunking
         let project_id = memory.metadata.get("project_id")
@@ -363,7 +518,21 @@ where
                 if let Some(mut memory) = self.memories.get_mut(&id) {
                     // Update content ALWAYS
                     match Memory::<T>::create_payload(&content, self.master_key.as_deref()) {
-                        Ok(p) => memory.content = p,
+                        Ok(p) => {
+                            if self.config.server.store_content_on_disk {
+                                let path = self.get_disk_content_dir().join(format!("{}.bin", id));
+                                if let Err(e) = std::fs::write(&path, &p) {
+                                    tracing::error!("Failed to update memory content on disk: {}", e);
+                                    memory.content = p;
+                                } else {
+                                    memory.content = vec![];
+                                    memory.disk_backed = true;
+                                }
+                            } else {
+                                memory.content = p;
+                                memory.disk_backed = false;
+                            }
+                        },
                         Err(e) => tracing::error!("Failed to update content: {}", e),
                     }
                     
@@ -581,7 +750,7 @@ where
             .map(|c| (c, 1.0))
             .collect();
             
-        self.recall_weighted(weighted_cues, limit, auto_reinforce, min_intersection, false, false, false, false, heatmap)
+        self.recall_weighted(weighted_cues, limit, auto_reinforce, min_intersection, 1, false, false, false, false, heatmap, None, None, None)
     }
 
     /// O(limit) recall using intersection-first strategy.
@@ -633,7 +802,7 @@ where
 
             // 5. Fetch memory and build result
             if let Some(memory) = self.memories.get(memory_id) {
-                let decrypted_content = memory.access_content(self.master_key.as_deref())
+                let decrypted_content = self.read_memory_content(memory.value())
                     .unwrap_or_else(|_| "<decryption failed>".to_string());
                 
                 results.push(RecallResult {
@@ -684,7 +853,7 @@ where
                     seen.insert(memory_id.clone());
                     
                     if let Some(memory) = self.memories.get(memory_id) {
-                        let decrypted_content = memory.access_content(self.master_key.as_deref())
+                        let decrypted_content = self.read_memory_content(memory.value())
                              .unwrap_or_else(|_| "<decryption failed>".to_string());
 
                         candidates.push(RecallResult {
@@ -734,11 +903,15 @@ where
         limit: usize,
         auto_reinforce: bool,
         min_intersection: Option<usize>,
+        expansion_depth: usize,
         explain: bool,
         disable_pattern_completion: bool,
         disable_salience_bias: bool,
         disable_systems_consolidation: bool,
         heatmap: Option<&HashMap<String, f32>>,
+        global_lexicons: Option<&crate::external_lexicons::GlobalLexicons>,
+        external_lexicon_filter: Option<&Vec<String>>,
+        mandatory_cues: Option<&Vec<String>>,
     ) -> Vec<RecallResult> {
         if query_cues.is_empty() {
             return Vec::new();
@@ -760,30 +933,37 @@ where
         if !disable_pattern_completion {
             let mut inferred_candidates: HashMap<String, u64> = HashMap::new();
             for (cue, _) in &active_cues {
-                if let Some(co_map) = self.cue_co_occurrence.get(cue) {
-                for entry in co_map.iter() {
-                    let (inferred_cue, count) = entry.pair();
-                    // Skip if already in query
-                    if active_cues.iter().any(|(c, _)| c == inferred_cue) {
-                        continue;
-                    }
-                    
-                    // Skip metadata/structural cues in pattern completion inference
-                    // We only want to infer semantic synonyms (e.g. "food" -> "diet"), 
-                    // not structural context (e.g. "food" -> "domain:youtube")
-                    if inferred_cue.contains(':') {
-                        continue;
-                    }
-
-                    // Skip superstring inferences (Compounding)
-                    // If we query "health", don't infer "surgo_health" or "gut_health".
-                    // We want Lateral Expansion (synonyms), not Vertical Expansion (specialization).
-                    if inferred_cue.contains(cue) {
-                        continue;
-                    }
-
+                let mut merge = |inferred_cue: &String, count: &u64| {
+                    if active_cues.iter().any(|(c, _)| c == inferred_cue) { return; }
+                    if inferred_cue.contains(':') { return; }
+                    if inferred_cue.contains(cue) { return; }
                     *inferred_candidates.entry(inferred_cue.clone()).or_insert(0) += *count;
+                };
+
+                if let Some(co_map) = self.cue_co_occurrence.get(cue) {
+                    for (k, v) in co_map.value().iter() {
+                        merge(k, v);
+                    }
                 }
+                
+                if let Some(global) = global_lexicons {
+                    let names = match external_lexicon_filter {
+                        Some(filter) => filter.iter().cloned().collect::<Vec<_>>(),
+                        None => global.list_available(),
+                    };
+
+                    for name in names {
+                        if let Some(lex) = global.get_lexicon(&name) {
+                            if let Some(compact) = lex.get_compact() {
+                                if let Some(&cue_id) = compact.vocab_to_id.get(cue) {
+                                    for &(rel_id, weight) in &compact.edges[cue_id as usize] {
+                                        let rel_cue = &compact.vocab[rel_id as usize];
+                                        merge(rel_cue, &weight);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -800,7 +980,7 @@ where
         }
         
         // 2. Consolidated search using Selective Set Intersection
-        let mut results = self.consolidated_search(&active_cues, limit, explain, disable_salience_bias, disable_systems_consolidation, heatmap);
+        let mut results = self.consolidated_search(&active_cues, limit, explain, disable_salience_bias, disable_systems_consolidation, heatmap, mandatory_cues);
         
         // Filter by minimum intersection if specified (on primary cues only?)
         // For now, simple retention.
@@ -845,7 +1025,58 @@ where
                      None
                  };
 
-                 let content = memory.access_content(self.master_key.as_deref()).unwrap_or_else(|_| "<decryption failed>".to_string());
+                 let mut content = self.read_memory_content(memory.value()).unwrap_or_else(|_| "<decryption failed>".to_string());
+                 
+                 // Look for linkages for context expansion
+                 let mut parent_id = None;
+                 let mut chunk_idx = None;
+                 for cue in &memory.cues {
+                     if cue.starts_with("parent:") {
+                         parent_id = Some(cue.clone());
+                     } else if cue.starts_with("chunk_idx:") {
+                         chunk_idx = cue.split(':').nth(1).and_then(|v| v.parse::<usize>().ok());
+                     }
+                 }
+                 let memory_metadata = memory.metadata.clone();
+                 drop(memory); // Release guard before potentially looking up siblings
+
+                 if expansion_depth > 1 {
+                     if let (Some(pid), Some(idx)) = (parent_id, chunk_idx) {
+                         let mut neighbors = Vec::new();
+                         let start_idx = idx.saturating_sub(expansion_depth - 1);
+                         let end_idx = idx + expansion_depth - 1;
+
+                         if let Some(parent_set) = self.cue_index.get(&pid) {
+                             // Limit search to prevent massive documents from blowing up memory
+                             for sibling_id in parent_set.items.iter().take(500) {
+                                 if sibling_id == &candidate.memory_id { continue; }
+                                 if let Some(sibling) = self.memories.get(sibling_id) {
+                                     for c in &sibling.cues {
+                                         if c.starts_with("chunk_idx:") {
+                                             if let Some(s_idx) = c.split(':').nth(1).and_then(|v| v.parse::<usize>().ok()) {
+                                                 if s_idx >= start_idx && s_idx <= end_idx {
+                                                     if let Ok(s_content) = self.read_memory_content(sibling.value()) {
+                                                         neighbors.push((s_idx, s_content));
+                                                     }
+                                                 }
+                                             }
+                                         }
+                                     }
+                                 }
+                             }
+                         }
+
+                         if !neighbors.is_empty() {
+                             neighbors.push((idx, content));
+                             neighbors.sort_by_key(|(i, _)| *i);
+                             content = neighbors.into_iter()
+                                 .map(|(_, c)| c)
+                                 .collect::<Vec<String>>()
+                                 .join("\n\n"); 
+                         }
+                     }
+                 }
+
                  final_results.push(RecallResult {
                      memory_id: candidate.memory_id,
                      content,
@@ -856,7 +1087,7 @@ where
                      reinforcement_score: candidate.reinforcement_score,
                      salience_score: candidate.salience_score,
                      created_at: candidate.created_at,
-                     metadata: memory.metadata.clone(),
+                     metadata: memory_metadata,
                      explain: explain_data,
                  });
              }
@@ -865,7 +1096,7 @@ where
         final_results
     }
     
-    fn consolidated_search(&self, query_cues: &[(String, f64)], limit: usize, explain: bool, disable_salience_bias: bool, disable_systems_consolidation: bool, heatmap: Option<&HashMap<String, f32>>) -> Vec<ScoredMemoryCandidate> {
+    fn consolidated_search(&self, query_cues: &[(String, f64)], limit: usize, explain: bool, disable_salience_bias: bool, disable_systems_consolidation: bool, heatmap: Option<&HashMap<String, f32>>, mandatory_cues: Option<&Vec<String>>) -> Vec<ScoredMemoryCandidate> {
         if query_cues.is_empty() {
             return Vec::new();
         }
@@ -942,7 +1173,7 @@ where
         }
         
         // 5. Score candidates
-        let results = self.score_consolidated_candidates(candidates, explain, disable_salience_bias, disable_systems_consolidation, heatmap);
+        let results = self.score_consolidated_candidates(candidates, explain, disable_salience_bias, disable_systems_consolidation, heatmap, mandatory_cues);
 
         results
     }
@@ -953,7 +1184,8 @@ where
         _explain: bool, 
         disable_salience_bias: bool, 
         disable_systems_consolidation: bool,
-        heatmap: Option<&HashMap<String, f32>>
+        heatmap: Option<&HashMap<String, f32>>,
+        mandatory_cues: Option<&Vec<String>>
     ) -> Vec<ScoredMemoryCandidate> {
         let max_rec_weight = self.tuning.max_rec_weight;
         let max_freq_weight = self.tuning.max_freq_weight;
@@ -963,6 +1195,21 @@ where
         for (memory_id_ref, positions_info, total_weight) in candidates {
             
             if let Some(memory) = self.memories.get(memory_id_ref) {
+                // Strict Mandatory Filter
+                if let Some(mandatory) = mandatory_cues {
+                    let mut missing_mandatory = false;
+                    for m_cue in mandatory {
+                        // Strict check, MUST exist literally in memory's cues
+                        if !memory.cues.contains(m_cue) {
+                            missing_mandatory = true;
+                            break;
+                        }
+                    }
+                    if missing_mandatory {
+                        continue;
+                    }
+                }
+                
                 // Skip consolidated summaries if disabled
                 if disable_systems_consolidation && memory.cues.iter().any(|c| c == "type:summary") {
                     continue;
@@ -1016,7 +1263,18 @@ where
                     (eff + lift, eff, lift)
                 };
                 
-                let intersection_score = total_weight * self.tuning.intersection_score_multiplier;
+                // BM25-lite Length Normalization
+                let b = 1.0;
+                let k1 = 2.0;
+                let avg_cues = 40.0; // Estimated average cue list length
+                let len_f64 = memory.cues.len().max(1) as f64;
+                
+                let bm25_len_penalty = 1.0 - b + b * (len_f64 / avg_cues);
+                // With TF=1 for all matching cues, the BM25 formula simplifies to a single tf_component
+                // Note: we're applying this to total_weight (which is sum of IDFs)
+                let bm25_tf_component = (k1 + 1.0) / (1.0 + k1 * bm25_len_penalty);
+                
+                let intersection_score = total_weight * bm25_tf_component * self.tuning.intersection_score_multiplier;
                 
                 // Final score includes salience
                 // We use salience_score (Effective + Market) here
@@ -1078,7 +1336,7 @@ where
         for mem in &memories {
             if !added_nodes.contains(&mem.id) {
                 // Truncate content for label
-                let content_str = mem.access_content(self.master_key.as_deref()).unwrap_or_default();
+                let content_str = self.read_memory_content(&*mem).unwrap_or_default();
                 let label: String = content_str.chars().take(50).collect();
                 let label = if content_str.len() > 50 { format!("{}...", label) } else { label };
                 
@@ -1121,8 +1379,7 @@ where
                  if node["group"] == "cue" {
                      let cue_label = node["label"].as_str().unwrap();
                      if let Some(co_map) = self.cue_co_occurrence.get(cue_label) {
-                          for entry in co_map.iter() {
-                              let (other_cue, count) = entry.pair();
+                          for (other_cue, count) in co_map.value().iter() {
                               let other_id = format!("cue:{}", other_cue);
                               
                               // Only visualize connection if both are in the graph to avoid explosion
@@ -1167,7 +1424,7 @@ where
     /// 
     /// Scoring: Aggregates co-occurrence counts across all query cues.
     /// Terms that co-occur with multiple query cues get higher scores.
-    pub fn expand_cues_from_graph(&self, query_cues: &[String], limit: usize) -> Vec<(String, f64, u64, Vec<String>)> {
+    pub fn expand_cues_from_graph(&self, query_cues: &[String], limit: usize, global_lexicons: Option<&crate::external_lexicons::GlobalLexicons>, external_lexicon_filter: Option<&Vec<String>>) -> Vec<(String, f64, u64, Vec<String>)> {
         if query_cues.is_empty() {
             return Vec::new();
         }
@@ -1183,27 +1440,74 @@ where
             return Vec::new();
         }
 
-        // Fast path: Single cue query - just return top co-occurring terms directly
+        // Fast path: Single cue query
         if normalized_cues.len() == 1 {
             let query_cue = &normalized_cues[0];
+            let mut results = HashMap::new();
+
             if let Some(co_map) = self.cue_co_occurrence.get(query_cue) {
-                let mut results: Vec<(String, f64, u64, Vec<String>)> = co_map
-                    .iter()
-                    .filter(|entry| {
-                        let candidate = entry.key();
-                        // Skip metadata cues and superstrings
-                        !candidate.contains(':') && !candidate.contains(query_cue)
-                    })
-                    .map(|entry| {
-                        let (term, count) = entry.pair();
-                        (term.clone(), *count as f64, *count, vec![query_cue.clone()])
+                for (candidate, count) in co_map.value().iter() {
+                    if !candidate.contains(':') && !candidate.contains(query_cue) {
+                        *results.entry(candidate.clone()).or_insert(0) += *count;
+                    }
+                }
+            }
+            if let Some(global) = global_lexicons {
+                let names = match external_lexicon_filter {
+                    Some(filter) => filter.iter().cloned().collect::<Vec<_>>(),
+                    None => global.list_available(),
+                };
+
+                for name in names {
+                    if let Some(lex) = global.get_lexicon(&name) {
+                        if let Some(compact) = lex.get_compact() {
+                            if let Some(&cue_id) = compact.vocab_to_id.get(query_cue) {
+                                for &(rel_id, count) in &compact.edges[cue_id as usize] {
+                                    let candidate = &compact.vocab[rel_id as usize];
+                                    if !candidate.contains(':') && !candidate.contains(query_cue) {
+                                        *results.entry(candidate.clone()).or_insert(0) += count;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !results.is_empty() {
+                let mut results_vec: Vec<(String, f64, u64, Vec<String>)> = results
+                    .into_iter()
+                    .map(|(term, count)| {
+                        // IDF Weighting: divide by sqrt of global occurrences to downweight "hubs"
+                        let global_count = self.cue_global_counts.get(&term).map(|c| *c.value()).unwrap_or(0);
+                        
+                        // We also need to check external lexicons for global counts
+                        let mut final_global_count = global_count;
+                        if let Some(global) = global_lexicons {
+                             let names = match external_lexicon_filter {
+                                Some(ref filter) => filter.iter().cloned().collect::<Vec<_>>(),
+                                None => global.list_available(),
+                            };
+                            for name in names {
+                                if let Some(lex) = global.get_lexicon(&name) {
+                                    if let Some(compact) = lex.get_compact() {
+                                        if let Some(&term_id) = compact.vocab_to_id.get(&term) {
+                                            final_global_count += compact.counts[term_id as usize];
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        let idf_factor = (1.0 + final_global_count as f64).sqrt();
+                        let score = (count as f64) / idf_factor;
+                        (term, score, count, vec![query_cue.clone()])
                     })
                     .collect();
                 
-                // Sort by count descending
-                results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                results.truncate(limit);
-                return results;
+                results_vec.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                results_vec.truncate(limit);
+                return results_vec;
             } else {
                 return Vec::new();
             }
@@ -1214,23 +1518,10 @@ where
 
         for query_cue in &normalized_cues {
             if let Some(co_map) = self.cue_co_occurrence.get(query_cue) {
-                for entry in co_map.iter() {
-                    let (candidate_cue, count) = entry.pair();
-                    
-                    // Skip if candidate is already in query (no point expanding to itself)
-                    if normalized_cues.contains(candidate_cue) {
-                        continue;
-                    }
-                    
-                    // Skip metadata/structural cues (same filter as pattern completion)
-                    if candidate_cue.contains(':') {
-                        continue;
-                    }
-                    
-                    // Skip superstring inferences (avoid vertical specialization)
-                    if candidate_cue.contains(query_cue) {
-                        continue;
-                    }
+                for (candidate_cue, count) in co_map.value().iter() {
+                    if normalized_cues.contains(candidate_cue) { continue; }
+                    if candidate_cue.contains(':') { continue; }
+                    if candidate_cue.contains(query_cue) { continue; }
 
                     candidates
                         .entry(candidate_cue.clone())
@@ -1243,14 +1534,67 @@ where
                         .or_insert((*count, vec![query_cue.clone()]));
                 }
             }
+            if let Some(global) = global_lexicons {
+                let names = match external_lexicon_filter {
+                    Some(filter) => filter.iter().cloned().collect::<Vec<_>>(),
+                    None => global.list_available(),
+                };
+
+                for name in names {
+                    if let Some(lex) = global.get_lexicon(&name) {
+                        if let Some(compact) = lex.get_compact() {
+                            if let Some(&cue_id) = compact.vocab_to_id.get(query_cue) {
+                                for &(rel_id, count) in &compact.edges[cue_id as usize] {
+                                    let candidate_cue = &compact.vocab[rel_id as usize];
+                                    
+                                    if normalized_cues.contains(candidate_cue) { continue; }
+                                    if candidate_cue.contains(':') { continue; }
+                                    if candidate_cue.contains(query_cue) { continue; }
+
+                                    candidates
+                                        .entry(candidate_cue.clone())
+                                        .and_modify(|(total, sources)| {
+                                            *total += count;
+                                            if !sources.contains(query_cue) {
+                                                sources.push(query_cue.clone());
+                                            }
+                                        })
+                                        .or_insert((count, vec![query_cue.clone()]));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Convert to vec and sort by score (count) descending
         let mut results: Vec<(String, f64, u64, Vec<String>)> = candidates
             .into_iter()
             .map(|(term, (count, sources))| {
-                // Score = raw count (can be refined with IDF later)
-                let score = count as f64;
+                // IDF Weighting: divide by sqrt of global occurrences to downweight "hubs"
+                let global_count = self.cue_global_counts.get(&term).map(|c| *c.value()).unwrap_or(0);
+                
+                let mut final_global_count = global_count;
+                if let Some(global) = global_lexicons {
+                     let names = match external_lexicon_filter {
+                        Some(ref filter) => filter.iter().cloned().collect::<Vec<_>>(),
+                        None => global.list_available(),
+                    };
+                    for name in names {
+                        if let Some(lex) = global.get_lexicon(&name) {
+                            if let Some(compact) = lex.get_compact() {
+                                if let Some(&term_id) = compact.vocab_to_id.get(&term) {
+                                    final_global_count += compact.counts[term_id as usize];
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let idf_factor = (1.0 + final_global_count as f64).sqrt();
+                let score = (count as f64) / idf_factor;
+                
                 (term, score, count, sources)
             })
             .collect();
@@ -1276,6 +1620,223 @@ where
         );
 
         stats
+    }
+
+    // =========================================================================
+    // Speculative RAG Decoding
+    // =========================================================================
+
+    /// Speculate the next words that should follow the given prefix, based on
+    /// aligned recalled memories. This is CueMap's "draft model" — it predicts
+    /// continuations from grounded facts so that an LLM can be logit-biased
+    /// toward factual output.
+    ///
+    /// # Algorithm
+    /// 1. Tokenize the prefix into cues and recall the top-K memories.
+    /// 2. For each recalled memory, split its content into words and align
+    ///    them against the prefix words.
+    /// 3. Find the alignment point (where the prefix "ends" inside the memory).
+    /// 4. Extract the continuation words immediately after that point.
+    /// 5. Rank candidates by `alignment_score * recall_score` and return the best.
+    pub fn speculate_continuation(
+        &self,
+        prefix: &str,
+        limit: usize,
+        max_continuation_words: usize,
+        mode: AlignmentMode,
+        _heatmap: Option<&HashMap<String, f32>>,
+    ) -> Vec<SpeculationCandidate> {
+        if prefix.trim().is_empty() || limit == 0 {
+            return Vec::new();
+        }
+
+        // 1. Tokenize the prefix into cues for recall
+        let query_cues = crate::nl::tokenize_to_cues(prefix);
+        if query_cues.is_empty() {
+            return Vec::new();
+        }
+
+        // 2. Recall top memories using the prefix as query
+        //    Use recall_fast for speed — we're inside a hot decoding loop.
+        let recalled = self.recall_fast(query_cues, limit * 3);
+        if recalled.is_empty() {
+            return Vec::new();
+        }
+
+        // 3. Normalize the prefix into words for alignment
+        let prefix_words: Vec<String> = prefix
+            .split_whitespace()
+            .map(|w| w.to_lowercase()
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == '\'')
+                .collect::<String>())
+            .filter(|w| !w.is_empty())
+            .collect();
+
+        if prefix_words.is_empty() {
+            return Vec::new();
+        }
+
+        // 4. For each recalled memory, align and extract continuation
+        let mut candidates = Vec::new();
+
+        for result in &recalled {
+            let memory_content = &result.content;
+
+            // Split memory into words, preserving original casing for output
+            let memory_words_raw: Vec<&str> = memory_content.split_whitespace().collect();
+            if memory_words_raw.is_empty() {
+                continue;
+            }
+
+            // Normalized version for matching
+            let memory_words_lower: Vec<String> = memory_words_raw
+                .iter()
+                .map(|w| w.to_lowercase()
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || *c == '\'')
+                    .collect::<String>())
+                .collect();
+
+            // Align and find continuation point
+            let (alignment_score, continuation_start_idx) = match mode {
+                AlignmentMode::Relaxed => Self::align_relaxed(
+                    &prefix_words,
+                    &memory_words_lower,
+                ),
+                AlignmentMode::Strict => Self::align_strict(
+                    &prefix_words,
+                    &memory_words_lower,
+                ),
+            };
+
+            // Skip memories with very poor alignment
+            if alignment_score < 0.15 || continuation_start_idx >= memory_words_raw.len() {
+                continue;
+            }
+
+            // Extract continuation words (original casing from memory)
+            let continuation_end = (continuation_start_idx + max_continuation_words)
+                .min(memory_words_raw.len());
+            let continuation: Vec<String> = memory_words_raw[continuation_start_idx..continuation_end]
+                .iter()
+                .map(|w| w.to_string())
+                .collect();
+
+            if continuation.is_empty() {
+                continue;
+            }
+
+            candidates.push(SpeculationCandidate {
+                words: continuation,
+                source_memory_id: result.memory_id.clone(),
+                alignment_score,
+                recall_score: result.score,
+            });
+        }
+
+        // 5. Sort by combined score: alignment quality × recall score
+        candidates.sort_by(|a, b| {
+            let score_a = a.alignment_score * a.recall_score;
+            let score_b = b.alignment_score * b.recall_score;
+            score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        candidates.truncate(limit);
+        candidates
+    }
+
+    /// Relaxed alignment: bag-of-words overlap with recency weighting.
+    /// Words near the end of the prefix contribute more to the score.
+    /// Returns (alignment_score, continuation_start_index_in_memory).
+    fn align_relaxed(
+        prefix_words: &[String],
+        memory_words: &[String],
+    ) -> (f64, usize) {
+        if prefix_words.is_empty() || memory_words.is_empty() {
+            return (0.0, 0);
+        }
+
+        let n = prefix_words.len();
+        let mut total_weight = 0.0;
+        let mut matched_weight = 0.0;
+        let mut last_match_idx: Option<usize> = None;
+
+        // Score each prefix word, with recency weighting:
+        // the last word gets weight 1.0, the first word gets weight ~0.3
+        for (i, pw) in prefix_words.iter().enumerate() {
+            if pw.len() <= 1 { continue; } // skip single chars
+
+            let recency = 0.3 + 0.7 * (i as f64 / n.max(1) as f64);
+            total_weight += recency;
+
+            // Find the LAST occurrence in the memory (closest to the continuation)
+            for (j, mw) in memory_words.iter().enumerate().rev() {
+                if mw == pw {
+                    matched_weight += recency;
+                    match last_match_idx {
+                        Some(prev) => {
+                            if j >= prev { last_match_idx = Some(j); }
+                        }
+                        None => { last_match_idx = Some(j); }
+                    }
+                    break;
+                }
+            }
+        }
+
+        let score = if total_weight > 0.0 { matched_weight / total_weight } else { 0.0 };
+        let continuation_idx = last_match_idx.map(|i| i + 1).unwrap_or(0);
+
+        (score, continuation_idx)
+    }
+
+    /// Strict alignment: order-preserving longest common subsequence.
+    /// Finds the longest subsequence of prefix words that appear in the
+    /// same order within the memory. Returns the index after the last
+    /// matched word as the continuation point.
+    fn align_strict(
+        prefix_words: &[String],
+        memory_words: &[String],
+    ) -> (f64, usize) {
+        if prefix_words.is_empty() || memory_words.is_empty() {
+            return (0.0, 0);
+        }
+
+        // Greedy forward scan: try to match prefix words in order
+        let mut matched = 0;
+        let mut mem_cursor = 0;
+        let mut last_match_idx = 0;
+
+        for pw in prefix_words {
+            if pw.len() <= 1 { continue; }
+
+            while mem_cursor < memory_words.len() {
+                if &memory_words[mem_cursor] == pw {
+                    matched += 1;
+                    last_match_idx = mem_cursor;
+                    mem_cursor += 1;
+                    break;
+                }
+                mem_cursor += 1;
+            }
+
+            if mem_cursor >= memory_words.len() {
+                break;
+            }
+        }
+
+        // Count meaningful prefix words (> 1 char)
+        let meaningful_count = prefix_words.iter().filter(|w| w.len() > 1).count();
+        let score = if meaningful_count > 0 {
+            matched as f64 / meaningful_count as f64
+        } else {
+            0.0
+        };
+
+        let continuation_idx = if matched > 0 { last_match_idx + 1 } else { 0 };
+
+        (score, continuation_idx)
     }
 }
 
@@ -1365,7 +1926,7 @@ impl CueMapEngine<MainStats> {
                 // Construct result
                 results.push(RecallResult {
                     memory_id: mem.id.clone(),
-                    content: mem.access_content(self.master_key.as_deref()).unwrap_or_else(|_| "<decryption failed>".to_string()),
+                    content: self.read_memory_content(mem.value()).unwrap_or_else(|_| "<decryption failed>".to_string()),
                     score: total_salience, 
                     match_integrity: 1.0, 
                     intersection_count: 0, 
@@ -1480,7 +2041,7 @@ impl CueMapEngine<MainStats> {
             for id in &group {
                 if let Some(mem) = self.memories.get(id) {
                     if !combined_content.is_empty() { combined_content.push_str("\n---\n"); }
-                    if let Ok(c) = mem.access_content(self.master_key.as_deref()) {
+                    if let Ok(c) = self.read_memory_content(mem.value()) {
                         combined_content.push_str(&c);
                     }
                     for cue in &mem.cues { combined_cues.insert(cue.clone()); }
@@ -1517,6 +2078,31 @@ impl CueMapEngine<MainStats> {
         }
         
         results
+    }
+
+    /// Extract all unique symbols (un-prefixed values) from structural cues in the index.
+    /// E.g., "defines_function:my_func" -> "my_func"
+    pub fn get_all_symbols(&self) -> HashSet<String> {
+        let mut symbols = HashSet::new();
+        let prefixes = [
+            "defines_function:", "defines_class:", "defines_method:", "defines_struct:",
+            "defines_enum:", "defines_trait:", "defines_type:", "defines_interface:",
+            "calls_function:", "calls_method:", "imports_module:", "creates_object:"
+        ];
+
+        for entry in self.cue_index.iter() {
+            let cue = entry.key();
+            for prefix in prefixes {
+                if cue.starts_with(prefix) {
+                    let symbol = &cue[prefix.len()..];
+                    if !symbol.is_empty() {
+                        symbols.insert(symbol.to_string());
+                    }
+                    break;
+                }
+            }
+        }
+        symbols
     }
 }
 

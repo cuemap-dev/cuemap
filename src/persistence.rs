@@ -50,6 +50,10 @@ struct PersistedState<T> {
     cue_index: HashMap<String, Vec<String>>, // Flattened OrderedSet
     version: u32,
     saved_at: u64,
+    #[serde(default)]
+    cue_co_occurrence: Option<HashMap<String, HashMap<String, u64>>>,
+    #[serde(default)]
+    cue_global_counts: Option<HashMap<String, u64>>,
 }
 
 const PERSISTENCE_VERSION: u32 = 1;
@@ -102,6 +106,37 @@ impl PersistenceManager {
                 (cue, memory_ids)
             })
             .collect();
+
+        // Smart Graph Serialization: Only embed if memory count is 0 but graph exists
+        let co_occurrence_map = {
+            let co_occ = engine.get_cue_co_occurrence();
+            if memories_map.is_empty() && !co_occ.is_empty() {
+                let mut graph = HashMap::new();
+                for entry in co_occ.iter() {
+                    let inner = entry.value().clone();
+                    if !inner.is_empty() {
+                        graph.insert(entry.key().clone(), inner);
+                    }
+                }
+                Some(graph)
+            } else {
+                None
+            }
+        };
+        
+        // 4. Convert global counts
+        let global_counts_map = {
+            let counts_dm = &engine.cue_global_counts;
+            if !counts_dm.is_empty() {
+                let mut counts = HashMap::new();
+                for entry in counts_dm.iter() {
+                    counts.insert(entry.key().clone(), *entry.value());
+                }
+                Some(counts)
+            } else {
+                None
+            }
+        };
         
         let state = PersistedState {
             memories: memories_map,
@@ -111,6 +146,8 @@ impl PersistenceManager {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
+            cue_co_occurrence: co_occurrence_map,
+            cue_global_counts: global_counts_map,
         };
         
         // Serialize to bincode
@@ -140,7 +177,12 @@ impl PersistenceManager {
     /// Load engine state from a specific path (used by multi-tenant)
     pub fn load_from_path<T>(
         path: &Path,
-    ) -> Result<(DashMap<String, Memory<T>, RandomState>, DashMap<String, OrderedSet, RandomState>), Box<dyn std::error::Error>> 
+    ) -> Result<(
+        DashMap<String, Memory<T>, RandomState>, 
+        DashMap<String, OrderedSet, RandomState>,
+        Option<DashMap<String, HashMap<String, u64>, RandomState>>,
+        Option<DashMap<String, u64, RandomState>>
+    ), Box<dyn std::error::Error>> 
     where T: Serialize + for<'de> Deserialize<'de> + Clone + Default + Send + Sync + MemoryStats + 'static
     {
         if !path.exists() {
@@ -174,8 +216,24 @@ impl PersistenceManager {
             }
             cue_index.insert(cue, ordered_set);
         }
+
+        let loaded_graph = state.cue_co_occurrence.map(|raw_graph| {
+            let dm = DashMap::with_hasher(RandomState::new());
+            for (cue, related) in raw_graph {
+                dm.insert(cue, related);
+            }
+            dm
+        });
+
+        let loaded_global_counts = state.cue_global_counts.map(|raw_counts| {
+            let dm = DashMap::with_hasher(RandomState::new());
+            for (cue, count) in raw_counts {
+                dm.insert(cue, count);
+            }
+            dm
+        });
         
-        Ok((memories, cue_index))
+        Ok((memories, cue_index, loaded_graph, loaded_global_counts))
     }
     
     /// List all snapshot files in a directory (main engines only, not aliases/lexicon)
@@ -223,14 +281,18 @@ impl PersistenceManager {
     
     pub fn load_state<T>(
         &self,
-    ) -> Result<(DashMap<String, Memory<T>, RandomState>, DashMap<String, OrderedSet, RandomState>), Box<dyn std::error::Error>> 
+    ) -> Result<(
+        DashMap<String, Memory<T>, RandomState>, 
+        DashMap<String, OrderedSet, RandomState>,
+        Option<DashMap<String, HashMap<String, u64>, RandomState>>
+    ), Box<dyn std::error::Error>> 
     where T: Serialize + for<'de> Deserialize<'de> + Clone + Default + Send + Sync + MemoryStats + 'static
     {
         let snapshot_path = self.snapshot_path();
         
         if !snapshot_path.exists() {
             info!("No existing snapshot found, starting with empty state");
-            return Ok((DashMap::with_hasher(RandomState::new()), DashMap::with_hasher(RandomState::new())));
+            return Ok((DashMap::with_hasher(RandomState::new()), DashMap::with_hasher(RandomState::new()), None));
         }
         
         info!("Loading state from {:?}", snapshot_path);
@@ -260,8 +322,16 @@ impl PersistenceManager {
             }
             cue_index.insert(cue, ordered_set);
         }
+
+        let loaded_graph = state.cue_co_occurrence.map(|raw_graph| {
+            let dm = DashMap::with_hasher(RandomState::new());
+            for (cue, related) in raw_graph {
+                dm.insert(cue, related);
+            }
+            dm
+        });
         
-        Ok((memories, cue_index))
+        Ok((memories, cue_index, loaded_graph))
     }
     
     pub fn save_state<T>(
@@ -292,6 +362,37 @@ impl PersistenceManager {
             })
             .collect();
         
+        // Smart Graph Serialization
+        let co_occurrence_map = {
+            let co_occ = engine.get_cue_co_occurrence();
+            if memories_map.is_empty() && !co_occ.is_empty() {
+                let mut graph = HashMap::new();
+                for entry in co_occ.iter() {
+                    let inner = entry.value().clone();
+                    if !inner.is_empty() {
+                        graph.insert(entry.key().clone(), inner);
+                    }
+                }
+                Some(graph)
+            } else {
+                None
+            }
+        };
+
+        // 4. Convert global counts
+        let global_counts_map = {
+            let counts_dm = &engine.cue_global_counts;
+            if !counts_dm.is_empty() {
+                let mut counts = HashMap::new();
+                for entry in counts_dm.iter() {
+                    counts.insert(entry.key().clone(), *entry.value());
+                }
+                Some(counts)
+            } else {
+                None
+            }
+        };
+        
         let state = PersistedState {
             memories: memories_map,
             cue_index: cue_index_map,
@@ -300,6 +401,8 @@ impl PersistenceManager {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
+            cue_co_occurrence: co_occurrence_map,
+            cue_global_counts: global_counts_map,
         };
         
         // Serialize to bincode

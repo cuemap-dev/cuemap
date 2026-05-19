@@ -1,4 +1,4 @@
-use tree_sitter::Parser;
+use tree_sitter::{Parser, StreamingIterator};
 use std::path::Path;
 use std::cell::RefCell;
 use unicode_segmentation::UnicodeSegmentation;
@@ -9,6 +9,64 @@ use unicode_segmentation::UnicodeSegmentation;
 thread_local! {
     static PARSERS: RefCell<Parsers> = RefCell::new(Parsers::new());
 }
+
+const PYTHON_QUERY: &str = r#"
+(function_definition name: (identifier) @defines_function)
+(class_definition name: (identifier) @defines_class)
+(call function: (identifier) @calls_function)
+(call function: (attribute attribute: (identifier) @calls_method))
+(import_statement name: (dotted_name) @imports_module)
+(import_from_statement module_name: (dotted_name) @imports_module)
+"#;
+
+const RUST_QUERY: &str = r#"
+(function_item name: (identifier) @defines_function)
+(struct_item name: (type_identifier) @defines_struct)
+(enum_item name: (type_identifier) @defines_enum)
+(trait_item name: (type_identifier) @defines_trait)
+(call_expression function: (identifier) @calls_function)
+(call_expression function: (field_expression field: (field_identifier) @calls_method))
+(call_expression function: (scoped_identifier name: (identifier) @calls_function))
+(use_declaration argument: (scoped_identifier path: (identifier) @imports_module))
+(use_declaration argument: (identifier) @imports_module)
+"#;
+
+const TS_JS_QUERY: &str = r#"
+(function_declaration name: (identifier) @defines_function)
+(class_declaration name: (identifier) @defines_class)
+(method_definition name: (property_identifier) @defines_method)
+(call_expression function: (identifier) @calls_function)
+(call_expression function: (member_expression property: (property_identifier) @calls_method))
+(import_statement source: (string (string_fragment) @imports_module))
+"#;
+
+const GO_QUERY: &str = r#"
+(function_declaration name: (identifier) @defines_function)
+(method_declaration name: (field_identifier) @defines_method)
+(type_declaration (type_spec name: (type_identifier) @defines_type))
+(call_expression function: (identifier) @calls_function)
+(call_expression function: (selector_expression field: (field_identifier) @calls_method))
+(import_spec path: (interpreted_string_literal) @imports_module)
+"#;
+
+const PHP_QUERY: &str = r#"
+(function_definition name: (name) @defines_function)
+(class_definition name: (name) @defines_class)
+(method_declaration name: (name) @defines_method)
+(function_call_expression function: (name) @calls_function)
+(member_call_expression name: (name) @calls_method)
+(namespace_definition_statement name: (namespace_name) @in_namespace)
+"#;
+
+const JAVA_QUERY: &str = r#"
+(method_declaration name: (identifier) @defines_method)
+(class_declaration name: (identifier) @defines_class)
+(interface_declaration name: (identifier) @defines_interface)
+(enum_declaration name: (identifier) @defines_enum)
+(method_invocation name: (identifier) @calls_method)
+(object_creation_expression type: (type_identifier) @creates_object)
+(import_declaration (scoped_identifier) @imports_module)
+"#;
 
 struct Parsers {
     python: Option<Parser>,
@@ -217,7 +275,7 @@ impl Chunker {
             }
         };
         
-        match file_type {
+        let mut chunks = match file_type {
             ChunkerType::Python => Self::chunk_python(content),
             ChunkerType::Rust => Self::chunk_rust(content),
             ChunkerType::TypeScript => Self::chunk_typescript(content),
@@ -237,7 +295,22 @@ impl Chunker {
             ChunkerType::Text => Self::chunk_text(content),
             ChunkerType::ApiSpec => Self::chunk_json(content),
             ChunkerType::SocialExport => Self::chunk_social_export(path, content),
+        };
+
+        // Inject Parent ID and Chunk Index for Context Expansion Linkage
+        let parent_id = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(path.to_string_lossy().as_bytes());
+            format!("parent:{:x}", hasher.finalize())[0..16].to_string()
+        };
+
+        for (idx, chunk) in chunks.iter_mut().enumerate() {
+            chunk.structural_cues.push(parent_id.clone());
+            chunk.structural_cues.push(format!("chunk_idx:{}", idx));
         }
+
+        chunks
     }
 
     /// Try to detect social media export by content patterns FIRST
@@ -340,7 +413,7 @@ impl Chunker {
             let parser = parsers.get_python();
             Self::chunk_treesitter_with_names(content, parser, 
                 &["function_definition", "class_definition", "if_statement", "for_statement", "while_statement", "try_statement", "except_clause", "with_statement", "assignment", "call", "comment"], 
-                "lang:python", ChunkCategory::Code)
+                "lang:python", ChunkCategory::Code, Some(PYTHON_QUERY))
         })
     }
 
@@ -351,7 +424,7 @@ impl Chunker {
             Self::chunk_treesitter_with_names(content, parser, 
                 &["function_item", "struct_item", "enum_item", "trait_item", 
                   "if_expression", "match_expression", "match_arm", "for_expression", "while_expression", "loop_expression"], 
-                "lang:rust", ChunkCategory::Code)
+                "lang:rust", ChunkCategory::Code, Some(RUST_QUERY))
         })
     }
     
@@ -361,7 +434,7 @@ impl Chunker {
             let parser = parsers.get_typescript();
             Self::chunk_treesitter_with_names(content, parser, 
                 &["function_declaration", "class_declaration", "interface_declaration", "lexical_declaration", "method_definition", "constructor_declaration", "if_statement", "for_statement", "while_statement", "expression_statement", "call_expression", "comment", "jsx_element", "jsx_self_closing_element"], 
-                "lang:typescript", ChunkCategory::Code)
+                "lang:typescript", ChunkCategory::Code, Some(TS_JS_QUERY))
         })
     }
 
@@ -371,7 +444,7 @@ impl Chunker {
             let parser = parsers.get_javascript();
             Self::chunk_treesitter_with_names(content, parser, 
                 &["function_declaration", "class_declaration", "method_definition", "if_statement", "for_statement", "while_statement", "expression_statement", "call_expression", "comment", "jsx_element", "jsx_self_closing_element"], 
-                "lang:javascript", ChunkCategory::Code)
+                "lang:javascript", ChunkCategory::Code, Some(TS_JS_QUERY))
         })
     }
 
@@ -381,7 +454,7 @@ impl Chunker {
             let parser = parsers.get_go();
             Self::chunk_treesitter_with_names(content, parser, 
                 &["function_declaration", "method_declaration", "type_declaration", "if_statement", "for_statement", "call_expression", "block"], 
-                "lang:go", ChunkCategory::Code)
+                "lang:go", ChunkCategory::Code, Some(GO_QUERY))
         })
     }
 
@@ -486,7 +559,7 @@ impl Chunker {
         PARSERS.with(|parsers| {
             let mut parsers = parsers.borrow_mut();
             let parser = parsers.get_css();
-            Self::chunk_treesitter_with_names(content, parser, &["rule_set"], "lang:css", ChunkCategory::Code)
+            Self::chunk_treesitter_with_names(content, parser, &["rule_set"], "lang:css", ChunkCategory::Code, None)
         })
     }
 
@@ -496,7 +569,7 @@ impl Chunker {
             let parser = parsers.get_php();
             Self::chunk_treesitter_with_names(content, parser, 
                 &["function_definition", "class_definition", "method_declaration", "if_statement", "for_statement", "foreach_statement", "while_statement", "expression_statement", "comment", "compound_statement"], 
-                "lang:php", ChunkCategory::Code)
+                "lang:php", ChunkCategory::Code, Some(PHP_QUERY))
         })
     }
 
@@ -506,7 +579,7 @@ impl Chunker {
             let parser = parsers.get_java();
             Self::chunk_treesitter_with_names(content, parser, 
                 &["class_declaration", "method_declaration", "constructor_declaration", "if_statement", "for_statement", "while_statement", "expression_statement", "comment", "block"], 
-                "lang:java", ChunkCategory::Code)
+                "lang:java", ChunkCategory::Code, Some(JAVA_QUERY))
         })
     }
 
@@ -515,13 +588,42 @@ impl Chunker {
         parser: &mut Parser, 
         node_kinds: &[&str], 
         lang_tag: &str, 
-        category: ChunkCategory
+        category: ChunkCategory,
+        query_str: Option<&str>
     ) -> Vec<Chunk> {
         let mut chunks = Vec::new();
         tracing::info!("[CHUNKER DEBUG] Attempting to parse {} bytes...", content.len());
         let tree_result = parser.parse(content, None);
         tracing::info!("[CHUNKER DEBUG] Parse result: {}", if tree_result.is_some() { "SUCCESS" } else { "FAILED" });
         if let Some(tree) = tree_result {
+            // New: Extract semantic cues via Query
+            let mut extracted_cues: Vec<(usize, usize, String)> = Vec::new();
+            if let Some(q_str) = query_str {
+                if let Some(lang) = parser.language() {
+                    if let Ok(query) = tree_sitter::Query::new(&lang, q_str) {
+                        let mut cursor = tree_sitter::QueryCursor::new();
+                        let text_callback = content.as_bytes();
+                        let mut matches = cursor.matches(&query, tree.root_node(), text_callback);
+                        while let Some(m) = matches.next() {
+                            for capture in m.captures {
+                                let capture_name = &query.capture_names()[capture.index as usize];
+                                let start_byte = capture.node.start_byte();
+                                let end_byte = capture.node.end_byte();
+                                if let Ok(text) = capture.node.utf8_text(text_callback) {
+                                    let text_str: &str = text;
+                                    let clean_text = text_str.trim();
+                                    if !clean_text.is_empty() && clean_text.len() < 100 {
+                                        extracted_cues.push((start_byte, end_byte, format!("{}:{}", capture_name, clean_text)));
+                                    }
+                                }
+                            }
+                        }
+                        extracted_cues.sort();
+                        extracted_cues.dedup();
+                    }
+                }
+            }
+
             // New config for splitting logic
             let max_chars = 3000; // soft limit - large enough for most functions
             tracing::info!("[CHUNKER DEBUG] Parsed {} bytes, root: {}", content.len(), tree.root_node().kind());
@@ -532,7 +634,8 @@ impl Chunker {
                 &mut chunks, 
                 lang_tag, 
                 category,
-                max_chars
+                max_chars,
+                &extracted_cues
             );
             tracing::info!("[CHUNKER DEBUG] After visit: {} chunks", chunks.len());
         }
@@ -574,7 +677,8 @@ impl Chunker {
         chunks: &mut Vec<Chunk>, 
         lang_tag: &str, 
         category: ChunkCategory,
-        max_chars: usize
+        max_chars: usize,
+        extracted_cues: &[(usize, usize, String)]
     ) {
         let kind = node.kind();
         let start_row = node.start_position().row;
@@ -636,16 +740,31 @@ impl Chunker {
             eprintln!("[DEBUG CHUNKER] Creating chunk: {} '{}' lines {}-{} ({} bytes)", 
                 kind, name, start_row + 1, end_row + 1, byte_len);
 
+            let chunk_start_byte = node.start_byte();
+            let chunk_end_byte = node.end_byte();
+
+            let mut chunk_cues = vec![
+                lang_tag.to_string(),
+                format!("type:{}", type_cue),
+                format!("{}:{}", name_label, name),
+            ];
+
+            // Add semantic structural cues captured from Tree-sitter query
+            for (start_byte, end_byte, cue) in extracted_cues {
+                // If the capture falls within this chunk's boundaries
+                if *start_byte >= chunk_start_byte && *end_byte <= chunk_end_byte {
+                    chunk_cues.push(cue.clone());
+                }
+            }
+            chunk_cues.sort();
+            chunk_cues.dedup();
+
             chunks.push(Chunk {
                 content: text,
                 start_line: start_row + 1,
                 end_line: end_row + 1,
                 context: format!("{}:{}", kind, name),
-                structural_cues: vec![
-                    lang_tag.to_string(),
-                    format!("type:{}", type_cue),
-                    format!("{}:{}", name_label, name),
-                ],
+                structural_cues: chunk_cues,
                 category,
             });
             
@@ -662,7 +781,7 @@ impl Chunker {
             
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                Self::visit_nodes_recursive(child, content, node_kinds, chunks, lang_tag, category, max_chars);
+                Self::visit_nodes_recursive(child, content, node_kinds, chunks, lang_tag, category, max_chars, extracted_cues);
             }
             
             // If we drilled down but got nothing (e.g. big linear function), force line-based segmentation
@@ -700,7 +819,7 @@ impl Chunker {
             // Standard recursion for non-target nodes
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                Self::visit_nodes_recursive(child, content, node_kinds, chunks, lang_tag, category, max_chars);
+                Self::visit_nodes_recursive(child, content, node_kinds, chunks, lang_tag, category, max_chars, extracted_cues);
             }
         }
     }

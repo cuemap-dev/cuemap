@@ -141,6 +141,8 @@ pub struct ServerSettings {
     pub assets_dir: Option<String>,
     pub log_level: String,
     pub read_only: bool,
+    #[serde(default)]
+    pub store_content_on_disk: bool,
 }
 
 impl Default for ServerSettings {
@@ -152,6 +154,7 @@ impl Default for ServerSettings {
             assets_dir: None,
             log_level: "info".to_string(),
             read_only: false,
+            store_content_on_disk: false,
         }
     }
 }

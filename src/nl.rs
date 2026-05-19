@@ -2,6 +2,126 @@ use regex::Regex;
 use std::collections::{HashSet, HashMap};
 use std::sync::OnceLock;
 use dashmap::DashMap;
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Intent {
+    FindCalls,
+    FindDef,
+    FindImports,
+    Generic,
+}
+
+pub struct SymbolRouter {
+    automaton: Option<AhoCorasick>,
+    intent_docs: HashMap<Intent, Vec<String>>,
+}
+
+impl SymbolRouter {
+    pub fn new(symbols: HashSet<String>) -> Self {
+        let mut sorted_symbols: Vec<String> = symbols.into_iter().collect();
+        // Sort by length descending to ensure longest match (Aho-Corasick MatchKind::LeftmostLongest)
+        sorted_symbols.sort_by(|a, b| b.len().cmp(&a.len()));
+
+        let automaton = if !sorted_symbols.is_empty() {
+            AhoCorasickBuilder::new()
+                .match_kind(MatchKind::LeftmostLongest)
+                .build(&sorted_symbols)
+                .ok()
+        } else {
+            None
+        };
+
+        let mut intent_docs = HashMap::new();
+        intent_docs.insert(Intent::FindCalls, vec![
+            "where", "used", "calls", "references", "usages", "invoked", "location", "callers", "call", "using"
+        ].into_iter().map(|s| s.to_string()).collect());
+        
+        intent_docs.insert(Intent::FindDef, vec![
+            "what", "does", "do", "how", "work", "definition", "body", "implementation", "logic", "where", "defined", "code", "tell", "explain", "about"
+        ].into_iter().map(|s| s.to_string()).collect());
+
+        intent_docs.insert(Intent::FindImports, vec![
+            "requires", "imports", "dependencies", "includes", "modules", "import", "require", "package", "dependency"
+        ].into_iter().map(|s| s.to_string()).collect());
+
+        Self {
+            automaton,
+            intent_docs,
+        }
+    }
+
+    pub fn route(&self, query: &str) -> (Intent, Vec<String>) {
+        let mut extracted_symbols = Vec::new();
+        let mut stripped_query = query.to_lowercase();
+
+        // 1. Extract symbols using Aho-Corasick
+        if let Some(ac) = &self.automaton {
+            let matches: Vec<_> = ac.find_iter(query).collect();
+            // Work backwards to not invalidate indices when stripping
+            for mat in matches.iter().rev() {
+                let symbol = &query[mat.start()..mat.end()];
+                extracted_symbols.push(symbol.to_string());
+                // Strip from the query shell used for intent scoring
+                stripped_query.replace_range(mat.start()..mat.end(), " ");
+            }
+        }
+
+        // 2. Score Intent using BM25-lite
+        let words: Vec<String> = stripped_query
+            .split_whitespace()
+            .map(|w| w.chars().filter(|c| c.is_alphanumeric()).collect::<String>())
+            .filter(|w| !w.is_empty())
+            .collect();
+
+        let mut best_intent = Intent::Generic;
+        let mut max_score = 0.0;
+
+        for (intent, doc_tokens) in &self.intent_docs {
+            let mut score = 0.0;
+            for word in &words {
+                if doc_tokens.contains(word) {
+                    // Simple TF (count matches)
+                    score += 1.0;
+                }
+            }
+            // Normalize by intent doc length slightly to avoid bias towards longer doc sets
+            let normalized_score = score / (doc_tokens.len() as f64).sqrt();
+            if normalized_score > max_score && normalized_score > 0.25 {
+                max_score = normalized_score;
+                best_intent = *intent;
+            }
+        }
+
+        (best_intent, extracted_symbols)
+    }
+
+    /// Convert intent and symbols into CueMap grounded cues
+    pub fn compile_to_cues(&self, intent: Intent, symbols: Vec<String>) -> Vec<String> {
+        let mut cues = Vec::new();
+        for symbol in symbols {
+            match intent {
+                Intent::FindCalls => {
+                    cues.push(format!("calls_function:{}", symbol));
+                    cues.push(format!("calls_method:{}", symbol));
+                }
+                Intent::FindDef => {
+                    cues.push(format!("defines_function:{}", symbol));
+                    cues.push(format!("defines_class:{}", symbol));
+                    cues.push(format!("defines_struct:{}", symbol));
+                    cues.push(format!("defines_method:{}", symbol));
+                }
+                Intent::FindImports => {
+                    cues.push(format!("imports_module:{}", symbol));
+                }
+                Intent::Generic => {
+                    cues.push(symbol);
+                }
+            }
+        }
+        cues
+    }
+}
 
 // Stopword list for filtering common words
 static STOPWORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
@@ -84,18 +204,35 @@ fn get_nlprule_tokenizer() -> Option<&'static nlprule::Tokenizer> {
             }
         }
 
-        // Try to load the tokenizer binary from OUT_DIR (set during build)
-        let tokenizer_path = concat!(env!("OUT_DIR"), "/en_tokenizer.bin");
-        match nlprule::Tokenizer::new(tokenizer_path) {
-            Ok(t) => {
-                tracing::info!("nlprule tokenizer loaded successfully");
-                Some(t)
+        // 2. Try to load from the Cuemap base directory or repo path
+        let base_dir = crate::config::get_base_dir();
+        let possible_paths = [
+            base_dir.join("en_tokenizer.bin"),
+            base_dir.join("data").join("en_tokenizer.bin"),
+            // Repo paths (for development)
+            std::path::PathBuf::from("data/nlprule/en"),
+            std::path::PathBuf::from("rust_engine/data/nlprule/en"),
+            // Fallback to build-time directory as a last resort for local dev
+            std::path::PathBuf::from(concat!(env!("OUT_DIR"), "/en_tokenizer.bin")),
+        ];
+
+        for tokenizer_path in possible_paths {
+            if !tokenizer_path.exists() {
+                continue;
             }
-            Err(e) => {
-                tracing::warn!("Failed to load nlprule tokenizer: {}, using fallback", e);
-                None
+
+            match nlprule::Tokenizer::new(&tokenizer_path) {
+                Ok(t) => {
+                    tracing::info!("nlprule tokenizer loaded successfully from {:?}", tokenizer_path);
+                    return Some(t);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load nlprule tokenizer at {:?}: {}", tokenizer_path, e);
+                }
             }
         }
+
+        None
     }).as_ref()
 }
 
