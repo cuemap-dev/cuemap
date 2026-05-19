@@ -1,7 +1,6 @@
 #[cfg(test)]
 mod tests {
     use cuemap::semantic::SemanticEngine;
-    use std::path::Path;
 
     #[test]
     fn test_wordnet_expansion() {

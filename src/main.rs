@@ -475,8 +475,11 @@ async fn main() {
                 if args.disable_bg_jobs { config.jobs.background_processing = false; }
                 if args.disable_snapshots { config.persistence.enabled = false; }
                 
-                // For "enable" flags: if CLI says enable, force enable.
-                if args.enable_consolidation { config.jobs.consolidation_enabled = true; }
+                // Autonomous consolidation is deprecated in v0.7 because it creates derived
+                // summary memories outside the deterministic co-processor path.
+                if args.enable_consolidation {
+                    warn!("--enable-consolidation is deprecated in v0.7 and will be ignored");
+                }
                 if args.disk_content { config.server.store_content_on_disk = true; }
                 
                 // Cloud overrides
@@ -486,6 +489,22 @@ async fn main() {
                 if let Some(e) = &args.cloud_endpoint { config.persistence.cloud.endpoint = Some(e.clone()); }
                 if let Some(p) = &args.cloud_prefix { config.persistence.cloud.prefix = p.clone(); }
                 if args.cloud_auto_backup { config.persistence.cloud.auto_backup = true; }
+
+                if !matches!(config.search.cuegen_strategy, CueGenStrategy::Default) {
+                    warn!(
+                        "Cue generation strategy {:?} is deprecated in v0.7; falling back to deterministic default",
+                        config.search.cuegen_strategy
+                    );
+                    config.search.cuegen_strategy = CueGenStrategy::Default;
+                }
+                if config.llm.enabled {
+                    warn!("LLM cue generation is deprecated in v0.7 core mode; disabling llm.enabled");
+                    config.llm.enabled = false;
+                }
+                if config.jobs.consolidation_enabled {
+                    warn!("Autonomous consolidation is deprecated in v0.7; disabling jobs.consolidation_enabled");
+                    config.jobs.consolidation_enabled = false;
+                }
 
                 run_server(config, args.load_static, args.child_process).await;
             }
@@ -669,25 +688,10 @@ async fn run_server(config: config::ServerConfig, load_static: Option<String>, i
     let provider: Arc<dyn jobs::ProjectProvider> = mt_engine.clone();
     let job_queue = Arc::new(jobs::JobQueue::new(provider, Some(metrics.clone()), !config.jobs.background_processing));
 
-    // Start autonomous systems consolidation if enabled
+    // Autonomous systems consolidation is deprecated in v0.7. Existing summary
+    // memories remain readable, but the server no longer schedules new summary jobs.
     if config.jobs.consolidation_enabled {
-        let engine = mt_engine.clone();
-        let queue = job_queue.clone(); 
-        tokio::spawn(async move {
-            info!("Systems Consolidation: Enabled (running daily)");
-            let mut interval = tokio::time::interval(Duration::from_secs(86400));
-            interval.tick().await; 
-            loop {
-                interval.tick().await;
-                let projects = engine.list_projects();
-                for proj_stats in projects {
-                    let job = jobs::Job::ConsolidateMemories { 
-                        project_id: proj_stats.project_id.clone() 
-                    };
-                    queue.enqueue(job).await;
-                }
-            }
-        });
+        warn!("Systems Consolidation: deprecated in v0.7; no consolidation jobs will be scheduled");
     }
     
     let mt_engine = mt_engine;

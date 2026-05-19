@@ -76,6 +76,33 @@ fn default_depth() -> usize {
     1
 }
 
+fn apply_query_intent(
+    ctx: &crate::projects::ProjectContext,
+    query_text: Option<&str>,
+    expanded_cues: &mut Vec<(String, f64)>,
+) -> Option<crate::facets::QueryIntent> {
+    let query_text = query_text?;
+    let intent = crate::facets::compile_query_intent(query_text, |cue| {
+        ctx.main.get_cue_index().contains_key(cue)
+    });
+
+    if intent.suppress_generic && !intent.weighted_cues.is_empty() {
+        expanded_cues.retain(|(cue, _)| cue.contains(':') || !crate::facets::is_weak_query_cue(cue));
+    }
+
+    for (cue, weight) in &intent.weighted_cues {
+        if let Some((_, existing_weight)) = expanded_cues.iter_mut().find(|(existing, _)| existing == cue) {
+            if *existing_weight < *weight {
+                *existing_weight = *weight;
+            }
+        } else {
+            expanded_cues.push((cue.clone(), *weight));
+        }
+    }
+
+    Some(intent)
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct RecallGroundedRequest {
     pub query_text: String,
@@ -376,7 +403,7 @@ pub fn routes(
 async fn root() -> impl IntoResponse {
     Json(serde_json::json!({
         "name": "CueMap Rust Engine",
-        "version": "0.6.3",
+        "version": env!("CARGO_PKG_VERSION"),
         "description": "High-performance Temporal-Associative Memory Store"
     }))
 }
@@ -607,6 +634,7 @@ async fn recall(
                 } else {
                     ctx.expand_query_cues(normalized_cues, &original_tokens)
                 };
+                let query_intent = apply_query_intent(&ctx, req.query_text.as_deref(), &mut expanded_cues);
                 
                 let mut all_results: Vec<crate::engine::RecallResult> = Vec::new();
                 let mut used_pivot_memory_ids = std::collections::HashSet::new();
@@ -702,7 +730,8 @@ async fn recall(
                         "explain".to_string(), 
                         serde_json::json!({
                             "query_cues": cues_to_process,
-                            "expanded_cues": expanded_cues
+                            "expanded_cues": expanded_cues,
+                            "query_intent": query_intent
                         })
                     );
                 }
@@ -796,6 +825,7 @@ async fn recall(
         };
         ctx.expand_query_cues(normalized_cues, &original_tokens)
     };
+    let query_intent = apply_query_intent(&ctx, req.query_text.as_deref(), &mut expanded_cues);
 
     let mut all_results: Vec<crate::engine::RecallResult> = Vec::new();
     let mut used_pivot_memory_ids = std::collections::HashSet::new();
@@ -906,7 +936,8 @@ async fn recall(
             "engine_latency": engine_latency_ms,
             "explain": {
                 "query_cues": cues_to_process,
-                "expanded_cues": expanded_cues
+                "expanded_cues": expanded_cues,
+                "query_intent": query_intent
             }
         })));
     }
@@ -1115,12 +1146,13 @@ async fn recall_grounded(
             normalized_cues.push(normalized);
         }
 
-        let expanded_cues = if req.disable_alias_expansion {
+        let mut expanded_cues = if req.disable_alias_expansion {
             normalized_cues.into_iter().map(|c| (c, 1.0)).collect()
         } else {
             // tokens were computed in step 1, reuse them!
             ctx.expand_query_cues(normalized_cues, &tokens)
         };
+        let _query_intent = apply_query_intent(&ctx, Some(&req.query_text), &mut expanded_cues);
         
         let heatmap = ctx.market_heatmap.read().ok();
         let heatmap_ref = heatmap.as_deref();

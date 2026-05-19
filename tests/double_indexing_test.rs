@@ -2,7 +2,6 @@
 mod tests {
     use cuemap::engine::CueMapEngine;
     use cuemap::structures::MainStats;
-    use std::collections::HashMap;
 
     #[test]
     fn test_double_indexing_recall() {

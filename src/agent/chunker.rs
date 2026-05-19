@@ -1555,7 +1555,7 @@ impl Chunker {
         
         // 1. Fetch the page with User-Agent (required by Wikipedia and many other sites)
         let client = reqwest::Client::builder()
-            .user_agent("CueMap/0.6 (https://cuemap.dev; bot)")
+            .user_agent(concat!("CueMap/", env!("CARGO_PKG_VERSION"), " (https://cuemap.dev; bot)"))
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
         

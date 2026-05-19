@@ -653,7 +653,6 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>, metrics: &Op
                      let memory_id = memory_id_clone;
                      let content = content_clone;
                      let project_id = project_id_clone;
-                     let rt_handle = tokio::runtime::Handle::current();
 
                      debug!("Job: Proposing cues for memory {} in project {} (strategy: {:?})", memory_id, project_id, ctx.cuegen_strategy);
                  
@@ -684,9 +683,6 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>, metrics: &Op
                  
                  // Track cues by source for detailed logging
                  let mut wordnet_cues: Vec<String> = Vec::new();
-                 let mut glove_cues: Vec<String> = Vec::new();
-                 let mut context_cues: Vec<String> = Vec::new();
-                 let mut llm_cues: Vec<String> = Vec::new();
                  
                  // IDF Filtering: Identify expansion candidates (rare cues only)
                  let total = ctx.total_memories();
@@ -709,40 +705,12 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>, metrics: &Op
                      wordnet_cues.extend(wn_result);
                  }
                  
-                // 4. Strategy Specific Expansion
-                match ctx.cuegen_strategy {
-                    CueGenStrategy::Default => {
-                        // Minimal strategy: Only WordNet (handled below always-on)
-                        // No extra expansion.
-                    },
-                    CueGenStrategy::Glove => {
-                        // GloVe Expansion (Nearest Neighbors of Cues)
-                        let glove_result = ctx.semantic_engine.expand_glove(&content, &expansion_candidates);
-                        glove_cues.extend(glove_result);
-                        
-                        // Global Context Expansion (Nearest Neighbors of Context Vector)
-                        let context_result = ctx.semantic_engine.expand_global_context(&content);
-                        context_cues.extend(context_result);
-                    },
-                     CueGenStrategy::Ollama => {
-                         // LLM Expansion
-                         // Use global config or fallback if enabled
-                         if ctx.llm_config.enabled || matches!(ctx.cuegen_strategy, CueGenStrategy::Ollama) {
-                             let content_ref = content.clone();
-                             let known_cues_ref = known_cues.clone();
-                             // Convert to legacy config for llm module
-                             let legacy_config = ctx.llm_config.to_legacy();
-                             
-                             match rt_handle.block_on(async move {
-                                 // ensure we are using the function from llm module
-                                 crate::llm::propose_cues(&content_ref, &legacy_config, &known_cues_ref).await
-                             }) {
-                                 Ok(result) => llm_cues.extend(result),
-                                 Err(e) => error!("Job: LLM failed: {}", e),
-                             }
-                         }
-                     }
-                 }
+                if !matches!(ctx.cuegen_strategy, CueGenStrategy::Default) {
+                    debug!(
+                        "Job: {:?} cue generation is deprecated in v0.7; using deterministic WordNet/POS expansion only",
+                        ctx.cuegen_strategy
+                    );
+                }
                  
                  // Log source breakdown before normalization
                  let log_sample = |name: &str, cues: &[String]| {
@@ -754,9 +722,6 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>, metrics: &Op
                  };
                  
                  log_sample("WordNet", &wordnet_cues);
-                 log_sample("GloVe", &glove_cues);
-                 log_sample("Context", &context_cues);
-                 log_sample("LLM", &llm_cues);
                  
 
                  
@@ -782,9 +747,6 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>, metrics: &Op
                  };
                  
                  filter_and_add(wordnet_cues, &mut seen, &mut proposed_cues);
-                 filter_and_add(glove_cues, &mut seen, &mut proposed_cues);
-                 filter_and_add(context_cues, &mut seen, &mut proposed_cues);
-                 filter_and_add(llm_cues, &mut seen, &mut proposed_cues);
                  
                  // Cap total proposed cues to prevent explosion
                  const MAX_PROPOSED_CUES: usize = 10;

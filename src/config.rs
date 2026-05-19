@@ -18,8 +18,8 @@ pub const DASHMAP_SHARD_COUNT: usize = 128;
 pub enum CueGenStrategy {
     #[default]
     Default,  // Minimal expansion (WordNet / Synonyms only)
-    Glove,    // Deep semantic expansion (GloVe + WordNet)
-    Ollama   // Local Ollama with Mistral (+ WordNet)
+    Glove,    // Deprecated in v0.7; falls back to Default
+    Ollama   // Deprecated in v0.7; falls back to Default
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -120,7 +120,7 @@ impl ServerConfig {
             "live" => {
                 config.persistence.enabled = true;
                 config.jobs.background_processing = true;
-                config.jobs.consolidation_enabled = true;
+                config.jobs.consolidation_enabled = false;
             },
             "benchmark" => {
                 config.persistence.enabled = false;

@@ -3,6 +3,7 @@ use crate::config::TuningConfig;
 use crate::crypto::EncryptionKey;
 use dashmap::DashMap;
 use serde::{Serialize, Deserialize};
+use std::any::TypeId;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -41,6 +42,31 @@ pub struct ScoredMemoryCandidate {
     // Raw values for late materialization
     pub intersection_weighted: f64,
     pub match_count: f64,
+    pub rerank_bonus: f64,
+    pub generic_penalty: f64,
+}
+
+fn is_generated_memory_facet(cue: &str) -> bool {
+    if cue.starts_with("source_role:")
+        || cue.starts_with("source_channel:")
+        || cue.starts_with("source_type:")
+        || cue.starts_with("has:")
+        || cue.starts_with("temporal:")
+        || cue.starts_with("entity:")
+    {
+        return true;
+    }
+
+    matches!(
+        cue,
+        "type:preference"
+            | "type:dislike"
+            | "type:ownership"
+            | "type:recommendation"
+            | "type:recipe"
+            | "type:answer"
+            | "type:routine"
+    )
 }
 
 /// Result of speculative alignment: a predicted continuation from a recalled memory.
@@ -314,6 +340,26 @@ where
         }
     }
 
+    fn with_synchronous_facets(
+        &self,
+        content: &str,
+        metadata: Option<&HashMap<String, serde_json::Value>>,
+        cues: Vec<String>,
+    ) -> Vec<String> {
+        if TypeId::of::<T>() != TypeId::of::<MainStats>() {
+            return cues;
+        }
+
+        let mut enriched = cues;
+        let mut seen: HashSet<String> = enriched.iter().map(|cue| cue.to_lowercase()).collect();
+        for facet in crate::facets::extract_memory_facets(content, metadata, &enriched) {
+            if seen.insert(facet.to_lowercase()) {
+                enriched.push(facet);
+            }
+        }
+        enriched
+    }
+
     pub fn add_memory(
         &self,
         content: String,
@@ -322,6 +368,8 @@ where
         stats: T,
         disable_temporal_chunking: bool,
     ) -> String {
+        let cues = self.with_synchronous_facets(&content, metadata.as_ref(), cues);
+
         // Create payload (Compressed or Encrypted)
         let payload = match Memory::<T>::create_payload(&content, self.master_key.as_deref()) {
             Ok(p) => p,
@@ -374,12 +422,13 @@ where
             }
         }
         self.last_events.insert(project_id, (memory_id.clone(), memory.created_at, memory.cues.clone()));
+        let indexed_cues = memory.cues.clone();
         if self.memories.insert(memory_id.clone(), memory).is_none() {
             self.memory_count.fetch_add(1, Ordering::Relaxed);
         }
         
-        // Index by cues (Double Indexing)
-        for cue in &cues {
+        // Index by cues (full cue plus key:value value aliases)
+        for cue in &indexed_cues {
             let cue_lower = cue.to_lowercase().trim().to_string();
             if cue_lower.is_empty() { continue; }
 
@@ -391,11 +440,6 @@ where
                 .entry(cue_lower.clone())
                 .or_insert_with(OrderedSet::new)
                 .add(memory_id.clone());
-
-            if !self.cue_index.contains_key(&cue_lower) {
-                 self.cue_count.fetch_add(1, Ordering::Relaxed);
-            }
-             self.cue_index.entry(cue_lower.clone()).or_insert_with(OrderedSet::new).add(memory_id.clone());
              
              // 2. Index value
              if let Some((_, value)) = cue_lower.split_once(':') {
@@ -407,7 +451,6 @@ where
                       self.cue_index.entry(val_str).or_insert_with(OrderedSet::new).add(memory_id.clone());
                  }
              }
-
 
         }
         
@@ -513,6 +556,8 @@ where
         reinforce: bool,
         overwrite_cues: bool,
     ) -> String {
+        let cues = self.with_synchronous_facets(&content, metadata.as_ref(), cues);
+
         if self.memories.contains_key(&id) {
             {
                 if let Some(mut memory) = self.memories.get_mut(&id) {
@@ -1020,6 +1065,8 @@ where
                         "recency_score": candidate.recency_score,
                         "reinforcement_score": candidate.reinforcement_score,
                         "salience_score": candidate.salience_score,
+                        "rerank_bonus": candidate.rerank_bonus,
+                        "generic_penalty": candidate.generic_penalty,
                     }))
                  } else {
                      None
@@ -1173,7 +1220,7 @@ where
         }
         
         // 5. Score candidates
-        let results = self.score_consolidated_candidates(candidates, explain, disable_salience_bias, disable_systems_consolidation, heatmap, mandatory_cues);
+        let results = self.score_consolidated_candidates(candidates, query_cues, explain, disable_salience_bias, disable_systems_consolidation, heatmap, mandatory_cues);
 
         results
     }
@@ -1181,6 +1228,7 @@ where
     fn score_consolidated_candidates<'a>(
         &self, 
         candidates: Vec<(&'a str, Vec<(usize, usize, f64)>, f64)>, 
+        query_cues: &[(String, f64)],
         _explain: bool, 
         disable_salience_bias: bool, 
         disable_systems_consolidation: bool,
@@ -1267,7 +1315,12 @@ where
                 let b = 1.0;
                 let k1 = 2.0;
                 let avg_cues = 40.0; // Estimated average cue list length
-                let len_f64 = memory.cues.len().max(1) as f64;
+                let scored_cue_len = memory.cues
+                    .iter()
+                    .filter(|cue| !is_generated_memory_facet(cue))
+                    .count()
+                    .max(1);
+                let len_f64 = scored_cue_len as f64;
                 
                 let bm25_len_penalty = 1.0 - b + b * (len_f64 / avg_cues);
                 // With TF=1 for all matching cues, the BM25 formula simplifies to a single tf_component
@@ -1276,16 +1329,44 @@ where
                 
                 let intersection_score = total_weight * bm25_tf_component * self.tuning.intersection_score_multiplier;
                 
-                // Final score includes salience
-                // We use salience_score (Effective + Market) here
-                let score = intersection_score + (recency_score * avg_w_rec) + (frequency_score * avg_w_freq) + (_salience_score * self.tuning.salience_score_multiplier);
+                let mut structured_query_seen = false;
+                let mut structured_match_seen = false;
+                let mut rerank_bonus = 0.0;
+                for (query_cue, query_weight) in query_cues {
+                    let Some((prefix, _)) = query_cue.split_once(':') else {
+                        continue;
+                    };
+                    structured_query_seen = true;
+                    if memory.cues.iter().any(|memory_cue| memory_cue == query_cue) {
+                        structured_match_seen = true;
+                        let multiplier = match prefix {
+                            "source_role" | "source_channel" | "source_type" => 12.0,
+                            "type" => 10.0,
+                            "has" => 9.0,
+                            "temporal" => 8.0,
+                            "entity" => 7.0,
+                            _ => 4.0,
+                        };
+                        rerank_bonus += query_weight * multiplier;
+                    }
+                }
+                let generic_penalty = if structured_query_seen && !structured_match_seen && match_count <= 2.0 {
+                    0.85
+                } else {
+                    1.0
+                };
+                
+                // Final score includes salience plus deterministic facet reranking.
+                // We use salience_score (Effective + Market) here.
+                let base_score = intersection_score + (recency_score * avg_w_rec) + (frequency_score * avg_w_freq) + (_salience_score * self.tuning.salience_score_multiplier);
+                let score = (base_score + rerank_bonus) * generic_penalty;
                 
                 // Match integrity calculation
                 // 1. Intersection strength (relative to match count)
                 let intersection_strength = total_weight / match_count.max(1.0);
                 // 2. Context agreement: how many of the memory's cues matched the query
                 let context_agreement = if !memory.cues.is_empty() {
-                    match_count / (memory.cues.len() as f64)
+                    (match_count / (scored_cue_len as f64)).min(1.0)
                 } else {
                     0.0
                 };
@@ -1304,6 +1385,8 @@ where
                     created_at: memory.created_at,
                     intersection_weighted: total_weight,
                     match_count,
+                    rerank_bonus,
+                    generic_penalty,
                 });
             }
         }

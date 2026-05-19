@@ -2,6 +2,19 @@
 
 All notable changes to the CueMap Rust Engine will be documented in this file.
 
+## [0.7.0] - 2026-05-19
+
+### Changed
+- **Deterministic Co-Processor Core**: Deprecated embedding and LLM cue generation paths in the hot/core path. `glove` and `ollama` cuegen values remain parse-compatible for one release but fall back to deterministic WordNet/POS behavior.
+- **Synchronous Facets**: Added deterministic add-time facets for source metadata, evidence shape, temporal markers, preference/dislike/ownership/recommendation/recipe/routine signals, and bounded entity cues.
+- **Query Intent Routing**: Added deterministic query intent cues for count, money, duration, current/latest, preference, source-answer, temporal-window, recipe, and recommendation queries.
+- **Sparse Reranking**: Added bounded deterministic facet reranking on top of the existing sparse candidate generation.
+- **Indexing Fixes**: Removed duplicate full-cue indexing in `add_memory`, indexed internally generated `episode:*` cues, and kept recall `expansion_depth` default at `1`.
+
+### Deprecated
+- **Autonomous Consolidation**: New `ConsolidateMemories` scheduling is disabled. Existing `type:summary` memories remain readable and filterable for snapshot compatibility.
+- **Embeddings/LLM Cue Expansion**: GloVe/finalfusion and Ollama cue proposal are no longer part of the v0.7 core engine path.
+
 ## [0.6.7] - 2026-03-15
 
 ### Added

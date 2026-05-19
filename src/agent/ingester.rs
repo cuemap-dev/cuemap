@@ -478,7 +478,7 @@ impl Ingester {
 
         // HTTP client for fetching pages
         let client = reqwest::Client::builder()
-            .user_agent("CueMap/0.6 (https://cuemap.dev; bot)")
+            .user_agent(concat!("CueMap/", env!("CARGO_PKG_VERSION"), " (https://cuemap.dev; bot)"))
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;

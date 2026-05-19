@@ -33,6 +33,8 @@ fn test_temporal_chunking() {
     let mem2 = engine.get_memory(&id2).unwrap();
     let episode_cue = format!("episode:{}", id1);
     assert!(mem2.cues.contains(&episode_cue), "Second memory should have episode cue pointing to the first");
+    let episode_results = engine.recall(vec![episode_cue], 5, false, None);
+    assert!(episode_results.iter().any(|r| r.memory_id == id2), "Episode cue should be indexed for recall");
 }
 
 #[test]

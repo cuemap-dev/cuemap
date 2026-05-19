@@ -10,7 +10,9 @@ CueMap implements a **Continuous Gradient Algorithm** optimized for associative 
 2.  **Pattern Completion (Associative Recall)**: Automatically infers missing cues from co-occurrence history, enabling recall from partial inputs.
 3.  **Recency & Salience (Signal Dynamics)**: Balances fresh data with salient, high-signal events prioritized by an adaptive impact scoring module.
 4.  **Reinforcement (Access-based Learning)**: Frequently accessed memories gain signal strength, remaining highly accessible even as they age.
-5.  **Autonomous Consolidation**: Periodically merges overlapping memories into summaries using background index compaction to preserve signal while reducing noise.
+5.  **Deterministic Facets & Intent Routing**: Extracts synchronous source, evidence, temporal, type, and entity facets, then uses sparse intent cues and reranking during recall.
+
+As of v0.7.0, CueMap's core path is deterministic and embedding-free. GloVe/Ollama cue generation and autonomous consolidation are deprecated from the hot path; existing summary memories remain readable for compatibility.
 
 Built with Rust for maximum performance and reliability.
 
@@ -898,7 +900,7 @@ graph TB
         J6[ProposeAliases]
         J7[ExtractAndIngest]
         J8[VerifyFile]
-        J9[ConsolidateMemories]
+        J9[ConsolidateMemories<br/>deprecated]
     end
     
     subgraph "Processing"

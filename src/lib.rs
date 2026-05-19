@@ -18,5 +18,5 @@ pub mod web;
 pub mod crypto;
 pub mod metrics;
 pub mod external_lexicons;
-
+pub mod facets;
 
