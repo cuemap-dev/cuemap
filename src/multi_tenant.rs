@@ -1,23 +1,22 @@
 //! Multi-tenant engine supporting project isolation.
 
-use crate::structures::{MainStats, LexiconStats};
+use crate::config::TuningConfig;
+use crate::crypto::EncryptionKey;
 use crate::engine::CueMapEngine;
+use crate::normalization::NormalizationConfig;
 use crate::persistence::PersistenceManager;
 use crate::projects::ProjectContext;
-use crate::crypto::EncryptionKey;
-use crate::normalization::NormalizationConfig;
+use crate::structures::{LexiconStats, MainStats};
 use crate::taxonomy::Taxonomy;
-use crate::config::{CueGenStrategy, TuningConfig, LlmConfig};
-use std::collections::HashMap;
-use crate::semantic::SemanticEngine;
+use ahash::RandomState;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use ahash::RandomState;
+use std::collections::HashMap;
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub type ProjectId = String;
 
@@ -56,49 +55,46 @@ impl ProjectMeta {
 pub struct MultiTenantEngine {
     projects: Arc<DashMap<ProjectId, Arc<ProjectContext>, RandomState>>,
     snapshots_dir: PathBuf,
-    cuegen_strategy: CueGenStrategy,
-    semantic_engine: SemanticEngine,
     master_key: Option<Arc<EncryptionKey>>,
     tuning: Arc<TuningConfig>,
-    llm_config: Arc<LlmConfig>,
     config: crate::config::ServerConfig,
 }
 
 impl MultiTenantEngine {
     #[allow(dead_code)]
-    pub fn new(cuegen_strategy: CueGenStrategy, semantic_engine: SemanticEngine) -> Self {
-        Self::with_snapshots_dir("./snapshots", cuegen_strategy, semantic_engine, TuningConfig::default(), LlmConfig::default())
+    pub fn new() -> Self {
+        Self::with_snapshots_dir("./snapshots", TuningConfig::default())
     }
-    
-    pub fn with_snapshots_dir<P: AsRef<Path>>(dir: P, cuegen_strategy: CueGenStrategy, semantic_engine: SemanticEngine, tuning: TuningConfig, llm_config: LlmConfig) -> Self {
+
+    pub fn with_snapshots_dir<P: AsRef<Path>>(
+        dir: P,
+        tuning: TuningConfig,
+    ) -> Self {
         let snapshots_dir = dir.as_ref().to_path_buf();
-        
+
         // Create snapshots directory if it doesn't exist
         if let Err(e) = fs::create_dir_all(&snapshots_dir) {
             eprintln!("Warning: Failed to create snapshots directory: {}", e);
         }
-        
+
         Self {
             projects: Arc::new(DashMap::with_hasher(RandomState::new())),
             snapshots_dir,
-            cuegen_strategy,
-            semantic_engine,
             master_key: None,
             tuning: Arc::new(tuning),
-            llm_config: Arc::new(llm_config),
             config: crate::config::ServerConfig::default(),
         }
     }
-    
-    pub fn with_config(config: crate::config::ServerConfig, snapshots_dir: PathBuf, semantic_engine: SemanticEngine) -> Self {
+
+    pub fn with_config(
+        config: crate::config::ServerConfig,
+        snapshots_dir: PathBuf,
+    ) -> Self {
         Self {
             projects: Arc::new(DashMap::with_hasher(RandomState::new())),
             snapshots_dir,
-            cuegen_strategy: config.search.cuegen_strategy.clone(),
-            semantic_engine,
             master_key: None,
             tuning: Arc::new(config.tuning.clone()),
-            llm_config: Arc::new(config.llm.clone()),
             config,
         }
     }
@@ -106,45 +102,41 @@ impl MultiTenantEngine {
     pub fn set_master_key(&mut self, key: Option<Arc<EncryptionKey>>) {
         self.master_key = key;
     }
-    
-    pub fn get_or_create_project(&self, project_id: ProjectId) -> Result<Arc<ProjectContext>, String> {
+
+    pub fn get_or_create_project(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Arc<ProjectContext>, String> {
         if let Some(ctx) = self.projects.get(&project_id) {
             ctx.touch();
             Ok(ctx.clone())
         } else {
-
-
             // Create new project with default config
             let mut ctx_obj = ProjectContext::new(
                 NormalizationConfig::default(),
                 Taxonomy::default(),
-                self.cuegen_strategy.clone(),
-                self.semantic_engine.clone(),
                 self.tuning.clone(),
-                self.llm_config.clone(),
                 self.config.clone(),
                 project_id.clone(),
             );
-            
+
             // Set master key on engines
             ctx_obj.main.set_master_key(self.master_key.clone());
             ctx_obj.aliases.set_master_key(self.master_key.clone());
             ctx_obj.lexicon.set_master_key(self.master_key.clone());
-            
+
             let ctx = Arc::new(ctx_obj);
             self.projects.insert(project_id.clone(), ctx.clone());
-            
+
             // Ensure meta exists
             if let Ok(meta) = self.load_project_meta(&project_id) {
                 let _ = self.save_project_meta(&meta);
             }
-            
+
             Ok(ctx)
         }
     }
-    
 
-    
     /// Spawns a background thread to periodically save all project snapshots
     pub fn start_periodic_snapshots(&self, interval: Duration) {
         let engine = self.clone();
@@ -155,7 +147,7 @@ impl MultiTenantEngine {
                 let results = engine.save_all();
                 let saved = results.iter().filter(|(_, r)| r.is_ok()).count();
                 let failed = results.iter().filter(|(_, r)| r.is_err()).count();
-                
+
                 if saved > 0 {
                     tracing::debug!("Periodic snapshot: saved {} projects", saved);
                 }
@@ -166,12 +158,10 @@ impl MultiTenantEngine {
         });
     }
 
-
-    
     pub fn get_project(&self, project_id: &ProjectId) -> Option<Arc<ProjectContext>> {
         self.projects.get(project_id).map(|e| e.clone())
     }
-    
+
     pub fn list_projects(&self) -> Vec<ProjectStats> {
         self.projects
             .iter()
@@ -179,13 +169,15 @@ impl MultiTenantEngine {
                 let project_id = entry.key().clone();
                 let ctx = entry.value();
                 let stats = ctx.main.get_stats();
-                
+
                 ProjectStats {
                     project_id,
-                    total_memories: stats.get("total_memories")
+                    total_memories: stats
+                        .get("total_memories")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0) as usize,
-                    total_cues: stats.get("total_cues")
+                    total_cues: stats
+                        .get("total_cues")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0) as usize,
                     created_at: SystemTime::now()
@@ -200,60 +192,92 @@ impl MultiTenantEngine {
             })
             .collect()
     }
-    
+
     pub fn delete_project(&self, project_id: &ProjectId) -> bool {
         self.projects.remove(project_id).is_some()
     }
-    
+
     /// Save a project snapshot to disk (main, aliases, lexicon)
     pub fn save_project(&self, project_id: &ProjectId) -> Result<PathBuf, String> {
-        let ctx = self.get_project(project_id)
+        let ctx = self
+            .get_project(project_id)
             .ok_or_else(|| format!("Project '{}' not found", project_id))?;
-        
+
         // Save all 3 engines with suffixes
         let main_path = self.snapshots_dir.join(format!("{}.bin", project_id));
-        let aliases_path = self.snapshots_dir.join(format!("{}_aliases.bin", project_id));
-        let lexicon_path = self.snapshots_dir.join(format!("{}_lexicon.bin", project_id));
-        
+        let aliases_path = self
+            .snapshots_dir
+            .join(format!("{}_aliases.bin", project_id));
+        let lexicon_path = self
+            .snapshots_dir
+            .join(format!("{}_lexicon.bin", project_id));
+
         PersistenceManager::save_to_path(&ctx.main, &main_path)
             .map_err(|e| format!("Failed to save main engine: {}", e))?;
-        
+
         PersistenceManager::save_to_path(&ctx.aliases, &aliases_path)
             .map_err(|e| format!("Failed to save aliases engine: {}", e))?;
-        
+
         PersistenceManager::save_to_path(&ctx.lexicon, &lexicon_path)
             .map_err(|e| format!("Failed to save lexicon engine: {}", e))?;
-        
+
         tracing::info!("Saved project '{}' (main + aliases + lexicon)", project_id);
-        
+
         Ok(main_path)
     }
-    
+
     /// Load a project snapshot from disk (main, aliases, lexicon)
     pub fn load_project(&self, project_id: &ProjectId) -> Result<Arc<ProjectContext>, String> {
         let main_path = self.snapshots_dir.join(format!("{}.bin", project_id));
-        let aliases_path = self.snapshots_dir.join(format!("{}_aliases.bin", project_id));
-        let lexicon_path = self.snapshots_dir.join(format!("{}_lexicon.bin", project_id));
-        
+        let aliases_path = self
+            .snapshots_dir
+            .join(format!("{}_aliases.bin", project_id));
+        let lexicon_path = self
+            .snapshots_dir
+            .join(format!("{}_lexicon.bin", project_id));
+
         if !main_path.exists() {
             return Err(format!("Snapshot for project '{}' not found", project_id));
         }
-        
+
         // Load main engine (required)
-        let (memories, cue_index, main_graph, main_counts) = PersistenceManager::load_from_path::<MainStats>(&main_path)
-            .map_err(|e| format!("Failed to load main engine: {}", e))?;
-        let mut main_engine = CueMapEngine::from_state(memories, cue_index, main_graph, main_counts, self.config.clone(), project_id.clone());
+        let (memories, source_key_to_id, cue_index, next_memory_id, main_counts) =
+            PersistenceManager::load_from_path::<MainStats>(&main_path)
+                .map_err(|e| format!("Failed to load main engine: {}", e))?;
+        let mut main_engine = CueMapEngine::from_state(
+            memories,
+            source_key_to_id,
+            cue_index,
+            next_memory_id,
+            main_counts,
+            self.config.clone(),
+            project_id.clone(),
+        );
         main_engine.set_master_key(self.master_key.clone());
         main_engine.set_tuning_config(self.tuning.as_ref().clone());
-        
+
         // Load aliases engine (optional - may not exist for older snapshots)
         let mut aliases_engine = if aliases_path.exists() {
             match PersistenceManager::load_from_path::<MainStats>(&aliases_path) {
-                Ok((memories, cue_index, aliases_graph, aliases_counts)) => {
+                Ok((
+                    memories,
+                    source_key_to_id,
+                    cue_index,
+                    next_memory_id,
+                    aliases_counts,
+                )) => {
                     tracing::debug!("Loaded aliases for project '{}'", project_id);
                     let mut local_config = self.config.clone();
                     local_config.server.store_content_on_disk = false;
-                    let engine = CueMapEngine::from_state(memories, cue_index, aliases_graph, aliases_counts, local_config, project_id.clone());
+                    let engine = CueMapEngine::from_state(
+                        memories,
+                        source_key_to_id,
+                        cue_index,
+                        next_memory_id,
+                        aliases_counts,
+                        local_config,
+                        project_id.clone(),
+                    );
                     engine
                 }
                 Err(e) => {
@@ -266,15 +290,29 @@ impl MultiTenantEngine {
         };
         aliases_engine.set_master_key(self.master_key.clone());
         aliases_engine.set_tuning_config(self.tuning.as_ref().clone());
-        
+
         // Load lexicon engine (optional - may not exist for older snapshots)
         let mut lexicon_engine = if lexicon_path.exists() {
             match PersistenceManager::load_from_path::<LexiconStats>(&lexicon_path) {
-                Ok((memories, cue_index, lex_graph, lex_counts)) => {
+                Ok((
+                    memories,
+                    source_key_to_id,
+                    cue_index,
+                    next_memory_id,
+                    lex_counts,
+                )) => {
                     tracing::debug!("Loaded lexicon for project '{}'", project_id);
                     let mut local_config = self.config.clone();
                     local_config.server.store_content_on_disk = false;
-                    let engine = CueMapEngine::from_state(memories, cue_index, lex_graph, lex_counts, local_config, project_id.clone());
+                    let engine = CueMapEngine::from_state(
+                        memories,
+                        source_key_to_id,
+                        cue_index,
+                        next_memory_id,
+                        lex_counts,
+                        local_config,
+                        project_id.clone(),
+                    );
                     engine
                 }
                 Err(e) => {
@@ -287,76 +325,79 @@ impl MultiTenantEngine {
         };
         lexicon_engine.set_master_key(self.master_key.clone());
         lexicon_engine.set_tuning_config(self.tuning.as_ref().clone());
-        
+
         let ctx = Arc::new(ProjectContext {
             main: main_engine,
             aliases: aliases_engine,
             lexicon: lexicon_engine,
             query_cache: DashMap::with_hasher(RandomState::new()),
+            symbol_router_cache: RwLock::new(Default::default()),
             normalization: NormalizationConfig::default(),
             taxonomy: Taxonomy::default(),
-            cuegen_strategy: self.cuegen_strategy.clone(),
-            semantic_engine: self.semantic_engine.clone(),
             last_activity: std::sync::atomic::AtomicU64::new(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
-                    .as_secs()
+                    .as_secs(),
             ),
             market_heatmap: Arc::new(RwLock::new(HashMap::new())),
             tuning: self.tuning.clone(),
-            llm_config: self.llm_config.clone(),
+            cuebridge_artifacts: RwLock::new(crate::cuebridge::CueBridgeArtifacts::load_for_project(
+                &self.config.server.data_dir,
+                project_id,
+            )),
         });
-        
+
         self.projects.insert(project_id.clone(), ctx.clone());
-        
+
         Ok(ctx)
     }
-    
+
     /// Save all projects to disk
     pub fn save_all(&self) -> HashMap<String, Result<PathBuf, String>> {
         let mut results = HashMap::new();
-        
+
         // Collect IDs to avoid holding lock during save (prevent re-entrancy deadlock)
         let project_ids: Vec<String> = self.projects.iter().map(|e| e.key().clone()).collect();
-        
+
         for project_id in project_ids {
             let result = self.save_project(&project_id);
             results.insert(project_id, result);
         }
-        
+
         results
     }
-    
+
     /// Load all available snapshots from disk
     pub fn load_all(&self) -> HashMap<String, Result<(), String>> {
         let mut results = HashMap::new();
         let snapshots = self.list_snapshots();
-        
+
         for project_id in snapshots {
-            let result = self.load_project(&project_id)
+            let result = self
+                .load_project(&project_id)
                 .map(|_| ())
                 .map_err(|e| format!("Failed to load: {}", e));
             results.insert(project_id, result);
         }
-        
+
         results
     }
-    
+
     /// List available snapshots on disk
     pub fn list_snapshots(&self) -> Vec<String> {
         PersistenceManager::list_snapshots_in_dir(&self.snapshots_dir)
     }
-    
+
     /// Delete a project snapshot from disk
     #[allow(dead_code)]
     pub fn delete_snapshot(&self, project_id: &ProjectId) -> Result<(), String> {
         let snapshot_path = self.snapshots_dir.join(format!("{}.bin", project_id));
         let meta_path = self.snapshots_dir.join(format!("{}.meta.json", project_id));
-        
+
         // Try to delete meta if exists
         if meta_path.exists() {
-             let _ = fs::remove_file(meta_path);
+            let _ = fs::remove_file(meta_path);
         }
 
         PersistenceManager::delete_snapshot(&snapshot_path)
@@ -377,14 +418,20 @@ impl MultiTenantEngine {
 
     /// Save project metadata
     pub fn save_project_meta(&self, meta: &ProjectMeta) -> Result<(), String> {
-        let meta_path = self.snapshots_dir.join(format!("{}.meta.json", meta.project_id));
+        let meta_path = self
+            .snapshots_dir
+            .join(format!("{}.meta.json", meta.project_id));
         let content = serde_json::to_string_pretty(meta).map_err(|e| e.to_string())?;
         fs::write(meta_path, content).map_err(|e| e.to_string())?;
         Ok(())
     }
 
     /// Set watch directory for a project
-    pub fn set_project_watch_dir(&self, project_id: &str, watch_dir: Option<String>) -> Result<(), String> {
+    pub fn set_project_watch_dir(
+        &self,
+        project_id: &str,
+        watch_dir: Option<String>,
+    ) -> Result<(), String> {
         // Validation
         if let Some(dir) = &watch_dir {
             let path = Path::new(dir);
@@ -395,22 +442,22 @@ impl MultiTenantEngine {
 
         // Get current meta
         let mut meta = self.load_project_meta(&project_id.to_string())?;
-        
+
         meta.watch_dir = watch_dir;
         // Auto-enable agent if watch dir is set
         meta.agent_enabled = meta.watch_dir.is_some();
-        
+
         self.save_project_meta(&meta)?;
-        
+
         Ok(())
     }
-    
+
     pub fn get_global_stats(&self) -> HashMap<String, serde_json::Value> {
         let projects = self.list_projects();
-        
+
         let total_memories: usize = projects.iter().map(|p| p.total_memories).sum();
         let total_cues: usize = projects.iter().map(|p| p.total_cues).sum();
-        
+
         let mut stats = HashMap::new();
         stats.insert(
             "total_projects".to_string(),
@@ -420,16 +467,28 @@ impl MultiTenantEngine {
             "total_memories".to_string(),
             serde_json::json!(total_memories),
         );
-        stats.insert(
-            "total_cues".to_string(),
-            serde_json::json!(total_cues),
-        );
-        stats.insert(
-            "projects".to_string(),
-            serde_json::json!(projects),
-        );
-        
+        stats.insert("total_cues".to_string(), serde_json::json!(total_cues));
+        stats.insert("projects".to_string(), serde_json::json!(projects));
+
         stats
+    }
+
+    pub fn project_artifact_summary(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<crate::cuebridge::CueBridgeArtifactSummary, String> {
+        let ctx = self
+            .get_project(project_id)
+            .ok_or_else(|| format!("Project '{}' not found", project_id))?;
+        Ok(ctx.cuebridge_artifact_summary())
+    }
+
+    pub fn reload_project_artifacts(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<crate::cuebridge::CueBridgeArtifactSummary, String> {
+        let ctx = self.get_or_create_project(project_id.clone())?;
+        Ok(ctx.reload_cuebridge_artifacts(&self.config.server.data_dir, project_id))
     }
 }
 
@@ -440,7 +499,7 @@ pub fn validate_project_id(project_id: &str) -> bool {
     if project_id.len() < 3 || project_id.len() > 64 {
         return false;
     }
-    
+
     project_id
         .chars()
         .all(|c| c.is_alphanumeric() || c == '-' || c == '_')

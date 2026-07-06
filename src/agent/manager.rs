@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{info, error};
+use tracing::{error, info};
 
 use crate::agent::{Agent, AgentConfig};
 use crate::jobs::{JobQueue, ProjectProvider};
@@ -27,19 +27,28 @@ impl AgentManager {
         // If an agent is already running for this project, stop it first to ensure clean handoff
         self.stop_agent(project_id).await;
 
-        info!("AgentManager: Spawning new Agent for project '{}'", project_id);
-        
+        info!(
+            "AgentManager: Spawning new Agent for project '{}'",
+            project_id
+        );
+
         match Agent::new(config, self.job_queue.clone(), self.provider.clone()) {
             Ok(agent) => {
                 let agent = Arc::new(agent);
                 agent.start().await;
-                
+
                 let mut locked = self.agents.write().await;
                 locked.insert(project_id.to_string(), agent);
-                info!("AgentManager: Successfully spawned Agent for '{}'", project_id);
+                info!(
+                    "AgentManager: Successfully spawned Agent for '{}'",
+                    project_id
+                );
             }
             Err(e) => {
-                error!("AgentManager: Failed to initialize Agent for '{}': {}", project_id, e);
+                error!(
+                    "AgentManager: Failed to initialize Agent for '{}': {}",
+                    project_id, e
+                );
             }
         }
     }

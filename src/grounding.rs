@@ -1,9 +1,10 @@
 use crate::engine::RecallResult;
+use crate::structures::MemoryId;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelectedItem {
-    pub memory_id: String,
+    pub memory_id: MemoryId,
     pub content: String,
     pub score: f64,
     pub intersection_count: usize,
@@ -18,7 +19,7 @@ pub struct SelectedItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExcludedItem {
-    pub memory_id: String,
+    pub memory_id: MemoryId,
     pub score: f64,
     pub reason: String,
 }
@@ -55,15 +56,17 @@ impl GroundingEngine {
 
         for result in results {
             let tokens = Self::estimate_tokens(&result.content);
-            
+
             if current_tokens + tokens <= token_budget {
-                let source = result.metadata
+                let source = result
+                    .metadata
                     .get("source")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown")
                     .to_string();
-                
-                let timestamp = result.metadata
+
+                let timestamp = result
+                    .metadata
                     .get("timestamp")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
@@ -100,11 +103,16 @@ impl GroundingEngine {
                 });
                 current_tokens += tokens;
             } else {
-                if excluded_top.len() < 5 { // Only track top 5 exclusions
+                if excluded_top.len() < 5 {
+                    // Only track top 5 exclusions
                     excluded_top.push(ExcludedItem {
                         memory_id: result.memory_id,
                         score: result.score,
-                        reason: format!("Exceeds remaining token budget (needs {}, has {})", tokens, token_budget - current_tokens),
+                        reason: format!(
+                            "Exceeds remaining token budget (needs {}, has {})",
+                            tokens,
+                            token_budget - current_tokens
+                        ),
                     });
                 }
             }

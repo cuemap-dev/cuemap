@@ -22,17 +22,13 @@
 //! - `AZURE_STORAGE_ACCOUNT_KEY` - Storage account key
 
 use crate::engine::CueMapEngine;
-use crate::structures::{Memory, OrderedSet, MemoryStats};
+use crate::structures::{Memory, MemoryId, MemoryStats, OrderedSet};
+use ahash::RandomState;
 use bytes::Bytes;
 use dashmap::DashMap;
-use ahash::RandomState;
 use object_store::{
-    aws::AmazonS3Builder,
-    azure::MicrosoftAzureBuilder,
-    gcp::GoogleCloudStorageBuilder,
-    local::LocalFileSystem,
-    path::Path as ObjectPath,
-    ObjectStore, PutPayload,
+    aws::AmazonS3Builder, azure::MicrosoftAzureBuilder, gcp::GoogleCloudStorageBuilder,
+    local::LocalFileSystem, path::Path as ObjectPath, ObjectStore, PutPayload,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -43,20 +39,19 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
-
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedState<T> {
-    memories: HashMap<String, Memory<T>>,
-    cue_index: HashMap<String, Vec<String>>, // Flattened OrderedSet
+    memories: HashMap<MemoryId, Memory<T>>,
+    source_key_to_id: HashMap<String, MemoryId>,
+    cue_index: HashMap<String, Vec<MemoryId>>, // Flattened OrderedSet
+    next_memory_id: MemoryId,
     version: u32,
     saved_at: u64,
-    #[serde(default)]
-    cue_co_occurrence: Option<HashMap<String, HashMap<String, u64>>>,
     #[serde(default)]
     cue_global_counts: Option<HashMap<String, u64>>,
 }
 
-const PERSISTENCE_VERSION: u32 = 1;
+const PERSISTENCE_VERSION: u32 = 2;
 
 pub struct PersistenceManager {
     data_dir: PathBuf,
@@ -66,38 +61,52 @@ pub struct PersistenceManager {
 impl PersistenceManager {
     pub fn new(data_dir: impl AsRef<Path>, snapshot_interval_secs: u64) -> Self {
         let data_dir = data_dir.as_ref().to_path_buf();
-        
+
         // Create data directory if it doesn't exist
         if let Err(e) = fs::create_dir_all(&data_dir) {
             error!("Failed to create data directory {:?}: {}", data_dir, e);
         }
-        
+
         Self {
             data_dir,
             snapshot_interval: Duration::from_secs(snapshot_interval_secs),
         }
     }
-    
+
     /// Save engine state to a specific path (used by multi-tenant)
     /// Save engine state to a specific path (used by multi-tenant)
     pub fn save_to_path<T>(
         engine: &CueMapEngine<T>,
         path: &Path,
-    ) -> Result<(), Box<dyn std::error::Error>> 
-    where T: Serialize + for<'de> Deserialize<'de> + Clone + Default + Send + Sync + MemoryStats + 'static
+    ) -> Result<(), Box<dyn std::error::Error>>
+    where
+        T: Serialize
+            + for<'de> Deserialize<'de>
+            + Clone
+            + Default
+            + Send
+            + Sync
+            + MemoryStats
+            + 'static,
     {
         let start = std::time::Instant::now();
-        
+
         let memories = engine.get_memories();
+        let source_key_to_id = engine.get_source_key_to_id();
         let cue_index = engine.get_cue_index();
-        
+
         // Convert DashMaps to serializable format
-        let memories_map: HashMap<String, Memory<T>> = memories
+        let memories_map: HashMap<MemoryId, Memory<T>> = memories
             .iter()
-            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .map(|entry| (*entry.key(), entry.value().clone()))
             .collect();
-        
-        let cue_index_map: HashMap<String, Vec<String>> = cue_index
+
+        let source_key_to_id_map: HashMap<String, MemoryId> = source_key_to_id
+            .iter()
+            .map(|entry| (entry.key().clone(), *entry.value()))
+            .collect();
+
+        let cue_index_map: HashMap<String, Vec<MemoryId>> = cue_index
             .iter()
             .map(|entry| {
                 let cue = entry.key().clone();
@@ -107,24 +116,7 @@ impl PersistenceManager {
             })
             .collect();
 
-        // Smart Graph Serialization: Only embed if memory count is 0 but graph exists
-        let co_occurrence_map = {
-            let co_occ = engine.get_cue_co_occurrence();
-            if memories_map.is_empty() && !co_occ.is_empty() {
-                let mut graph = HashMap::new();
-                for entry in co_occ.iter() {
-                    let inner = entry.value().clone();
-                    if !inner.is_empty() {
-                        graph.insert(entry.key().clone(), inner);
-                    }
-                }
-                Some(graph)
-            } else {
-                None
-            }
-        };
-        
-        // 4. Convert global counts
+        // Convert global counts
         let global_counts_map = {
             let counts_dm = &engine.cue_global_counts;
             if !counts_dm.is_empty() {
@@ -137,29 +129,30 @@ impl PersistenceManager {
                 None
             }
         };
-        
+
         let state = PersistedState {
             memories: memories_map,
+            source_key_to_id: source_key_to_id_map,
             cue_index: cue_index_map,
+            next_memory_id: engine.next_memory_id(),
             version: PERSISTENCE_VERSION,
             saved_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
-            cue_co_occurrence: co_occurrence_map,
             cue_global_counts: global_counts_map,
         };
-        
+
         // Serialize to bincode
         let data = bincode::serialize(&state)?;
-        
+
         // Write to temp file first (atomic operation)
         let temp_path = path.with_extension("bin.tmp");
         fs::write(&temp_path, &data)?;
-        
+
         // Rename to final location (atomic on most filesystems)
         fs::rename(&temp_path, path)?;
-        
+
         let duration = start.elapsed();
         info!(
             "Saved {} memories and {} cues to {:?} in {:?} ({} bytes)",
@@ -169,31 +162,50 @@ impl PersistenceManager {
             duration,
             data.len()
         );
-        
+
         Ok(())
     }
-    
+
     /// Load engine state from a specific path (used by multi-tenant)
     /// Load engine state from a specific path (used by multi-tenant)
     pub fn load_from_path<T>(
         path: &Path,
-    ) -> Result<(
-        DashMap<String, Memory<T>, RandomState>, 
-        DashMap<String, OrderedSet, RandomState>,
-        Option<DashMap<String, HashMap<String, u64>, RandomState>>,
-        Option<DashMap<String, u64, RandomState>>
-    ), Box<dyn std::error::Error>> 
-    where T: Serialize + for<'de> Deserialize<'de> + Clone + Default + Send + Sync + MemoryStats + 'static
+    ) -> Result<
+        (
+            DashMap<MemoryId, Memory<T>, RandomState>,
+            DashMap<String, MemoryId, RandomState>,
+            DashMap<String, OrderedSet, RandomState>,
+            MemoryId,
+            Option<DashMap<String, u64, RandomState>>,
+        ),
+        Box<dyn std::error::Error>,
+    >
+    where
+        T: Serialize
+            + for<'de> Deserialize<'de>
+            + Clone
+            + Default
+            + Send
+            + Sync
+            + MemoryStats
+            + 'static,
     {
         if !path.exists() {
             return Err(format!("Snapshot not found: {:?}", path).into());
         }
-        
+
         info!("Loading state from {:?}", path);
-        
+
         let data = fs::read(path)?;
         let state: PersistedState<T> = bincode::deserialize(&data)?;
-        
+        if state.version != PERSISTENCE_VERSION {
+            return Err(format!(
+                "Unsupported snapshot version {} (expected {}). Reingest required.",
+                state.version, PERSISTENCE_VERSION
+            )
+            .into());
+        }
+
         info!(
             "Loaded {} memories and {} cues from snapshot (version: {}, saved: {})",
             state.memories.len(),
@@ -201,13 +213,18 @@ impl PersistenceManager {
             state.version,
             state.saved_at
         );
-        
+
         // Convert to DashMaps
         let memories = DashMap::with_hasher(RandomState::new());
         for (id, memory) in state.memories {
             memories.insert(id, memory);
         }
-        
+
+        let source_key_to_id = DashMap::with_hasher(RandomState::new());
+        for (source_key, memory_id) in state.source_key_to_id {
+            source_key_to_id.insert(source_key, memory_id);
+        }
+
         let cue_index = DashMap::with_hasher(RandomState::new());
         for (cue, memory_ids) in state.cue_index {
             let mut ordered_set = OrderedSet::new();
@@ -216,14 +233,6 @@ impl PersistenceManager {
             }
             cue_index.insert(cue, ordered_set);
         }
-
-        let loaded_graph = state.cue_co_occurrence.map(|raw_graph| {
-            let dm = DashMap::with_hasher(RandomState::new());
-            for (cue, related) in raw_graph {
-                dm.insert(cue, related);
-            }
-            dm
-        });
 
         let loaded_global_counts = state.cue_global_counts.map(|raw_counts| {
             let dm = DashMap::with_hasher(RandomState::new());
@@ -232,23 +241,29 @@ impl PersistenceManager {
             }
             dm
         });
-        
-        Ok((memories, cue_index, loaded_graph, loaded_global_counts))
+
+        Ok((
+            memories,
+            source_key_to_id,
+            cue_index,
+            state.next_memory_id.max(1),
+            loaded_global_counts,
+        ))
     }
-    
+
     /// List all snapshot files in a directory (main engines only, not aliases/lexicon)
     pub fn list_snapshots_in_dir(dir: &Path) -> Vec<String> {
         let mut snapshots = Vec::new();
-        
+
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
                     // Only include main engine files, not aliases or lexicon
-                    if filename.ends_with(".bin") 
+                    if filename.ends_with(".bin")
                         && !filename.ends_with(".tmp")
                         && !filename.ends_with("_aliases.bin")
-                        && !filename.ends_with("_lexicon.bin") 
+                        && !filename.ends_with("_lexicon.bin")
                     {
                         let project_id = filename.replace(".bin", "");
                         snapshots.push(project_id);
@@ -256,50 +271,73 @@ impl PersistenceManager {
                 }
             }
         }
-        
+
         snapshots.sort();
         snapshots
     }
-    
+
     /// Delete a snapshot file
     #[allow(dead_code)]
     pub fn delete_snapshot(path: &Path) -> Result<(), String> {
         if path.exists() {
-            fs::remove_file(path)
-                .map_err(|e| format!("Failed to delete snapshot: {}", e))?;
+            fs::remove_file(path).map_err(|e| format!("Failed to delete snapshot: {}", e))?;
         }
         Ok(())
     }
-    
+
     fn snapshot_path(&self) -> PathBuf {
         self.data_dir.join("cuemap.bin")
     }
-    
+
     fn temp_snapshot_path(&self) -> PathBuf {
         self.data_dir.join("cuemap.bin.tmp")
     }
-    
+
     pub fn load_state<T>(
         &self,
-    ) -> Result<(
-        DashMap<String, Memory<T>, RandomState>, 
-        DashMap<String, OrderedSet, RandomState>,
-        Option<DashMap<String, HashMap<String, u64>, RandomState>>
-    ), Box<dyn std::error::Error>> 
-    where T: Serialize + for<'de> Deserialize<'de> + Clone + Default + Send + Sync + MemoryStats + 'static
+    ) -> Result<
+        (
+            DashMap<MemoryId, Memory<T>, RandomState>,
+            DashMap<String, MemoryId, RandomState>,
+            DashMap<String, OrderedSet, RandomState>,
+            MemoryId,
+        ),
+        Box<dyn std::error::Error>,
+    >
+    where
+        T: Serialize
+            + for<'de> Deserialize<'de>
+            + Clone
+            + Default
+            + Send
+            + Sync
+            + MemoryStats
+            + 'static,
     {
         let snapshot_path = self.snapshot_path();
-        
+
         if !snapshot_path.exists() {
             info!("No existing snapshot found, starting with empty state");
-            return Ok((DashMap::with_hasher(RandomState::new()), DashMap::with_hasher(RandomState::new()), None));
+            return Ok((
+                DashMap::with_hasher(RandomState::new()),
+                DashMap::with_hasher(RandomState::new()),
+                DashMap::with_hasher(RandomState::new()),
+                1,
+            ));
         }
-        
+
         info!("Loading state from {:?}", snapshot_path);
-        
+
         let data = fs::read(&snapshot_path)?;
         let state: PersistedState<T> = bincode::deserialize(&data)?;
-        
+        if state.version != PERSISTENCE_VERSION {
+            return Err(format!(
+                "Unsupported snapshot version {} (expected {}). Reingest required.",
+                state.version, PERSISTENCE_VERSION
+            )
+            .into());
+        }
+
         info!(
             "Loaded {} memories and {} cues from snapshot (version: {}, saved: {})",
             state.memories.len(),
@@ -307,13 +345,18 @@ impl PersistenceManager {
             state.version,
             state.saved_at
         );
-        
+
         // Convert to DashMaps
         let memories = DashMap::with_hasher(RandomState::new());
         for (id, memory) in state.memories {
             memories.insert(id, memory);
         }
-        
+
+        let source_key_to_id = DashMap::with_hasher(RandomState::new());
+        for (source_key, memory_id) in state.source_key_to_id {
+            source_key_to_id.insert(source_key, memory_id);
+        }
+
         let cue_index = DashMap::with_hasher(RandomState::new());
         for (cue, memory_ids) in state.cue_index {
             let mut ordered_set = OrderedSet::new();
@@ -323,35 +366,43 @@ impl PersistenceManager {
             cue_index.insert(cue, ordered_set);
         }
 
-        let loaded_graph = state.cue_co_occurrence.map(|raw_graph| {
-            let dm = DashMap::with_hasher(RandomState::new());
-            for (cue, related) in raw_graph {
-                dm.insert(cue, related);
-            }
-            dm
-        });
-        
-        Ok((memories, cue_index, loaded_graph))
+        Ok((
+            memories,
+            source_key_to_id,
+            cue_index,
+            state.next_memory_id.max(1),
+        ))
     }
-    
-    pub fn save_state<T>(
-        &self,
-        engine: &CueMapEngine<T>,
-    ) -> Result<(), Box<dyn std::error::Error>> 
-    where T: Serialize + for<'de> Deserialize<'de> + Clone + Default + Send + Sync + MemoryStats + 'static
+
+    pub fn save_state<T>(&self, engine: &CueMapEngine<T>) -> Result<(), Box<dyn std::error::Error>>
+    where
+        T: Serialize
+            + for<'de> Deserialize<'de>
+            + Clone
+            + Default
+            + Send
+            + Sync
+            + MemoryStats
+            + 'static,
     {
         let start = std::time::Instant::now();
-        
+
         let memories = engine.get_memories();
+        let source_key_to_id = engine.get_source_key_to_id();
         let cue_index = engine.get_cue_index();
-        
+
         // Convert DashMaps to serializable format
-        let memories_map: HashMap<String, Memory<T>> = memories
+        let memories_map: HashMap<MemoryId, Memory<T>> = memories
             .iter()
-            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .map(|entry| (*entry.key(), entry.value().clone()))
             .collect();
-        
-        let cue_index_map: HashMap<String, Vec<String>> = cue_index
+
+        let source_key_to_id_map: HashMap<String, MemoryId> = source_key_to_id
+            .iter()
+            .map(|entry| (entry.key().clone(), *entry.value()))
+            .collect();
+
+        let cue_index_map: HashMap<String, Vec<MemoryId>> = cue_index
             .iter()
             .map(|entry| {
                 let cue = entry.key().clone();
@@ -361,25 +412,8 @@ impl PersistenceManager {
                 (cue, memory_ids)
             })
             .collect();
-        
-        // Smart Graph Serialization
-        let co_occurrence_map = {
-            let co_occ = engine.get_cue_co_occurrence();
-            if memories_map.is_empty() && !co_occ.is_empty() {
-                let mut graph = HashMap::new();
-                for entry in co_occ.iter() {
-                    let inner = entry.value().clone();
-                    if !inner.is_empty() {
-                        graph.insert(entry.key().clone(), inner);
-                    }
-                }
-                Some(graph)
-            } else {
-                None
-            }
-        };
 
-        // 4. Convert global counts
+        // Convert global counts
         let global_counts_map = {
             let counts_dm = &engine.cue_global_counts;
             if !counts_dm.is_empty() {
@@ -392,29 +426,30 @@ impl PersistenceManager {
                 None
             }
         };
-        
+
         let state = PersistedState {
             memories: memories_map,
+            source_key_to_id: source_key_to_id_map,
             cue_index: cue_index_map,
+            next_memory_id: engine.next_memory_id(),
             version: PERSISTENCE_VERSION,
             saved_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
-            cue_co_occurrence: co_occurrence_map,
             cue_global_counts: global_counts_map,
         };
-        
+
         // Serialize to bincode
         let data = bincode::serialize(&state)?;
-        
+
         // Write to temp file first (atomic operation)
         let temp_path = self.temp_snapshot_path();
         fs::write(&temp_path, &data)?;
-        
+
         // Rename to final location (atomic on most filesystems)
         fs::rename(&temp_path, &self.snapshot_path())?;
-        
+
         let duration = start.elapsed();
         info!(
             "Saved {} memories and {} cues to snapshot in {:?} ({} bytes)",
@@ -423,24 +458,32 @@ impl PersistenceManager {
             duration,
             data.len()
         );
-        
+
         Ok(())
     }
-    
+
     pub async fn start_background_snapshots<T>(
         &self,
         engine: Arc<CueMapEngine<T>>,
-    ) -> tokio::task::JoinHandle<()> 
-    where T: Serialize + for<'de> Deserialize<'de> + Clone + Default + Send + Sync + MemoryStats + 'static
+    ) -> tokio::task::JoinHandle<()>
+    where
+        T: Serialize
+            + for<'de> Deserialize<'de>
+            + Clone
+            + Default
+            + Send
+            + Sync
+            + MemoryStats
+            + 'static,
     {
         let persistence = self.clone();
-        
+
         tokio::spawn(async move {
             let mut interval = interval(persistence.snapshot_interval);
-            
+
             loop {
                 interval.tick().await;
-                
+
                 if let Err(e) = persistence.save_state(&engine) {
                     error!("Background snapshot failed: {}", e);
                 } else {
@@ -464,8 +507,15 @@ impl Clone for PersistenceManager {
 pub async fn setup_shutdown_handler<T>(
     persistence: PersistenceManager,
     engine: Arc<CueMapEngine<T>>,
-)
-where T: Serialize + for<'de> Deserialize<'de> + Clone + Default + Send + Sync + MemoryStats + 'static
+) where
+    T: Serialize
+        + for<'de> Deserialize<'de>
+        + Clone
+        + Default
+        + Send
+        + Sync
+        + MemoryStats
+        + 'static,
 {
     tokio::spawn(async move {
         // Wait for SIGINT (Ctrl+C) or SIGTERM
@@ -473,7 +523,7 @@ where T: Serialize + for<'de> Deserialize<'de> + Clone + Default + Send + Sync +
             .expect("Failed to create SIGINT handler");
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("Failed to create SIGTERM handler");
-        
+
         tokio::select! {
             _ = sigint.recv() => {
                 info!("Received SIGINT, shutting down gracefully...");
@@ -482,7 +532,7 @@ where T: Serialize + for<'de> Deserialize<'de> + Clone + Default + Send + Sync +
                 info!("Received SIGTERM, shutting down gracefully...");
             }
         }
-        
+
         // Save final snapshot
         info!("Saving final snapshot before shutdown...");
         if let Err(e) = persistence.save_state(&engine) {
@@ -490,7 +540,7 @@ where T: Serialize + for<'de> Deserialize<'de> + Clone + Default + Send + Sync +
         } else {
             info!("Final snapshot saved successfully");
         }
-        
+
         // Exit
         std::process::exit(0);
     });
@@ -603,7 +653,9 @@ pub struct CloudBackupManager {
 
 impl CloudBackupManager {
     /// Create a new cloud backup manager
-    pub async fn new(config: CloudBackupConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn new(
+        config: CloudBackupConfig,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let provider = config
             .provider
             .as_ref()
@@ -615,28 +667,36 @@ impl CloudBackupManager {
                 region,
                 endpoint,
             } => {
-                info!("Initializing S3 cloud backup: bucket={}, region={}", bucket, region);
-                
+                info!(
+                    "Initializing S3 cloud backup: bucket={}, region={}",
+                    bucket, region
+                );
+
                 let mut builder = AmazonS3Builder::from_env()
                     .with_bucket_name(bucket)
                     .with_region(region);
 
                 if let Some(ep) = endpoint {
                     info!("Using custom S3 endpoint: {}", ep);
-                    builder = builder.with_endpoint(ep).with_virtual_hosted_style_request(false);
+                    builder = builder
+                        .with_endpoint(ep)
+                        .with_virtual_hosted_style_request(false);
                 }
 
                 Arc::new(builder.build()?)
             }
             CloudProvider::GCS { bucket } => {
                 info!("Initializing GCS cloud backup: bucket={}", bucket);
-                
+
                 let builder = GoogleCloudStorageBuilder::from_env().with_bucket_name(bucket);
                 Arc::new(builder.build()?)
             }
             CloudProvider::Azure { container, account } => {
-                info!("Initializing Azure cloud backup: account={}, container={}", account, container);
-                
+                info!(
+                    "Initializing Azure cloud backup: account={}, container={}",
+                    account, container
+                );
+
                 let builder = MicrosoftAzureBuilder::from_env()
                     .with_account(account)
                     .with_container_name(container);
@@ -644,7 +704,7 @@ impl CloudBackupManager {
             }
             CloudProvider::Local { path } => {
                 info!("Initializing local cloud backup: path={}", path);
-                
+
                 // Create directory if it doesn't exist
                 std::fs::create_dir_all(path)?;
                 Arc::new(LocalFileSystem::new_with_prefix(path)?)
@@ -652,7 +712,7 @@ impl CloudBackupManager {
         };
 
         info!("Cloud backup manager initialized successfully");
-        
+
         Ok(Self { config, store })
     }
 
@@ -693,7 +753,9 @@ impl CloudBackupManager {
         // Upload main engine
         let main_path = self.get_object_path(project_id, ".bin");
         let main_size = main_data.len() as u64;
-        self.store.put(&main_path, PutPayload::from_bytes(main_data)).await?;
+        self.store
+            .put(&main_path, PutPayload::from_bytes(main_data))
+            .await?;
         total_size += main_size;
         debug!("Uploaded main: {} ({} bytes)", main_path, main_size);
 
@@ -715,7 +777,10 @@ impl CloudBackupManager {
             debug!("Uploaded lexicon: {} ({} bytes)", path, size);
         }
 
-        info!("Uploaded project snapshot: {} ({} bytes total)", project_id, total_size);
+        info!(
+            "Uploaded project snapshot: {} ({} bytes total)",
+            project_id, total_size
+        );
         Ok(total_size)
     }
 
@@ -739,7 +804,8 @@ impl CloudBackupManager {
     pub async fn download_project_snapshot(
         &self,
         project_id: &str,
-    ) -> Result<(Bytes, Option<Bytes>, Option<Bytes>), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(Bytes, Option<Bytes>, Option<Bytes>), Box<dyn std::error::Error + Send + Sync>>
+    {
         // Download main engine (required)
         let main_path = self.get_object_path(project_id, ".bin");
         let main_result = self.store.get(&main_path).await?;
@@ -779,11 +845,13 @@ impl CloudBackupManager {
     }
 
     /// List all available cloud backups
-    pub async fn list_snapshots(&self) -> Result<Vec<BackupEntry>, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn list_snapshots(
+        &self,
+    ) -> Result<Vec<BackupEntry>, Box<dyn std::error::Error + Send + Sync>> {
         use futures::TryStreamExt;
 
         let prefix = ObjectPath::from(self.config.prefix.clone());
-        
+
         debug!("Listing snapshots with prefix: {}", prefix);
 
         let mut entries = Vec::new();
@@ -791,11 +859,11 @@ impl CloudBackupManager {
 
         while let Some(meta) = list_stream.try_next().await? {
             let path_str = meta.location.to_string();
-            
+
             // Only include main engine files (not aliases/lexicon)
-            if path_str.ends_with(".bin") 
-                && !path_str.ends_with("_aliases.bin") 
-                && !path_str.ends_with("_lexicon.bin") 
+            if path_str.ends_with(".bin")
+                && !path_str.ends_with("_aliases.bin")
+                && !path_str.ends_with("_lexicon.bin")
             {
                 // Extract project_id from path
                 let filename = path_str
@@ -877,7 +945,11 @@ mod tests {
         assert_eq!(config.prefix, "cuemap/");
 
         match config.provider {
-            Some(CloudProvider::S3 { bucket, region, endpoint }) => {
+            Some(CloudProvider::S3 {
+                bucket,
+                region,
+                endpoint,
+            }) => {
                 assert_eq!(bucket, "my-bucket");
                 assert_eq!(region, "us-west-2");
                 assert!(endpoint.is_none());
@@ -908,15 +980,9 @@ mod tests {
 
     #[test]
     fn test_config_from_args_gcs() {
-        let config = CloudBackupConfig::from_args(
-            Some("gcs"),
-            Some("gcs-bucket"),
-            None,
-            None,
-            "",
-            false,
-        )
-        .unwrap();
+        let config =
+            CloudBackupConfig::from_args(Some("gcs"), Some("gcs-bucket"), None, None, "", false)
+                .unwrap();
 
         match config.provider {
             Some(CloudProvider::GCS { bucket }) => {
@@ -928,28 +994,13 @@ mod tests {
 
     #[test]
     fn test_config_from_args_missing_bucket() {
-        let result = CloudBackupConfig::from_args(
-            Some("s3"),
-            None,
-            None,
-            None,
-            "",
-            false,
-        );
+        let result = CloudBackupConfig::from_args(Some("s3"), None, None, None, "", false);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_config_disabled_by_default() {
-        let config = CloudBackupConfig::from_args(
-            None,
-            None,
-            None,
-            None,
-            "",
-            false,
-        )
-        .unwrap();
+        let config = CloudBackupConfig::from_args(None, None, None, None, "", false).unwrap();
 
         assert!(!config.enabled);
         assert!(config.provider.is_none());

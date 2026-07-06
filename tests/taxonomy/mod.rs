@@ -4,7 +4,11 @@ use std::collections::HashMap;
 #[test]
 fn test_format_validation() {
     let taxonomy = Taxonomy::default();
-    let cues = vec!["valid:cue".to_string(), "plain".to_string(), "incomplete:".to_string()];
+    let cues = vec![
+        "valid:cue".to_string(),
+        "plain".to_string(),
+        "incomplete:".to_string(),
+    ];
     let report = validate_cues(cues, &taxonomy);
 
     assert_eq!(report.accepted, vec!["valid:cue", "plain"]);
@@ -29,7 +33,10 @@ fn test_key_validation() {
 #[test]
 fn test_value_validation() {
     let mut allowed_values = HashMap::new();
-    allowed_values.insert("status".to_string(), vec!["active".to_string(), "pending".to_string()]);
+    allowed_values.insert(
+        "status".to_string(),
+        vec!["active".to_string(), "pending".to_string()],
+    );
 
     let mut allowed_value_prefixes = HashMap::new();
     allowed_value_prefixes.insert("user".to_string(), vec!["id_".to_string()]);
@@ -41,10 +48,10 @@ fn test_value_validation() {
     };
 
     let cues = vec![
-        "status:active".to_string(),   // Valid exact match
-        "status:unknown".to_string(),  // Invalid value
-        "user:id_123".to_string(),     // Valid prefix
-        "user:admin".to_string(),      // Invalid prefix
+        "status:active".to_string(),  // Valid exact match
+        "status:unknown".to_string(), // Invalid value
+        "user:id_123".to_string(),    // Valid prefix
+        "user:admin".to_string(),     // Invalid prefix
     ];
     let report = validate_cues(cues, &taxonomy);
 

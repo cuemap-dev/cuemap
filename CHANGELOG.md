@@ -4,16 +4,26 @@ All notable changes to the CueMap Rust Engine will be documented in this file.
 
 ## [0.7.0] - 2026-05-19
 
+### Added
+- **CuePacks v1**: Added deterministic TOML-based CuePacks as the semantic rule layer for facets, query intent cues, aliases, and policy metadata. Bundled `memory-general` is enabled by default.
+- **CueBridge Artifact Runtime**: Added project-level loading for offline-compiled CueBridge `GapPack` and `AliasPack` artifacts. Normal recall runs first; GapPack expansion is only consulted when exact recall is weak, and explain output reports artifact provenance.
+- **Ordered/Evidence Recall Modes**: Added opt-in `parent_fusion`, `ordered_reconstruction`, and `evidence_coverage` recall modes for long-form logs, transcripts, tickets, and multi-evidence questions.
+
 ### Changed
-- **Deterministic Co-Processor Core**: Deprecated embedding and LLM cue generation paths in the hot/core path. `glove` and `ollama` cuegen values remain parse-compatible for one release but fall back to deterministic WordNet/POS behavior.
+- **Breaking Numeric Memory IDs**: Replaced string memory IDs with per-project `u32` memory IDs across engine storage, API responses, REST routes, CLI memory commands, posting lists, and disk-content file naming. Deterministic dedupe/update identity moved to optional `source_key`.
+- **Deterministic Co-Processor Core**: Removed embedding, LLM cue generation, WordNet/POS expansion, semantic bridges, pattern completion, external lexicon graphs, context expansion/speculation endpoints, graph jobs, cue proposal jobs, lexicon training jobs, and autonomous consolidation from the core engine.
 - **Synchronous Facets**: Added deterministic add-time facets for source metadata, evidence shape, temporal markers, preference/dislike/ownership/recommendation/recipe/routine signals, and bounded entity cues.
 - **Query Intent Routing**: Added deterministic query intent cues for count, money, duration, current/latest, preference, source-answer, temporal-window, recipe, and recommendation queries.
 - **Sparse Reranking**: Added bounded deterministic facet reranking on top of the existing sparse candidate generation.
+- **Market Heatmap Source**: Market heat now aggregates recently reinforced main-memory cues instead of lexicon identity entries.
 - **Indexing Fixes**: Removed duplicate full-cue indexing in `add_memory`, indexed internally generated `episode:*` cues, and kept recall `expansion_depth` default at `1`.
+- **Tokenizer Runtime Asset**: Removed build-time nlprule tokenizer generation; tokenizer data now loads from `TOKENIZER_PATH`, the Cuemap data directory, or bundled runtime assets.
 
-### Deprecated
-- **Autonomous Consolidation**: New `ConsolidateMemories` scheduling is disabled. Existing `type:summary` memories remain readable and filterable for snapshot compatibility.
-- **Embeddings/LLM Cue Expansion**: GloVe/finalfusion and Ollama cue proposal are no longer part of the v0.7 core engine path.
+### Removed
+- **Obsolete Semantic Expansion Paths**: Removed GloVe/finalfusion, Ollama cuegen, WordNet/POS semantic expansion, semantic bridge indexes, external lexicons, pairwise cue co-occurrence graphs, pattern completion, `/context/expand`, and `/context/speculate`.
+- **Obsolete Background Jobs**: Removed `ProposeCues`, `TrainLexiconFromMemory`, `UpdateGraph`, `RebuildSemanticBridges`, and `ConsolidateMemories`.
+- **Obsolete CLI Surface**: Removed stale lexicon search behavior that depended on deleted automatic lexicon training.
+- **Embedded Web UI**: Removed the bundled React/Vite UI, `ui` Cargo feature, static asset handler, and Node build stage. CueMap v0.7 ships as an engine/API/CLI release.
 
 ## [0.6.7] - 2026-03-15
 

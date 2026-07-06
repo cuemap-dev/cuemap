@@ -1,6 +1,5 @@
+use cuemap::config::TuningConfig;
 use cuemap::multi_tenant::*;
-use cuemap::semantic::SemanticEngine;
-use cuemap::config::{CueGenStrategy, TuningConfig, LlmConfig};
 use cuemap::structures::MainStats;
 use std::fs;
 use tempfile::tempdir;
@@ -17,19 +16,44 @@ fn test_project_id_validation() {
 #[test]
 fn test_multi_tenant_isolation() {
     let dir = tempdir().unwrap();
-    let engine = MultiTenantEngine::with_snapshots_dir(dir.path(), CueGenStrategy::default(), SemanticEngine::new(None), TuningConfig::default(), LlmConfig::default());
-    
+    let engine = MultiTenantEngine::with_snapshots_dir(
+        dir.path(),
+        TuningConfig::default(),
+    );
+
     let ctx1 = engine.get_or_create_project("proj1".to_string()).unwrap();
     let ctx2 = engine.get_or_create_project("proj2".to_string()).unwrap();
-    
-    ctx1.main.add_memory("Project 1 content".to_string(), vec!["cue1".to_string()], None, MainStats::default(), false);
-    ctx2.main.add_memory("Project 2 content".to_string(), vec!["cue2".to_string()], None, MainStats::default(), false);
-    
+
+    ctx1.main.add_memory(
+        "Project 1 content".to_string(),
+        vec!["cue1".to_string()],
+        None,
+        MainStats::default(),
+        false,
+    );
+    ctx2.main.add_memory(
+        "Project 2 content".to_string(),
+        vec!["cue2".to_string()],
+        None,
+        MainStats::default(),
+        false,
+    );
+
     // Proj1 should not see cue2
-    assert_eq!(ctx1.main.recall(vec!["cue2".to_string()], 10, false, None).len(), 0);
+    assert_eq!(
+        ctx1.main
+            .recall(vec!["cue2".to_string()], 10, false, None)
+            .len(),
+        0
+    );
     // Proj2 should not see cue1
-    assert_eq!(ctx2.main.recall(vec!["cue1".to_string()], 10, false, None).len(), 0);
-    
+    assert_eq!(
+        ctx2.main
+            .recall(vec!["cue1".to_string()], 10, false, None)
+            .len(),
+        0
+    );
+
     assert_eq!(ctx1.main.get_memories().len(), 1);
     assert_eq!(ctx2.main.get_memories().len(), 1);
 }
@@ -39,26 +63,44 @@ fn test_snapshot_roundtrip() {
     let dir = tempdir().unwrap();
     let snapshots_dir = dir.path().join("snapshots");
     fs::create_dir_all(&snapshots_dir).unwrap();
-    
+
     let project_id = "persistence_test".to_string();
-    
+
     {
-        let engine = MultiTenantEngine::with_snapshots_dir(&snapshots_dir, CueGenStrategy::default(), SemanticEngine::new(None), TuningConfig::default(), LlmConfig::default());
+        let engine = MultiTenantEngine::with_snapshots_dir(
+            &snapshots_dir,
+            TuningConfig::default(),
+        );
         let ctx = engine.get_or_create_project(project_id.clone()).unwrap();
-        ctx.main.add_memory("persist me".to_string(), vec!["save:true".to_string()], None, MainStats::default(), false);
-        
+        ctx.main.add_memory(
+            "persist me".to_string(),
+            vec!["save:true".to_string()],
+            None,
+            MainStats::default(),
+            false,
+        );
+
         // Save
-        engine.save_project(&project_id).expect("Should save successfully");
+        engine
+            .save_project(&project_id)
+            .expect("Should save successfully");
     }
-    
+
     // Restart engine
     {
-        let engine = MultiTenantEngine::with_snapshots_dir(&snapshots_dir, CueGenStrategy::default(), SemanticEngine::new(None), TuningConfig::default(), LlmConfig::default());
-        
+        let engine = MultiTenantEngine::with_snapshots_dir(
+            &snapshots_dir,
+            TuningConfig::default(),
+        );
+
         // Should be able to load
-        let ctx = engine.load_project(&project_id).expect("Should load successfully");
-        let results = ctx.main.recall(vec!["save:true".to_string()], 10, false, None);
-        
+        let ctx = engine
+            .load_project(&project_id)
+            .expect("Should load successfully");
+        let results = ctx
+            .main
+            .recall(vec!["save:true".to_string()], 10, false, None);
+
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].content, "persist me");
     }
@@ -67,11 +109,16 @@ fn test_snapshot_roundtrip() {
 #[test]
 fn test_delete_project() {
     let dir = tempdir().unwrap();
-    let engine = MultiTenantEngine::with_snapshots_dir(dir.path(), CueGenStrategy::default(), SemanticEngine::new(None), TuningConfig::default(), LlmConfig::default());
-    
+    let engine = MultiTenantEngine::with_snapshots_dir(
+        dir.path(),
+        TuningConfig::default(),
+    );
+
     let project_id = "to_delete";
-    let _ = engine.get_or_create_project(project_id.to_string()).unwrap();
-    
+    let _ = engine
+        .get_or_create_project(project_id.to_string())
+        .unwrap();
+
     assert!(engine.get_project(&project_id.to_string()).is_some());
     assert!(engine.delete_project(&project_id.to_string()));
     assert!(engine.get_project(&project_id.to_string()).is_none());

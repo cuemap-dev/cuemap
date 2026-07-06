@@ -71,4 +71,3 @@ pub fn normalize_cue(raw: &str, config: &NormalizationConfig) -> (String, Normal
         },
     )
 }
-
