@@ -576,6 +576,52 @@ fn is_entity_noise(raw: &str) -> bool {
     )
 }
 
+fn is_temporal_month_entity(content: &str, raw: &str) -> bool {
+    let month = raw.trim().to_ascii_lowercase();
+    if raw.split_whitespace().count() != 1 || month_name_number(&month).is_none() {
+        return false;
+    }
+
+    let tokens = crate::nl::normalize_text(content)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    for (index, token) in tokens.iter().enumerate() {
+        if token != &month {
+            continue;
+        }
+        let temporal_context = index
+            .checked_sub(1)
+            .and_then(|previous| tokens.get(previous))
+            .map(|previous| {
+                matches!(
+                    previous.as_str(),
+                    "after"
+                        | "before"
+                        | "by"
+                        | "during"
+                        | "for"
+                        | "from"
+                        | "in"
+                        | "since"
+                        | "the"
+                        | "through"
+                        | "until"
+                )
+            })
+            .unwrap_or(false);
+        let dated_suffix = tokens
+            .get(index + 1)
+            .map(|next| next.parse::<u32>().is_ok())
+            .unwrap_or(false);
+        if temporal_context || dated_suffix {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn product_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -661,8 +707,9 @@ fn role_phrase_stopwords() -> &'static HashSet<&'static str> {
     static STOPWORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
     STOPWORDS.get_or_init(|| {
         HashSet::from([
-            "a", "an", "and", "as", "at", "by", "for", "from", "had", "has", "have", "i", "in",
-            "is", "it", "me", "my", "of", "on", "or", "our", "saw", "the", "to", "was", "with",
+            "a", "after", "an", "and", "as", "at", "before", "by", "during", "for", "from",
+            "had", "has", "have", "i", "in", "is", "it", "me", "my", "of", "on", "or", "our",
+            "saw", "since", "the", "to", "until", "was", "when", "while", "with",
         ])
     })
 }
@@ -1355,6 +1402,16 @@ fn preference_negative_re() -> &'static Regex {
     })
 }
 
+fn personal_transition_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?s)\b(?P<subject>(?:I|We|[A-Z][A-Za-z'-]{1,40}))\s+(?i:(?:have\s+|has\s+|had\s+)?(?:switched|changed|moved))\s+from\s+(?P<previous>.{1,120}?)\s+to\s+(?P<value>.{1,120}?)(?:\s+\b(?:after|before|during|since|until|when|while|because)\b|[.!?]|$)",
+        )
+        .unwrap()
+    })
+}
+
 fn preference_clause_trim(clause: &str) -> String {
     clause
         .split("->->")
@@ -1453,6 +1510,29 @@ fn add_preference_clause_cues(
             break;
         }
     }
+}
+
+fn add_personal_transition_facets(
+    content: &str,
+    out: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    let Some(caps) = personal_transition_re().captures(content) else {
+        return;
+    };
+    let Some(previous) = caps.name("previous") else {
+        return;
+    };
+    let Some(value) = caps.name("value") else {
+        return;
+    };
+
+    push_unique(out, seen, "type:update");
+    push_unique(out, seen, "type:selection");
+    push_unique(out, seen, "type:preference");
+    push_unique(out, seen, "preference:changed");
+    add_preference_clause_cues("preference_contrast", previous.as_str(), 8, out, seen);
+    add_preference_clause_cues("preference_value", value.as_str(), 10, out, seen);
 }
 
 fn add_preference_dynamic_facets(
@@ -2467,6 +2547,45 @@ fn navigation_app_signal(lower: &str) -> bool {
     )
 }
 
+fn temporal_event_relation_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?is)\b(?P<relation>after|before)\s+(?:the\s+)?(?P<anchor>[A-Za-z0-9][A-Za-z0-9'_-]*(?:\s+[A-Za-z0-9][A-Za-z0-9'_-]*){0,3})",
+        )
+        .unwrap()
+    })
+}
+
+fn temporal_event_relations(content: &str) -> Vec<(String, String)> {
+    let mut relations = Vec::new();
+    let mut seen = HashSet::new();
+
+    for caps in temporal_event_relation_re().captures_iter(content) {
+        let Some(relation) = caps.name("relation") else {
+            continue;
+        };
+        let Some(anchor) = caps.name("anchor") else {
+            continue;
+        };
+        let anchor_cues = crate::nl::tokenize_to_cues(anchor.as_str());
+        let anchor_cue = anchor_cues
+            .iter()
+            .filter(|cue| cue.contains('_'))
+            .max_by_key(|cue| (cue.split('_').count(), cue.len()))
+            .or_else(|| anchor_cues.first());
+        let Some(anchor_cue) = anchor_cue else {
+            continue;
+        };
+        let pair = (relation.as_str().to_lowercase(), anchor_cue.clone());
+        if seen.insert(pair.clone()) {
+            relations.push(pair);
+        }
+    }
+
+    relations
+}
+
 fn add_temporal_facets(content: &str, out: &mut Vec<String>, seen: &mut HashSet<String>) {
     let lower = content.to_lowercase();
     if has_any(
@@ -2523,6 +2642,10 @@ fn add_temporal_facets(content: &str, out: &mut Vec<String>, seen: &mut HashSet<
             push_unique(out, seen, marker.1);
         }
     }
+    for (relation, anchor) in temporal_event_relations(content) {
+        push_unique(out, seen, format!("temporal_relation:{relation}"));
+        push_unique(out, seen, format!("temporal_anchor:{anchor}"));
+    }
 }
 
 fn add_entity_facets(content: &str, out: &mut Vec<String>, seen: &mut HashSet<String>) {
@@ -2537,7 +2660,7 @@ fn add_entity_facets(content: &str, out: &mut Vec<String>, seen: &mut HashSet<St
     }
     for mat in proper_noun_re().find_iter(content) {
         let raw = mat.as_str();
-        if is_entity_noise(raw) {
+        if is_entity_noise(raw) || is_temporal_month_entity(content, raw) {
             continue;
         }
         entities.push(raw.to_string());
@@ -2711,6 +2834,7 @@ pub fn extract_memory_facets_core(
     add_education_facets(content, &mut facets, &mut seen);
     add_family_facets(content, &mut facets, &mut seen);
     add_type_facets(content, &mut facets, &mut seen);
+    add_personal_transition_facets(content, &mut facets, &mut seen);
     add_temporal_facets(content, &mut facets, &mut seen);
     add_entity_facets(content, &mut facets, &mut seen);
     add_entity_attribute_facets(content, &mut facets, &mut seen);
@@ -6125,6 +6249,53 @@ where
         );
     }
 
+    let is_state_transition_query = has_any(
+        &normalized_padded,
+        &[
+            " switch ",
+            " switched ",
+            " change ",
+            " changed ",
+            " move ",
+            " moved ",
+        ],
+    ) && has_any(&lower_padded, &[" from ", " to ", " what ", " which "]);
+    if is_state_transition_query {
+        add_label(&mut intent.labels, "state_transition");
+        push_weighted_if_available(
+            &mut intent.weighted_cues,
+            &mut seen,
+            &available,
+            "type:update",
+            3.0,
+        );
+        push_weighted_if_available(
+            &mut intent.weighted_cues,
+            &mut seen,
+            &available,
+            "type:selection",
+            2.4,
+        );
+    }
+
+    for (relation, anchor) in temporal_event_relations(query) {
+        add_label(&mut intent.labels, "temporal_event_relation");
+        push_weighted_if_available(
+            &mut intent.weighted_cues,
+            &mut seen,
+            &available,
+            &format!("temporal_relation:{relation}"),
+            2.8,
+        );
+        push_weighted_if_available(
+            &mut intent.weighted_cues,
+            &mut seen,
+            &available,
+            &format!("temporal_anchor:{anchor}"),
+            3.0,
+        );
+    }
+
     add_person_query_intent(&lower, is_count, &mut intent, &mut seen, &available);
 
     let mut entity_facets = Vec::new();
@@ -6213,4 +6384,94 @@ pub fn is_weak_query_cue(cue: &str) -> bool {
             | "cost"
             | "price"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compile_query_intent, extract_memory_facets_core};
+    use std::collections::HashSet;
+
+    #[test]
+    fn personal_switch_emits_clean_update_preference_and_temporal_facets() {
+        let facets = extract_memory_facets_core(
+            "Maya switched from coffee to mint tea after the April deploy.",
+            None,
+            &[],
+        );
+
+        for expected in [
+            "type:update",
+            "type:selection",
+            "type:preference",
+            "preference:changed",
+            "preference_contrast:coffee",
+            "preference_value:mint",
+            "preference_value:tea",
+            "preference_value:mint_tea",
+            "has:date",
+            "content_month:04",
+            "temporal_relation:after",
+            "temporal_anchor:april_deploy",
+            "entity:maya",
+        ] {
+            assert!(facets.contains(&expected.to_string()), "missing {expected}: {facets:?}");
+        }
+        assert!(!facets.contains(&"entity:april".to_string()));
+        assert!(!facets.iter().any(|cue| cue.starts_with("person_role_phrase:")));
+    }
+
+    #[test]
+    fn capitalized_month_remains_entity_without_temporal_context() {
+        let facets = extract_memory_facets_core("April joined Maya on the project.", None, &[]);
+        assert!(facets.contains(&"entity:april".to_string()));
+        assert!(facets.contains(&"entity:maya".to_string()));
+    }
+
+    #[test]
+    fn structural_role_phrase_survives_without_a_role_dictionary() {
+        let facets = extract_memory_facets_core("Engineering manager Maya approved it.", None, &[]);
+        assert!(facets.contains(&"person_role_phrase:engineering_manager".to_string()));
+        assert!(facets.contains(&"person_ref:named".to_string()));
+    }
+
+    #[test]
+    fn non_person_transition_is_not_promoted_to_preference() {
+        let facets = extract_memory_facets_core(
+            "The service switched from primary to fallback after the outage.",
+            None,
+            &[],
+        );
+        assert!(facets.contains(&"type:update".to_string()));
+        assert!(!facets.contains(&"type:preference".to_string()));
+        assert!(!facets.contains(&"preference:changed".to_string()));
+    }
+
+    #[test]
+    fn transition_query_reuses_update_and_event_relation_facets() {
+        let available = HashSet::from([
+            "type:update".to_string(),
+            "type:selection".to_string(),
+            "temporal_relation:after".to_string(),
+            "temporal_anchor:april_deploy".to_string(),
+        ]);
+        let intent = compile_query_intent(
+            "What did Maya switch to after the April deploy?",
+            |cue| available.contains(cue),
+        );
+
+        assert!(intent.labels.contains(&"state_transition".to_string()));
+        assert!(intent.labels.contains(&"temporal_event_relation".to_string()));
+        for expected in [
+            "type:update",
+            "type:selection",
+            "temporal_relation:after",
+            "temporal_anchor:april_deploy",
+        ] {
+            assert!(
+                intent.weighted_cues.iter().any(|(cue, _)| cue == expected),
+                "missing {expected}: {:?}",
+                intent.weighted_cues
+            );
+        }
+    }
 }

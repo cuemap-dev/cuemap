@@ -784,6 +784,13 @@ fn get_phrase_delimiter_regex() -> &'static Regex {
     })
 }
 
+fn is_phrase_boundary_word(word: &str) -> bool {
+    matches!(
+        word,
+        "after" | "before" | "during" | "since" | "until" | "when" | "while"
+    )
+}
+
 /// Pre-sanitize text before tokenization:
 /// 1. Replace URLs with domain name only
 /// 2. Remove common noise patterns
@@ -882,6 +889,7 @@ fn extract_rake_phrases(text: &str, lang: Language) -> Vec<String> {
             // Check against both global stopwords and language-specific ones
             if stopwords.contains(clean.as_str())
                 || lang_stopwords.contains(clean.as_str())
+                || is_phrase_boundary_word(clean.as_str())
                 || clean.len() <= 1
             {
                 // Stopword encountered - emit current phrase if valid
@@ -955,4 +963,21 @@ pub fn tokenize_to_cues_with_lang(text: &str, lang: Language) -> Vec<String> {
     }
 
     cues
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tokenize_to_cues;
+
+    #[test]
+    fn temporal_connector_breaks_phrase_without_removing_token() {
+        let cues = tokenize_to_cues(
+            "Maya switched from coffee to mint tea after the April deploy.",
+        );
+
+        assert!(cues.contains(&"after".to_string()));
+        assert!(cues.contains(&"mint_tea".to_string()));
+        assert!(cues.contains(&"april_deploy".to_string()));
+        assert!(!cues.contains(&"mint_tea_after".to_string()));
+    }
 }

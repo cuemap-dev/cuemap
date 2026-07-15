@@ -55,11 +55,18 @@ case "$MODE" in
       --openai-base-url "${CUEBRIDGE_BASE_URL:-http://127.0.0.1:1234/v1}"
       --openai-model "${CUEBRIDGE_MODEL:-qwen3-4b-cuebridge}"
       --openai-api-key "${CUEBRIDGE_API_KEY:-local}"
+      --llama-n-predict "${CUEBRIDGE_N_PREDICT:-1024}"
       --cuebridge-target-rank-threshold "${CUEBRIDGE_TARGET_RANK_THRESHOLD:-10}"
+      --cuebridge-accept-rank-threshold "${CUEBRIDGE_ACCEPT_RANK_THRESHOLD:-20}"
+      --cuebridge-min-rank-improvement "${CUEBRIDGE_MIN_RANK_IMPROVEMENT:-1}"
+      --cuebridge-collateral-policy "${CUEBRIDGE_COLLATERAL_POLICY:-tier}"
       --cuebridge-max-samples "${CUEBRIDGE_MAX_SAMPLES:-500}"
       --cuebridge-max-jobs "${CUEBRIDGE_MAX_JOBS:-500}"
       --max-questions-per-memory "${MAX_QUESTIONS_PER_MEMORY:-8}"
-      --cuebridge-max-fix-cases "${CUEBRIDGE_MAX_FIX_CASES:-200}"
+      --cuebridge-question-concurrency "${CUEBRIDGE_QUESTION_CONCURRENCY:-1}"
+      --cuebridge-question-batch-size "${CUEBRIDGE_QUESTION_BATCH_SIZE:-1}"
+      --cuebridge-fix-concurrency "${CUEBRIDGE_FIX_CONCURRENCY:-1}"
+      --cuebridge-fix-batch-size "${CUEBRIDGE_FIX_BATCH_SIZE:-1}"
     )
     ;;
   question-oracle)
@@ -69,8 +76,13 @@ case "$MODE" in
       --openai-base-url "${CUEBRIDGE_BASE_URL:-http://127.0.0.1:1234/v1}"
       --openai-model "${CUEBRIDGE_MODEL:-qwen3-4b-cuebridge}"
       --openai-api-key "${CUEBRIDGE_API_KEY:-local}"
+      --llama-n-predict "${CUEBRIDGE_N_PREDICT:-1024}"
       --cuebridge-target-rank-threshold "${CUEBRIDGE_TARGET_RANK_THRESHOLD:-10}"
-      --cuebridge-max-fix-cases "${CUEBRIDGE_MAX_FIX_CASES:-200}"
+      --cuebridge-accept-rank-threshold "${CUEBRIDGE_ACCEPT_RANK_THRESHOLD:-20}"
+      --cuebridge-min-rank-improvement "${CUEBRIDGE_MIN_RANK_IMPROVEMENT:-1}"
+      --cuebridge-collateral-policy "${CUEBRIDGE_COLLATERAL_POLICY:-tier}"
+      --cuebridge-fix-concurrency "${CUEBRIDGE_FIX_CONCURRENCY:-1}"
+      --cuebridge-fix-batch-size "${CUEBRIDGE_FIX_BATCH_SIZE:-1}"
     )
     ;;
   *)
@@ -79,7 +91,10 @@ case "$MODE" in
     ;;
 esac
 
+if [[ "$MODE" != "raw" ]]; then
+  args+=(--cuebridge-max-fix-cases "${CUEBRIDGE_MAX_FIX_CASES:-1000}")
+fi
+
 echo "Running BEAM $CONTEXT in $MODE mode"
 echo "Output: $OUTPUT"
 exec "${args[@]}"
-
