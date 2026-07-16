@@ -5,7 +5,7 @@ use cuemap::facets::{
 use cuemap::nl::tokenize_to_cues;
 use cuemap::structures::MainStats;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 fn compile_weighted_query(engine: &CueMapEngine<MainStats>, query: &str) -> Vec<(String, f64)> {
     compile_weighted_query_at(engine, query, None)
@@ -965,6 +965,74 @@ fn extracts_person_role_facets_from_titles_and_role_phrases() {
     assert!(facets.contains(&"person_role_phrase:primary_care_physician".to_string()));
     assert!(facets.contains(&"person_role_phrase:dermatologist".to_string()));
     assert!(facets.contains(&"person_role_phrase:project_manager".to_string()));
+    let role_phrases = facets
+        .iter()
+        .filter(|facet| facet.starts_with("person_role_phrase:"))
+        .cloned()
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        role_phrases,
+        HashSet::from([
+            "person_role_phrase:dermatologist".to_string(),
+            "person_role_phrase:primary_care_physician".to_string(),
+            "person_role_phrase:project_manager".to_string(),
+        ])
+    );
+}
+
+#[test]
+fn person_role_facets_reject_clause_false_positives() {
+    for content in [
+        "I cut the wood with a saw.",
+        "I cut the wood with a saw before Maya arrived.",
+        "I cut wooden boards with Alice.",
+        "I used a circular power saw beside Maya.",
+        "My friend saw Dr. Patel yesterday.",
+        "My neighbor visited Dr. Smith last week.",
+        "Ensure we only search the remaining HTML.",
+    ] {
+        let facets = extract_memory_facets(content, None, &[]);
+        assert!(
+            !facets
+                .iter()
+                .any(|facet| facet.starts_with("person_role_phrase:")),
+            "false role facet for {content:?}: {facets:?}"
+        );
+    }
+
+    let facets = extract_memory_facets("I met project manager Alice yesterday.", None, &[]);
+    assert!(
+        !facets.contains(&"person_role_phrase:met_project_manager".to_string()),
+        "clause verb leaked into role phrase: {facets:?}"
+    );
+}
+
+#[test]
+fn person_role_facets_preserve_content_words_and_complete_phrases() {
+    for (content, expected) in [
+        (
+            "Circular saw specialist Maya arrived.",
+            "person_role_phrase:circular_saw_specialist",
+        ),
+        (
+            "Head of product Maya approved the launch.",
+            "person_role_phrase:head_of_product",
+        ),
+        (
+            "Chief information security officer Dr. Smith approved it.",
+            "person_role_phrase:chief_information_security_officer",
+        ),
+        (
+            "My director of operations Dr. Smith approved it.",
+            "person_role_phrase:director_of_operations",
+        ),
+    ] {
+        let facets = extract_memory_facets(content, None, &[]);
+        assert!(
+            facets.contains(&expected.to_string()),
+            "missing {expected} for {content:?}: {facets:?}"
+        );
+    }
 }
 
 #[test]

@@ -412,7 +412,7 @@ fn role_before_title_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"\b(?P<role>[A-Z]{2,8}|[A-Za-z][A-Za-z'-]{2,})(?:\s+(?P<role2>[A-Za-z][A-Za-z'-]{2,}|[A-Z]{2,8})){0,3}\s+(?i:Dr|Prof)\.?\s+[A-Z][A-Za-z'-]{1,40}\b",
+            r"(?m)(?:^|[.!?;]\s+|,\s+(?:(?i:and|but)\s+)?|(?i:\band|but)\s+)(?P<role>(?:[A-Z]{2,8}|[A-Za-z][A-Za-z'-]{1,})(?:\s+(?:[A-Z]{2,8}|[A-Za-z][A-Za-z'-]{1,})){0,3})\s+(?i:Dr|Prof)\.?\s+[A-Z][A-Za-z'-]{1,40}\b",
         )
         .unwrap()
     })
@@ -422,7 +422,7 @@ fn possessed_role_before_title_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"\b(?i:my|our|the|a|an)\s+(?P<role>[A-Za-z][A-Za-z'-]{2,}(?:\s+[A-Za-z][A-Za-z'-]{2,}){0,3})\s+(?i:Dr|Prof)\.?\s+[A-Z][A-Za-z'-]{1,40}\b",
+            r"\b(?i:my|our|the|a|an)\s+(?P<role>[A-Za-z][A-Za-z'-]{1,}(?:\s+[A-Za-z][A-Za-z'-]{1,}){0,3})\s+(?i:Dr|Prof)\.?\s+[A-Z][A-Za-z'-]{1,40}\b",
         )
         .unwrap()
     })
@@ -432,7 +432,7 @@ fn role_before_name_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"\b(?P<role>[A-Za-z][A-Za-z'-]{2,}(?:\s+[A-Za-z][A-Za-z'-]{2,}){0,2})\s+[A-Z][A-Za-z'-]{1,40}\b",
+            r"(?m)(?:^|[.!?;]\s+|,\s+(?:(?i:and|but)\s+)?|(?i:\band|but)\s+)(?P<role>[A-Za-z][A-Za-z'-]{1,}(?:\s+[A-Za-z][A-Za-z'-]{1,}){0,3})\s+[A-Z][A-Za-z'-]{1,40}\b",
         )
         .unwrap()
     })
@@ -703,27 +703,19 @@ fn normalize_value(value: &str) -> Option<String> {
     }
 }
 
-fn role_phrase_stopwords() -> &'static HashSet<&'static str> {
-    static STOPWORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
-    STOPWORDS.get_or_init(|| {
-        HashSet::from([
-            "a", "after", "an", "and", "as", "at", "before", "by", "during", "for", "from",
-            "had", "has", "have", "i", "in", "is", "it", "me", "my", "of", "on", "or", "our",
-            "saw", "since", "the", "to", "until", "was", "when", "while", "with",
-        ])
-    })
+fn is_role_phrase_connector(part: &str) -> bool {
+    matches!(part, "and" | "for" | "in" | "of" | "to")
 }
 
 fn normalize_role_phrase(value: &str) -> Option<String> {
-    let stopwords = role_phrase_stopwords();
     let mut parts = Vec::new();
 
     for raw in value.split_whitespace() {
         let part = raw
             .trim_matches(|c: char| !c.is_alphanumeric())
             .to_ascii_lowercase();
-        if part.len() < 2 || stopwords.contains(part.as_str()) {
-            continue;
+        if part.len() < 2 {
+            return None;
         }
         parts.push(part);
     }
@@ -732,12 +724,48 @@ fn normalize_role_phrase(value: &str) -> Option<String> {
         return None;
     }
 
+    for (index, part) in parts.iter().enumerate() {
+        if !crate::nl::get_stopwords().contains(part.as_str()) {
+            continue;
+        }
+        let internal_connector =
+            index > 0 && index + 1 < parts.len() && is_role_phrase_connector(part);
+        if !internal_connector {
+            return None;
+        }
+    }
+
     let phrase = parts.join("_");
     if phrase.len() < 3 || phrase.len() > 64 {
         None
     } else {
         Some(phrase)
     }
+}
+
+fn normalize_person_role_phrase(value: &str) -> Option<String> {
+    let role = normalize_role_phrase(value)?;
+    let tail = role.rsplit('_').next()?;
+    let lemma = crate::nl::stem_word(tail);
+
+    // A role phrase should end in its nominal head. If lemmatization changes the
+    // final token, the candidate is more likely a clause ending in an inflected
+    // verb ("my friend saw Dr. Patel") than a role immediately before a name.
+    let known_noun = matches!(
+        crate::nl::get_known_pos_tag(tail),
+        Some("NN" | "NNS" | "NNP" | "NNPS")
+    );
+    let connector_scoped_plural = role.split('_').any(is_role_phrase_connector)
+        && (tail == format!("{lemma}s")
+            || tail == format!("{lemma}es")
+            || (tail.ends_with("ies")
+                && lemma.ends_with('y')
+                && tail.strip_suffix("ies") == lemma.strip_suffix('y')));
+    if lemma != tail && !known_noun && !connector_scoped_plural {
+        return None;
+    }
+
+    Some(role)
 }
 
 fn quantity_object_stopwords() -> &'static HashSet<&'static str> {
@@ -2716,7 +2744,7 @@ fn add_person_role_facets(content: &str, out: &mut Vec<String>, seen: &mut HashS
     for cap in possessed_role_before_title_re().captures_iter(content) {
         if let Some(role) = cap
             .name("role")
-            .and_then(|m| normalize_role_phrase(m.as_str()))
+            .and_then(|m| normalize_person_role_phrase(m.as_str()))
         {
             push_unique(out, seen, format!("person_role_phrase:{}", role));
             push_unique(out, seen, "person_ref:named");
@@ -2724,13 +2752,10 @@ fn add_person_role_facets(content: &str, out: &mut Vec<String>, seen: &mut HashS
     }
 
     for cap in role_before_title_re().captures_iter(content) {
-        let role_text = [cap.name("role"), cap.name("role2")]
-            .into_iter()
-            .flatten()
-            .map(|m| m.as_str())
-            .collect::<Vec<_>>()
-            .join(" ");
-        if let Some(role) = normalize_role_phrase(&role_text) {
+        if let Some(role) = cap
+            .name("role")
+            .and_then(|m| normalize_person_role_phrase(m.as_str()))
+        {
             push_unique(out, seen, format!("person_role_phrase:{}", role));
             push_unique(out, seen, "person_ref:named");
         }
@@ -2739,7 +2764,7 @@ fn add_person_role_facets(content: &str, out: &mut Vec<String>, seen: &mut HashS
     for cap in role_before_name_re().captures_iter(content) {
         let Some(role) = cap
             .name("role")
-            .and_then(|m| normalize_role_phrase(m.as_str()))
+            .and_then(|m| normalize_person_role_phrase(m.as_str()))
         else {
             continue;
         };

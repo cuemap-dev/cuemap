@@ -188,6 +188,8 @@ static NLPRULE_TOKENIZER: OnceLock<Option<nlprule::Tokenizer>> = OnceLock::new()
 // Dictionary of manual overrides/exceptions for 100% test coverage
 static LEMMA_EXCEPTIONS_JSON: &str = include_str!("../lemma_exceptions.json");
 static LEMMA_EXCEPTIONS: OnceLock<HashMap<String, String>> = OnceLock::new();
+static POS_TAGS_JSON: &str = include_str!("../data/tagger/tags.json");
+static POS_TAGS: OnceLock<HashMap<String, String>> = OnceLock::new();
 
 // Runtime cache for lemmatized words to avoid redundant nlprule processing
 static LEMMA_CACHE: OnceLock<DashMap<String, String>> = OnceLock::new();
@@ -237,6 +239,13 @@ fn get_lemma_cache() -> &'static DashMap<String, String> {
 
 fn get_lemma_exceptions() -> &'static HashMap<String, String> {
     LEMMA_EXCEPTIONS.get_or_init(|| serde_json::from_str(LEMMA_EXCEPTIONS_JSON).unwrap_or_default())
+}
+
+pub fn get_known_pos_tag(word: &str) -> Option<&'static str> {
+    POS_TAGS
+        .get_or_init(|| serde_json::from_str(POS_TAGS_JSON).unwrap_or_default())
+        .get(word)
+        .map(String::as_str)
 }
 
 fn get_nlprule_tokenizer() -> Option<&'static nlprule::Tokenizer> {
