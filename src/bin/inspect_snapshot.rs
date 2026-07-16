@@ -11,20 +11,23 @@ fn main() {
         return;
     }
     let path = Path::new(&args[1]);
-    
+
     // We can use the public load_from_path
     match PersistenceManager::load_from_path::<MainStats>(path) {
-        Ok((memories, cue_index)) => {
+        Ok((memories, _source_key_to_id, cue_index, _next_memory_id, _counts)) => {
             println!("Snapshot Summary for {:?}", path);
             println!("----------------------------------------");
             println!("Total Memories: {}", memories.len());
             println!("Total Cues:     {}", cue_index.len());
             println!("----------------------------------------\n");
-            
+
             // Sort keys for deterministic output
-            let mut keys: Vec<String> = memories.iter().map(|k| k.key().clone()).collect();
+            let mut keys: Vec<u32> = Vec::new();
+            for entry in memories.iter() {
+                keys.push(*entry.key());
+            }
             keys.sort();
-            
+
             for key in keys {
                 let memory = memories.get(&key).unwrap();
                 println!("ID: {}", key);

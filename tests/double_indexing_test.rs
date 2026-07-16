@@ -2,21 +2,20 @@
 mod tests {
     use cuemap::engine::CueMapEngine;
     use cuemap::structures::MainStats;
-    use std::collections::HashMap;
 
     #[test]
     fn test_double_indexing_recall() {
         let engine = CueMapEngine::new();
-        
+
         // 1. Add memory with structured cue
         engine.add_memory(
             "Function definition content".to_string(),
             vec!["type:function".to_string(), "name:ComputeTax".to_string()],
             None,
             MainStats::default(),
-            false
+            false,
         );
-        
+
         // 2. Recall using full cue (legacy/precise)
         let results_full = engine.recall(vec!["name:ComputeTax".to_string()], 10, false, None);
         assert!(!results_full.is_empty(), "Should find memory by full cue");
@@ -40,18 +39,32 @@ mod tests {
             vec!["category:secret".to_string()],
             None,
             MainStats::default(),
-            false
+            false,
         );
 
         // Verify indexing
-        assert!(!engine.recall(vec!["category:secret".to_string()], 1, false, None).is_empty());
-        assert!(!engine.recall(vec!["secret".to_string()], 1, false, None).is_empty());
+        assert!(!engine
+            .recall(vec!["category:secret".to_string()], 1, false, None)
+            .is_empty());
+        assert!(!engine
+            .recall(vec!["secret".to_string()], 1, false, None)
+            .is_empty());
 
         // Delete
-        engine.delete_memory(&mem_id);
+        engine.delete_memory(mem_id);
 
         // Verify gone from both
-        assert!(engine.recall(vec!["category:secret".to_string()], 1, false, None).is_empty(), "Should be gone from full index");
-        assert!(engine.recall(vec!["secret".to_string()], 1, false, None).is_empty(), "Should be gone from value index");
+        assert!(
+            engine
+                .recall(vec!["category:secret".to_string()], 1, false, None)
+                .is_empty(),
+            "Should be gone from full index"
+        );
+        assert!(
+            engine
+                .recall(vec!["secret".to_string()], 1, false, None)
+                .is_empty(),
+            "Should be gone from value index"
+        );
     }
 }

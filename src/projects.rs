@@ -1,70 +1,127 @@
-use crate::structures::{MainStats, LexiconStats};
-use std::collections::HashMap;
+use crate::config::TuningConfig;
+use crate::cuebridge::{CueBridgeArtifactSummary, CueBridgeArtifacts, CueBridgeAliasExpansion};
 use crate::engine::CueMapEngine;
 use crate::normalization::NormalizationConfig;
+use crate::structures::{LexiconStats, MainStats, MemoryId};
 use crate::taxonomy::Taxonomy;
-use crate::config::{CueGenStrategy, TuningConfig, LlmConfig};
-use crate::semantic::SemanticEngine;
-use dashmap::DashMap;
-use std::sync::{Arc, RwLock};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
-use serde_json::Value;
 use ahash::RandomState;
+use dashmap::DashMap;
+use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub(crate) struct SymbolRouterCache {
+    cue_index_version: usize,
+    symbol_count: usize,
+    router: Option<crate::nl::SymbolRouter>,
+}
+
+impl Default for SymbolRouterCache {
+    fn default() -> Self {
+        Self {
+            cue_index_version: 0,
+            symbol_count: 0,
+            router: None,
+        }
+    }
+}
 
 pub struct ProjectContext {
     pub main: CueMapEngine<MainStats>,
     pub aliases: CueMapEngine<MainStats>,
     pub lexicon: CueMapEngine<LexiconStats>,
     pub query_cache: DashMap<String, Vec<String>, RandomState>,
+    pub(crate) symbol_router_cache: RwLock<SymbolRouterCache>,
     pub normalization: NormalizationConfig,
     pub taxonomy: Taxonomy,
-    pub cuegen_strategy: CueGenStrategy,
-    pub semantic_engine: SemanticEngine,
     pub last_activity: AtomicU64,
     // Shared Context (holds top 10k cues)
     pub market_heatmap: Arc<RwLock<HashMap<String, f32>>>,
     pub tuning: Arc<TuningConfig>,
-    pub llm_config: Arc<LlmConfig>,
+    pub cuebridge_artifacts: RwLock<CueBridgeArtifacts>,
 }
 
 impl ProjectContext {
-    pub fn new(normalization: NormalizationConfig, taxonomy: Taxonomy, cuegen_strategy: CueGenStrategy, semantic_engine: SemanticEngine, tuning: Arc<TuningConfig>, llm_config: Arc<LlmConfig>) -> Self {
+    pub fn new(
+        normalization: NormalizationConfig,
+        taxonomy: Taxonomy,
+        tuning: Arc<TuningConfig>,
+        config: crate::config::ServerConfig,
+        project_id: String,
+    ) -> Self {
+        let mut main = CueMapEngine::with_tuning(tuning.as_ref().clone());
+        main.config = config.clone();
+        main.project_id = project_id.clone();
+
+        let mut aliases = CueMapEngine::with_tuning(tuning.as_ref().clone());
+        aliases.config = config.clone();
+        aliases.config.server.store_content_on_disk = false; // Disable for aliases (tiny memories, arbitrary IDs)
+        aliases.project_id = project_id.clone();
+
+        let mut lexicon = CueMapEngine::with_tuning(tuning.as_ref().clone());
+        lexicon.config = config.clone();
+        lexicon.config.server.store_content_on_disk = false; // Disable for lexicon (tiny memories, arbitrary IDs)
+        lexicon.project_id = project_id.clone();
+
+        let cuebridge_artifacts =
+            CueBridgeArtifacts::load_for_project(&config.server.data_dir, &project_id);
+
         Self {
-            main: CueMapEngine::with_tuning(tuning.as_ref().clone()),
-            aliases: CueMapEngine::with_tuning(tuning.as_ref().clone()),
-            lexicon: CueMapEngine::with_tuning(tuning.as_ref().clone()),
+            main,
+            aliases,
+            lexicon,
             query_cache: DashMap::with_hasher(RandomState::new()),
+            symbol_router_cache: RwLock::new(SymbolRouterCache::default()),
             normalization,
             taxonomy,
-            cuegen_strategy,
-            semantic_engine,
             last_activity: AtomicU64::new(
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
-                    .as_secs()
+                    .as_secs(),
             ),
             market_heatmap: Arc::new(RwLock::new(HashMap::new())),
             tuning,
-            llm_config,
+            cuebridge_artifacts: RwLock::new(cuebridge_artifacts),
         }
     }
-    
+
     pub fn touch(&self) {
         self.last_activity.store(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
-            Ordering::Relaxed
+            Ordering::Relaxed,
         );
     }
-    
+
     pub fn get_last_activity(&self) -> u64 {
         self.last_activity.load(Ordering::Relaxed)
     }
-    
+
+    pub fn reload_cuebridge_artifacts(
+        &self,
+        data_dir: &str,
+        project_id: &str,
+    ) -> CueBridgeArtifactSummary {
+        let artifacts = CueBridgeArtifacts::load_for_project(data_dir, project_id);
+        let summary = artifacts.summary();
+        if let Ok(mut guard) = self.cuebridge_artifacts.write() {
+            *guard = artifacts;
+        }
+        summary
+    }
+
+    pub fn cuebridge_artifact_summary(&self) -> CueBridgeArtifactSummary {
+        self.cuebridge_artifacts
+            .read()
+            .map(|artifacts| artifacts.summary())
+            .unwrap_or_default()
+    }
+
     // IDF-based filtering helpers
     pub fn get_cue_frequency(&self, cue: &str) -> usize {
         self.main.get_cue_frequency(cue)
@@ -73,161 +130,249 @@ impl ProjectContext {
     pub fn total_memories(&self) -> usize {
         self.main.total_memories()
     }
-    
+
     /// Resolves cues from text using the Lexicon.
     /// Returns (resolved_cues, lexicon_memory_ids) - the memory IDs can be used for async reinforcement.
     /// Resolve cues from text with tokenization, normalization, and validation.
-    /// 
+    ///
     /// When `skip_lexicon` is true, skips the lexicon lookup but still performs:
     /// - Tokenization
     /// - Normalization
     /// - Taxonomy validation
-    pub fn resolve_cues_from_text(&self, text: &str, skip_lexicon: bool) -> (Vec<String>, Vec<String>, Vec<String>) {
+    pub fn resolve_cues_from_text(
+        &self,
+        text: &str,
+        skip_lexicon: bool,
+    ) -> (Vec<String>, Vec<MemoryId>, Vec<String>) {
         self.resolve_cues_from_text_with_lang(text, skip_lexicon, crate::nl::Language::Default)
     }
 
-    pub fn resolve_cues_from_text_with_lang(&self, text: &str, skip_lexicon: bool, lang: crate::nl::Language) -> (Vec<String>, Vec<String>, Vec<String>) {
+    pub fn resolve_cues_from_text_with_lang(
+        &self,
+        text: &str,
+        skip_lexicon: bool,
+        lang: crate::nl::Language,
+    ) -> (Vec<String>, Vec<MemoryId>, Vec<String>) {
         use std::time::Instant;
         let t_start = Instant::now();
-        
-        // Tokenize first - we need tokens for return value regardless of cache
-        let t_tok = Instant::now();
-        let tokens = crate::nl::tokenize_to_cues_with_lang(text, lang);
-        let tok_ms = t_tok.elapsed().as_secs_f64() * 1000.0;
 
-        if tokens.is_empty() {
-            return (Vec::new(), Vec::new(), Vec::new());
-        }
-
-        let normalized_text = if lang == crate::nl::Language::Default {
-            crate::nl::normalize_text(text)
-        } else {
-            // Include language tag in cache key to avoid collisions
-            format!("{:?}:{}", lang, crate::nl::normalize_text(text))
-        };
-        
-        // Check cache (cache only stores cues, not memory IDs) - skip if lexicon disabled
-        if !skip_lexicon {
-            if let Some(cues) = self.query_cache.get(&normalized_text) {
-                // Return cached cues, empty memory IDs, and the raw tokens we just computed
-                return (cues.clone(), Vec::new(), tokens);
-            }
-        }
-        
-        let t_lex = Instant::now();
         let mut canonical_cues = Vec::new();
         let mut lexicon_memory_ids = Vec::new();
-        
-        if skip_lexicon {
-            // Skip lexicon - just normalize the tokens directly
-            for token in &tokens {
-                let (normalized, _) = crate::normalization::normalize_cue(token, &self.normalization);
-                if !canonical_cues.contains(&normalized) {
-                    canonical_cues.push(normalized);
+        let mut tokens = Vec::new();
+
+        // 1. Symbol-First Intent Routing (Aho-Corasick + BM25)
+        if let Some((routed_cues, routed_tokens)) = self.route_symbol_query(text) {
+            canonical_cues = routed_cues;
+            tokens = routed_tokens;
+        }
+
+        // 2. Fallback to traditional tokenization and Lexicon if SymbolRouter wasn't decisive
+        if canonical_cues.is_empty() {
+            let t_tok = Instant::now();
+            tokens = crate::nl::tokenize_to_cues_with_lang(text, lang);
+            let _tok_ms = t_tok.elapsed().as_secs_f64() * 1000.0;
+            if tokens.is_empty() {
+                return (Vec::new(), Vec::new(), Vec::new());
+            }
+
+            let normalized_text = if lang == crate::nl::Language::Default {
+                crate::nl::normalize_text(text)
+            } else {
+                format!("{:?}:{}", lang, crate::nl::normalize_text(text))
+            };
+
+            // Check cache
+            if !skip_lexicon {
+                if let Some(cues) = self.query_cache.get(&normalized_text) {
+                    return (cues.clone(), Vec::new(), tokens);
                 }
             }
-        } else {
-            // Fast lexicon lookup - O(1) per cue, no scoring overhead
-            let lexicon_results = self.lexicon.recall_fast(tokens.clone(), 64);
-            
-            for result in lexicon_results {
-                // result.content is the canonical cue
-                let (normalized, _) = crate::normalization::normalize_cue(&result.content, &self.normalization);
-                canonical_cues.push(normalized);
-                lexicon_memory_ids.push(result.memory_id.clone());
-            }
-            
-            // FALLBACK: If Lexicon returned nothing, use raw tokens directly
-            // This ensures queries for terms not trained in Lexicon still work
-            if canonical_cues.is_empty() {
+
+            let t_lex = Instant::now();
+            if skip_lexicon {
                 for token in &tokens {
-                    let (normalized, _) = crate::normalization::normalize_cue(token, &self.normalization);
+                    let (normalized, _) =
+                        crate::normalization::normalize_cue(token, &self.normalization);
                     if !canonical_cues.contains(&normalized) {
                         canonical_cues.push(normalized);
                     }
                 }
+            } else {
+                let lexicon_results = self.lexicon.recall_fast(tokens.clone(), 64);
+                for result in lexicon_results {
+                    let (normalized, _) =
+                        crate::normalization::normalize_cue(&result.content, &self.normalization);
+                    canonical_cues.push(normalized);
+                    lexicon_memory_ids.push(result.memory_id);
+                }
+
+                if canonical_cues.is_empty() {
+                    for token in &tokens {
+                        let (normalized, _) =
+                            crate::normalization::normalize_cue(token, &self.normalization);
+                        if !canonical_cues.contains(&normalized) {
+                            canonical_cues.push(normalized);
+                        }
+                    }
+                }
+            }
+            let _lex_ms = t_lex.elapsed().as_secs_f64() * 1000.0;
+
+            // Cache (only if lexicon was used)
+            if !skip_lexicon {
+                self.query_cache
+                    .insert(normalized_text, canonical_cues.clone());
             }
         }
-        let lex_ms = t_lex.elapsed().as_secs_f64() * 1000.0;
-        
-        // Validate list
+
+        // 3. Validate list
         let t_val = Instant::now();
         let report = crate::taxonomy::validate_cues(canonical_cues, &self.taxonomy);
         let accepted = report.accepted;
-        let val_ms = t_val.elapsed().as_secs_f64() * 1000.0;
-        
+        let _val_ms = t_val.elapsed().as_secs_f64() * 1000.0;
+
         let total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
-        
-        // Log timing breakdown if slow (>1ms)
+
         if total_ms > 1.0 {
             tracing::debug!(
-                "resolve_cues_from_text: tok={:.2}ms lex_recall={:.2}ms val={:.2}ms | total={:.2}ms skip_lexicon={}",
-                tok_ms, lex_ms, val_ms, total_ms, skip_lexicon
+                "resolve_cues_from_text: total={:.2}ms skip_lexicon={}",
+                total_ms,
+                skip_lexicon
             );
         }
-        
-        // Cache (only if lexicon was used)
-        if !skip_lexicon {
-            self.query_cache.insert(normalized_text, accepted.clone());
-        }
-        
+
         (accepted, lexicon_memory_ids, tokens)
     }
-    
-    pub fn expand_query_cues(&self, cues: Vec<String>, original_tokens: &[String]) -> Vec<(String, f64)> {
+
+    fn route_symbol_query(&self, text: &str) -> Option<(Vec<String>, Vec<String>)> {
+        let cue_index_version = self.main.cue_index_version();
+
+        if let Ok(cache) = self.symbol_router_cache.read() {
+            if cache.cue_index_version == cue_index_version {
+                return Self::route_with_symbol_cache(text, &cache);
+            }
+        }
+
+        let mut cache = self.symbol_router_cache.write().ok()?;
+        if cache.cue_index_version != cue_index_version {
+            let symbols = self.main.get_all_symbols();
+            cache.symbol_count = symbols.len();
+            cache.router = if symbols.is_empty() {
+                None
+            } else {
+                Some(crate::nl::SymbolRouter::new(symbols))
+            };
+            cache.cue_index_version = cue_index_version;
+        }
+
+        Self::route_with_symbol_cache(text, &cache)
+    }
+
+    fn route_with_symbol_cache(
+        text: &str,
+        cache: &SymbolRouterCache,
+    ) -> Option<(Vec<String>, Vec<String>)> {
+        if cache.symbol_count == 0 {
+            return None;
+        }
+        let router = cache.router.as_ref()?;
+        let (intent, extracted_symbols) = router.route(text);
+
+        if extracted_symbols.is_empty() || intent == crate::nl::Intent::Generic {
+            return None;
+        }
+
+        let canonical_cues = router.compile_to_cues(intent, extracted_symbols.clone());
+        tracing::debug!(
+            "SymbolRouter: Identified intent {:?} with symbols {:?} -> Cues: {:?}",
+            intent,
+            extracted_symbols,
+            canonical_cues
+        );
+        Some((canonical_cues, extracted_symbols))
+    }
+
+    pub fn expand_query_cues(
+        &self,
+        cues: Vec<String>,
+        original_tokens: &[String],
+    ) -> Vec<(String, f64)> {
+        self.expand_query_cues_with_trace(cues, original_tokens).0
+    }
+
+    pub fn expand_query_cues_with_trace(
+        &self,
+        cues: Vec<String>,
+        original_tokens: &[String],
+    ) -> (Vec<(String, f64)>, Vec<CueBridgeAliasExpansion>) {
         let mut expanded: Vec<(String, f64)> = Vec::new();
-        
+        let mut cuebridge_aliases = Vec::new();
+        let all_query_cues = cues.clone();
+
         for cue in cues {
             // 1. Add original cue with weight 1.0
             expanded.push((cue.clone(), 1.0));
-            
+
             // 2. ONLY expand aliases for original tokens (not Lexicon synonyms)
             if !original_tokens.contains(&cue) {
                 continue;
             }
-            
+
             // 2. Query aliases
             let alias_query = vec![
                 "type:alias".to_string(),
                 format!("from:{}", cue),
                 "status:active".to_string(),
             ];
-            
+
             // Recall aliases (limit 8, auto_reinforce false to avoid noise, no heatmap)
             let aliases = self.aliases.recall(alias_query, 8, false, None);
-            
+
             for alias in aliases {
                 // Parse alias content to get target cue and weight
                 if let Ok(data) = serde_json::from_str::<Value>(&alias.content) {
-                     // STRICT FILTER: Check if 'from' matches the current cue exactly
-                     if let Some(from_val) = data.get("from").and_then(|v| v.as_str()) {
-                         if from_val != cue {
-                             continue;
-                         }
-                     }
+                    // STRICT FILTER: Check if 'from' matches the current cue exactly
+                    if let Some(from_val) = data.get("from").and_then(|v| v.as_str()) {
+                        if from_val != cue {
+                            continue;
+                        }
+                    }
 
-                     if let Some(to_cue) = data.get("to").and_then(|v| v.as_str()) {
-                         // Default downweight 0.85 if not specified
-                         let downweight = data.get("downweight").and_then(|v| v.as_f64()).unwrap_or(0.85);
-                         
-                         // The "to" field in content is the actual cue
-                         expanded.push((to_cue.to_string(), downweight));
-                     }
+                    if let Some(to_cue) = data.get("to").and_then(|v| v.as_str()) {
+                        // Default downweight 0.85 if not specified
+                        let downweight = data
+                            .get("downweight")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.85);
+
+                        // The "to" field in content is the actual cue
+                        expanded.push((to_cue.to_string(), downweight));
+                    }
                 }
             }
 
+            if let Ok(artifacts) = self.cuebridge_artifacts.read() {
+                for alias in artifacts.alias_expansions(&cue, &all_query_cues, |target| {
+                    self.main.get_cue_index().contains_key(target)
+                }) {
+                    expanded.push((alias.to.clone(), alias.weight * alias.confidence.max(0.1)));
+                    cuebridge_aliases.push(alias);
+                }
+            }
         }
-        
+
         // Deduplicate
         let mut seen = std::collections::HashSet::new();
         expanded.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        
-        expanded.into_iter()
+
+        let deduped = expanded
+            .into_iter()
             .filter(|(cue, _)| {
                 // Only keep cues that exist in the index.
                 self.main.get_cue_index().contains_key(cue) && seen.insert(cue.clone())
             })
-            .collect()
+            .collect::<Vec<_>>();
+        (deduped, cuebridge_aliases)
     }
 }
 
@@ -251,14 +396,12 @@ impl ProjectStore {
         let ctx = Arc::new(ProjectContext::new(
             NormalizationConfig::default(),
             Taxonomy::default(),
-            CueGenStrategy::default(),
-            SemanticEngine::new(None),
             Arc::new(TuningConfig::default()),
-            Arc::new(LlmConfig::default()),
+            crate::config::ServerConfig::default(),
+            project_id.to_string(),
         ));
 
         self.projects.insert(project_id.to_string(), ctx.clone());
         ctx
     }
 }
-

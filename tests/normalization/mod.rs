@@ -12,13 +12,11 @@ fn test_rewrite_rules() {
     let config = NormalizationConfig {
         lowercase: true,
         trim: true,
-        rewrite_rules: vec![
-            RewriteRule {
-                name: "service_prefix".to_string(),
-                pattern: r"^([a-z0-9_]+)-service$".to_string(),
-                replace: "service:$1".to_string(),
-            },
-        ],
+        rewrite_rules: vec![RewriteRule {
+            name: "service_prefix".to_string(),
+            pattern: r"^([a-z0-9_]+)-service$".to_string(),
+            replace: "service:$1".to_string(),
+        }],
     };
 
     let (normalized, trace) = normalize_cue("Payments-Service", &config);

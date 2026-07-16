@@ -1,16 +1,20 @@
 # CueMap Rust Engine
 
-**High-performance temporal-associative memory store** that mimics the brain's recall mechanism.
+**High-performance temporal-associative memory store** designed for dynamic contextual retrieval.
 
 ## Overview
 
-CueMap implements a **Continuous Gradient Algorithm** inspired by biological memory:
+CueMap implements a **Continuous Gradient Algorithm** optimized for associative data structures:
 
 1.  **Intersection (Context Filter)**: Triangulates relevant memories by overlapping cues
-2.  **Pattern Completion (Associative Recall)**: Automatically infers missing cues from co-occurrence history, enabling recall from partial inputs.
-3.  **Recency & Salience (Signal Dynamics)**: Balances fresh data with salient, high-signal events prioritized by the Amygdala-inspired salience module.
-4.  **Reinforcement (Hebbian Learning)**: Frequently accessed memories gain signal strength, staying "front of mind" even as they age.
-5.  **Autonomous Consolidation**: Periodically merges overlapping memories into summaries, mimicking systems consolidation to preserve signal while reducing noise.
+2.  **CuePack-Guided Intent Routing**: Uses compiled deterministic rules to add structural facets and weighted intent cues without runtime model calls.
+3.  **Recency & Salience (Signal Dynamics)**: Balances fresh data with salient, high-signal events prioritized by an adaptive impact scoring module.
+4.  **Reinforcement (Access-based Learning)**: Frequently accessed memories gain signal strength, remaining highly accessible even as they age.
+5.  **Deterministic Facets & Intent Routing**: Extracts synchronous source, evidence, temporal, type, and entity facets, then uses sparse intent cues and reranking during recall.
+
+As of v0.7.0, CueMap's core path is deterministic and embedding-free. GloVe/Ollama cue generation, WordNet/POS expansion, semantic bridges, pattern completion, external lexicon graphs, context expansion/speculation endpoints, and autonomous consolidation have been removed from the core engine.
+
+v0.7.0 also uses numeric per-project memory IDs everywhere. If callers need deterministic upsert/dedupe identity, pass `source_key`; memory IDs remain compact runtime addresses.
 
 Built with Rust for maximum performance and reliability.
 
@@ -19,23 +23,21 @@ Built with Rust for maximum performance and reliability.
 ### Build & Run
 
 ```bash
-# Production (optimized, with UI)
-cargo build --release --features ui
-./target/release/cuemap-rust --port 8080
+# Production (optimized)
+cargo build --release
+./target/release/cuemap start --port 8080
 
-# Development (Backend only - Fast)
-cargo run
-
-# Development (With Embedded UI)
-# Note: Requires building the UI first (cd web_ui && npm run build)
-cargo run --features ui
+# Development
+cargo run -- start
 ```
+
+CueMap treats the nlprule tokenizer as a runtime asset, not a build artifact. Set `TOKENIZER_PATH` to a tokenizer `.bin` file or an nlprule language directory, or place `en_tokenizer.bin` under `~/.cuemap/data`. The repository and production Docker image include `data/nlprule/en` for this purpose.
 
 ### Docker
 
 ```bash
 docker build -f Dockerfile.production -t cuemap/engine .
-docker run -p 8080:8080 cuemap/engine -v $(pwd)/local_snapshot_dir:/app/data
+docker run -p 8080:8080 -v "$(pwd)/local_snapshot_dir:/app/data" cuemap/engine
 ```
 
 ### CLI Commands
@@ -67,41 +69,12 @@ cuemap <COMMAND> [OPTIONS]
 - **`set-project`**: Set the default project for the current session.
 - **`set-watch-dir`**: Set a watch directory for a project (enables agent).
 
-#### Knowledge Graph
+#### Deterministic Semantics
 - **`lexicon`**: Inspect lexicon entries and wire/unwire cues.
-- **`alias`**: Manage aliases and semantic weights.
-- **`expand`**: Test context expansion (query suggestions).
+- **`alias`**: Manage explicit deterministic aliases.
+- **`cuepack`**: List, inspect, and validate deterministic semantic packs.
 
 Hint: Use `cuemap --help` to see available commands and options.
-
-## Embedded Web UI
-
-CueMap includes a lightweight, embedded visualization dashboard with real-time insights.
-
-### Features
-
-- **Live Ingestion Dashboard**: Two-column graph view showing Memory and Lexicon growth in real-time with auto-refresh.
-- **Synapse Graph**: Force-directed graph visualization with auto-zoom-to-fit. Nodes represent memories and cues; edges show co-occurrence.
-- **Real-Time Inspector**: Debug queries, view score breakdowns, and inspect raw memory content.
-- **Lexicon Management**: Manually wire the "brain" with new cue connections or unwire cues that are no longer related.
-- **Project Selector**: Switch between projects via header dropdown
-
-Access it directly at: `http://localhost:8080/ui` (requires running with `--features ui`)
-
-### Frontend Development
-
-Run the UI separately from the engine for faster iteration:
-
-```bash
-# Terminal 1: Run Rust Engine
-cargo run
-
-# Terminal 2: Run Vite Dev Server (hot-reloading)
-cd web_ui && npm run dev
-# Access at: http://localhost:3000/ui/
-```
-
-The Vite config proxies all API requests to the engine on port 8080.
 
 ## Configuration
 
@@ -110,7 +83,7 @@ CueMap uses a layered configuration system that prioritizes settings in the foll
 
 This system allows you to:
 1.  **Centralize Settings**: Manage server options, security keys, and engine tuning in `~/.cuemap/server_config.toml`.
-2.  **Fine-Tune Performance**: Adjust critical engine parameters like scoring weights, search depth, and expansion thresholds via the `[tuning]` section without recompiling.
+2.  **Fine-Tune Performance**: Adjust critical engine parameters like scoring weights, scan limits, and bounded fallback thresholds via the `[tuning]` section without recompiling.
 3.  **Manage Project Context**: Use `set-watch-dir` to persist project-specific settings (like agent watch paths) in `.meta.json` files alongside your data.
 
 ## Self-Learning Agent (Zero-Friction Ingestion)
@@ -125,14 +98,14 @@ On startup, if `--agent-dir` is provided, CueMap initializes the **Self-Learning
 
 ```bash
 # Point CueMap at your project
-./target/release/cuemap-rust --agent-dir ~/projects/my-app
+./target/release/cuemap start --agent-dir ~/projects/my-app
 
 # The agent will automatically:
-# 1. Structural Chunking (Python, Rust, JS/TS, Go, Java, PHP, HTML, CSS).
-#    - Recursive tree-sitter extraction captures 'name:Calculator', 'selector:.btn', etc.
+# 1. Supercharged Structural Ingestion (Rust, Python, Go, JS/TS, PHP, Java).
+#    - Native tree-sitter queries capture definitions, calls, and imports as grounded cues.
 # 2. Document & Data Parsing (PDF, Word, Excel, JSON, CSV, YAML, XML).
-#    - Extracts headers, keys, and metadata as grounded structural cues, in addition to cues inferred from content.
-# 3. Immediate ingestion into the memory store. 
+#    - Extracts headers, keys, and metadata as structural metadata.
+# 3. Source-aware chunking: related chunks share stable parent/session/order metadata for optional bounded reconstruction during recall.
 ```
 
 ## AI Agent Integration (MCP Server)
@@ -170,8 +143,8 @@ CueMap provides complete project isolation with automatic persistence:
 ### Features
 
 - **Project Isolation**: Each project has its own memory space, identified by `X-Project-ID` header.
-- **Auto-Save on Shutdown**: All projects saved when server stops (Ctrl+C)
-- **Auto-Load on Startup**: All snapshots restored when server starts
+- **Auto-Save on Shutdown**: All projects are saved on graceful shutdown when persistence is enabled.
+- **Auto-Load on Startup**: Snapshots are restored from the configured data directory when persistence is enabled.
 - **Zero Configuration**: Works out of the box
 
 ### Usage
@@ -180,7 +153,7 @@ CueMap runs in multi-tenant mode by default. Simply specify a project ID in your
 
 ```bash
 # Start server
-./target/release/cuemap-rust --port 8080
+./target/release/cuemap start --port 8080
 ```
 
 ### Example
@@ -192,34 +165,34 @@ curl -X POST http://localhost:8080/memories \
   -H "Content-Type: application/json" \
   -d '{"content": "Important data", "cues": ["test"]}'
 
-# Stop server (Ctrl+C) - auto-saves all projects
-# Restart server - auto-loads all projects
-# Data persists across restarts!
+# Stop server (Ctrl+C) - saves all projects when persistence is enabled
+# Restart server - loads persisted snapshots
+# Data persists across restarts unless snapshots are disabled.
 ```
 
 ### Snapshot Management
 
 Snapshots are automatically managed:
-- **Created**: On graceful shutdown (SIGINT/Ctrl+C)
+- **Created**: Periodically and on graceful shutdown (SIGINT/Ctrl+C) when persistence is enabled.
 - **Loaded**: On server startup
-- **Location**: `./data/snapshots/` (configurable via `--data-dir`)
+- **Disabled**: `--disable-snapshots` turns off periodic and shutdown snapshot saves.
+- **Location**: `~/.cuemap/data/snapshots/` by default, or `<--data-dir>/snapshots` when `--data-dir` is set.
 - **Format**: Bincode binary
-- **Files**: `{project-id}.bin`, `{project-id_lexicon}.bin`, `{project-id_aliases}.bin`
+- **Files**: `{project-id}.bin`, `{project-id}_lexicon.bin`, `{project-id}_aliases.bin`
 
 ### Cloud Backup
 
 CueMap supports secure offsite backups to AWS S3, Google Cloud Storage, and Azure Blob Storage.
 
 **Configuration**:
-Enable cloud backup via CLI flags or environment variables.
+Enable cloud backup via CLI flags or `~/.cuemap/server_config.toml`.
 
 ```bash
 # S3 Example
-./cuemap-rust \
+./target/release/cuemap start \
   --cloud-backup s3 \
   --cloud-bucket my-backup-bucket \
-  --cloud-region us-east-1 \
-  --cloud-auto-backup
+  --cloud-region us-east-1
 ```
 
 **Supported Providers**:
@@ -229,7 +202,7 @@ Enable cloud backup via CLI flags or environment variables.
 - `local`: Local path (for testing/replication)
 
 **Management**:
-Backups can be triggered manually via API (`/backup/upload`, `/backup/download`) or automatically on every save (`--cloud-auto-backup`).
+Backups can be triggered manually via API (`/backup/upload`, `/backup/download`).
 
 
 ## Authentication
@@ -242,10 +215,17 @@ Set an API key via environment variable:
 
 ```bash
 # Single API key
-CUEMAP_API_KEY=your-secret-key ./target/release/cuemap-rust --port 8080
+CUEMAP_API_KEY=your-secret-key ./target/release/cuemap start --port 8080
 
 # Multiple API keys (comma-separated)
-CUEMAP_API_KEYS=key1,key2,key3 ./target/release/cuemap-rust --port 8080
+CUEMAP_API_KEYS=key1,key2,key3 ./target/release/cuemap start --port 8080
+```
+
+Or configure keys in `~/.cuemap/server_config.toml`:
+
+```toml
+[security]
+api_keys = ["your-secret-key"]
 ```
 
 ### Using Authentication
@@ -298,15 +278,15 @@ await client.add('Memory', ['test']);
 ### Docker with Authentication
 
 ```bash
-docker run -p 8080:8080 -v $(pwd)/local_snapshot_dir:/app/data \
+docker run -p 8080:8080 -v "$(pwd)/local_snapshot_dir:/app/data" \
   -e CUEMAP_API_KEY=your-secret-key \
   cuemap/engine
 ```
 
 ### Security Notes
 
-- Authentication is **disabled by default** (no keys = no auth required)
-- Keys are loaded from environment variables only
+- Authentication is **disabled by default** (no keys = no auth required, unless `security.require_auth=true` is set in config)
+- Keys can be loaded from `security.api_keys` in `~/.cuemap/server_config.toml` or from `CUEMAP_API_KEY` / `CUEMAP_API_KEYS`.
 - Use strong, randomly generated keys in production
 - Rotate keys regularly
 - Use HTTPS in production to protect keys in transit
@@ -319,7 +299,7 @@ CueMap supports **encryption-at-rest** for all memory content using modern authe
 - **Master Key**: Uses a 256-bit (32-byte) key for encryption.
 - **Key Derivation (PBKDF2)**: Supports deriving the master key from a human-readable passphrase using PBKDF2-HMAC-SHA256 with 100,000 iterations and a persistent installation-unique salt.
 - **Nonce**: A random 12-byte nonce is generated for every memory encryption operation and stored alongside the ciphertext.
-- **Zero-Knowledge**: The engine does not persist the master key to disk; it must be provided at startup via environment variables (`CUEMAP_MASTER_KEY` or `CUEMAP_MASTER_PASSWORD`), an interactive prompt (foreground only), or the configuration file. It is kept only in RAM.
+- **Key Handling**: The engine does not write the master key into CueMap data files. Encryption-at-rest is opt-in and the key must be provided at startup via environment variables (`CUEMAP_MASTER_KEY` or `CUEMAP_MASTER_PASSWORD`) or `security.master_key` in the configuration file. If you store the key in `server_config.toml`, protect that file like any other secret.
 
 ## Compression
 
@@ -331,37 +311,61 @@ To optimize storage efficiency, especially for large textual memories, CueMap em
 
 ## Performance
 
-### Benchmark Results (v0.6.3)
+### Benchmark Results (v0.7.0)
 
 Tests performed on **Real-World Data** (Wikipedia Articles), processing full natural language sentences with the complete NLP pipeline.
 
-**Hardware:** MacBook Pro M1 Max (64GB RAM), Single-node, 3x cues per x memories.
+**Hardware:** MacBook Pro M-series, 64GB RAM, single node. These are local v0.7 benchmark numbers from the numeric-ID engine.
+
+#### Benchmark Methodology
+
+The NL benchmark script lives at `benchmarks/benchmark_nl.py`.
+
+Benchmark setup:
+- Uses Wikipedia parquet files as the source corpus. You can obtain Wikipedia source data from official [Wikimedia dumps](https://dumps.wikimedia.org/) or an Internet Archive mirror, then prepare/extract text into parquet files with a `text` column.
+- Deduplicates sampled snippets and consumes them without replacement, so 100K and 1M write runs do not reuse the same text.
+- Writes use HTTP `POST /memories` with `minimal_response=true` and no explicit cues, forcing CueMap to run deterministic cue/facet extraction and indexing.
+- Reads generate keyword-style natural-language queries from retained ingested snippets.
+- Recall numbers use the script's lean recall mode: `auto_reinforce=false`, salience disabled, alias expansion disabled, CueBridge artifacts disabled, `depth=1`, `expansion_depth=1`, and parent/order/evidence reconstruction disabled. This isolates the core sparse recall path.
+- `--trace-timing` records engine timing breakdowns but is not required for throughput measurements.
+
+Example run:
+
+```bash
+cuemap start --disable-snapshots --disable-bg-jobs
+
+python benchmarks/benchmark_nl.py \
+  --sizes 100000,1000000 \
+  --project-id nl_test \
+  --wikipedia-path /Users/<username>/Downloads/wikipedia/ \
+  --trace-timing \
+  --wiki-reservoir-size 20000 \
+  --query-sample-size 5000 \
+  --payload-buffer-size 500
+```
 
 #### 1. Ingestion (Write) Performance
-*Measures the time to parse a raw sentence and extract semantic cues.
+*Measures HTTP ingestion, deterministic cue/facet extraction, source-key upsert, and indexing.*
 
-| Dataset Scale | Avg Latency | P50 (Median) | P99 (Stability) | Throughput | Scaling |
-|:---|:---|:---|:---|:---|:---|
-| **10,000** | 2.33 ms | 1.99 ms | 10.53 ms | ~429 ops/s | — |
-| **100,000** | 2.30 ms | 1.94 ms | 10.88 ms | ~435 ops/s | 🟢 Flat |
-| **1,000,000** | **2.34 ms** | **2.00 ms** | **10.91 ms** | **~427 ops/s** | 🟢 **O(1)** |
+| Dataset Scale | Avg Latency | P50 | P99 | Throughput |
+|:---|:---|:---|:---|:---|
+| **100,000** | 3.13 ms | 2.56 ms | 10.98 ms | 320 ops/s |
+| **1,000,000** | 2.85 ms | 2.39 ms | 11.23 ms | 351 ops/s |
 
-> **Observation:** Ingestion latency is effectively **O(1)**. Increasing the dataset size by **100x** (10k $\rightarrow$ 1M) resulted in **zero latency penalty** (2.00ms flat).
+Write latency remains mostly flat with project size; the dominant cost is per-memory extraction/indexing rather than corpus scan time.
 
 #### 2. Recall (Read) Performance
-*Measures the time to parse a query, perform pattern completion (context expansion), and intersect the semantic graph.*
+*Measures the time to parse a query, resolve deterministic cues, and score sparse candidate intersections.*
 
-| Dataset Scale | Operation | Avg Latency | P50 (Median) | P99 (Tail) |
-|:---|:---|:---|:---|:---|
-| **100,000** | **Smart Recall** (With PC) | 1.37 ms | 1.33 ms | 2.62 ms |
-| | **Raw Recall** (No PC) | 1.34 ms | 1.26 ms | 2.45 ms |
-| **1,000,000** | **Smart Recall** (With PC) | 1.70 ms | **1.63 ms** | 3.16 ms |
-| | **Raw Recall** (No PC) | 1.69 ms | **1.61 ms** | 3.35 ms |
+| Dataset Scale | Avg Latency | P50 | P99 |
+|:---|:---|:---|:---|
+| **100,000** | 1.73 ms | 1.65 ms | 3.67 ms |
+| **1,000,000** | 2.70 ms | 2.06 ms | 5.10 ms |
 
 **Key Metrics**:
-- ✅ **2ms Ingestion Speed:** Full NLP processing and indexing happens in <3ms.
-- ✅ **Perceptually Instant Search:** 1M item smart recall (1.63ms) is ~10x faster than a 60Hz screen refresh (16ms).
-- ✅ **Provable O(1) Writes:** Ingestion speed is decoupled from dataset size.
+- **Low-latency recall:** 1M-memory natural-language recall stays around 2.7ms average with about 5.1ms p99 in the current v0.7 run.
+- **Numeric ID memory reduction:** 1M in-memory footprint dropped from about 5.25GB to about 1.93GB after the v0.7 numeric memory-ID refactor.
+- **Deterministic hot path:** recall uses in-memory sparse indexes and does not call embeddings, LLMs, network services, or disk scans.
 
 ## Architecture
 
@@ -383,25 +387,22 @@ Tests performed on **Real-World Data** (Wikipedia Articles), processing full nat
 
 ## API
 
-### Built-in Semantic Engine
+### Deterministic Cue Extraction
 
-CueMap can automatically propose cues for your memories using **Semantic Engine**.
-
-**No LLM required!** By default, CueMap uses its internal **Semantic Engine** (WordNet) and **Global Context** to generate cues instantly.
+CueMap extracts cues synchronously from content and metadata using deterministic tokenization, normalization, facets, aliases, and CuePack rules. The recall path does not call embeddings, LLMs, WordNet, external APIs, or runtime graph expansion.
 
 ```bash
-# 1. Start CueMap (no Ollama needed)
-./target/release/cuemap-rust
+# 1. Start CueMap
+./target/release/cuemap start
 
 # 2. Add memory in natural language
 curl -X POST http://localhost:8080/memories \
   -H "X-Project-ID: default" \
   -H "Content-Type: application/json" \
   -d '{
-    "content": "The payments service is down due to a timeout.",
-    "cues": []
+    "content": "The payments service is down due to a timeout."
   }'
-# Internal Engine proposes: ["payment", "service", "timeout", "outage", "failure", "payment_service", ...]
+# Deterministic extraction adds normalized lexical cues plus structural/facet cues.
 ```
 
 ## API Reference
@@ -415,16 +416,16 @@ curl -X POST http://localhost:8080/memories \
   -H "Content-Type: application/json" \
   -d '{
     "content": "API Rate Limit Policy: 1000/min",
-    "cues": ["api", "rate_limit", "policy"]
+    "cues": ["api", "rate_limit", "policy"],
+    "source_key": "doc:api-rate-limit-policy"
   }'
 
-# Auto-generate cues via semantic engine (default) or LLM (if configured)
+# Deterministic cues are extracted from content when `cues` is omitted or empty
 curl -X POST http://localhost:8080/memories \
   -H "X-Project-ID: default" \
   -H "Content-Type: application/json" \
   -d '{
-    "content": "The payments service is down due to a timeout.",
-    "cues": [] 
+    "content": "The payments service is down due to a timeout."
   }'
 ```
 
@@ -441,18 +442,18 @@ curl -X POST http://localhost:8080/recall \
   }'
 ```
 
-#### Natural Language Search (Deterministic)
+#### Natural Language Search (Symbol-First Intent Routing)
 ```bash
 curl -X POST http://localhost:8080/recall \
   -H "X-Project-ID: default" \
   -H "Content-Type: application/json" \
   -d '{
-    "query_text": "payments service timeout",
+    "query_text": "where is process_data used?",
     "limit": 10,
-    "explain": true
+    "expansion_depth": 2
   }'
 ```
-Returns memories matching tokens mapped via the local Lexicon CueMap. Use `"explain": true` to see how the query was normalized and expanded.
+Returns surgical code recall. The engine uses a deterministic **Symbol-First Router** with sparse BM25-style scoring to convert fuzzy queries into structural cues (e.g., `calls_function:process_data`). Set `expansion_depth` above 1 to include nearby source-order chunks when session/order metadata is available.
 
 ```json
 {
@@ -486,7 +487,7 @@ curl -X PATCH http://localhost:8080/memories/{id}/reinforce \
     "cues": ["important", "urgent"]
   }'
 ```
-Reinforcement is used to boost the relevance of a memory. It is a way to tell CueMap that a memory is important and should be recalled more often. It's on by default but you can manually reinforce a memory through API.
+Reinforcement is used to boost the relevance of a memory. It is a way to tell CueMap that a memory is important and should be recalled more often. Standard `POST /recall` requests do not auto-reinforce by default; enable `auto_reinforce` explicitly or reinforce a memory manually through the API.
 
 ### Get Memory
 
@@ -554,7 +555,7 @@ curl -X DELETE "http://localhost:8080/projects/default"
 ### Lexicon Management
 
 #### Inspect Cue
-View incoming (tokens mapping to this cue) and outgoing (synonyms/hypernyms) edges.
+View incoming tokens and manually wired canonical cue mappings.
 ```bash
 curl "http://localhost:8080/lexicon/inspect/service:payment"
 ```
@@ -576,31 +577,50 @@ Remove a specific token from the lexicon.
 curl -X DELETE "http://localhost:8080/lexicon/entry/cue:stripe"
 ```
 
-#### View Synonyms
-Get all synonyms for a cue.
+### CuePacks
+
+CuePacks are deterministic semantic packages. They are the maintainable place for domain vocabulary, semantic phrase families, facet rules, query-intent rules, aliases, and policy metadata. CuePacks are compiled at startup or request setup; recall does not call a network service, run embeddings, scan raw memory content, or read pack files from disk.
+
+Bundled defaults are enabled unless disabled. Place custom packs in `~/.cuemap/cuepacks/` as TOML files and inspect them with:
+
 ```bash
-curl "http://localhost:8080/lexicon/synonyms/service:payment"
+cuemap cuepack list
+cuemap cuepack inspect memory-general
+cuemap cuepack validate ./my-domain-pack.toml
 ```
 
-### Context Expansion (Query Suggestion)
-
-Explore related concepts from the cue graph to expand a user's query.
+Select packs per request:
 
 ```bash
-curl -X POST http://localhost:8080/context/expand \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query": "server hung 137",
-    "limit": 5
-  }'
-# Response:
-# {
-#   "query_cues": ["server", "hung", "137"],
-#   "expansions": [
-#     { "term": "out_of_memory", "score": 25.0, "co_occurrence_count": 12 },
-#     { "term": "SIGKILL", "score": 22.0, "co_occurrence_count": 8 }
-#   ]
-# }
+cuemap recall -p my_project --cuepacks memory-general "which transit app did I use?"
+cuemap recall -p my_project --disable-default-cuepacks "core-only recall"
+```
+
+API requests accept a separate `cuepacks` field. Use `["off"]` for core-only behavior, omit the field for bundled defaults, or pass explicit pack names.
+
+### CueBridge Artifacts
+
+CueBridge artifacts are offline-compiled lexical-gap packages. CueMap loads them into memory and uses them deterministically during recall:
+
+- **AliasPack**: safe lexical variants applied during query cue resolution.
+- **GapPack**: gated expansion cues applied only when exact recall is weak.
+
+Install artifacts into the project artifact directory, then reload them:
+
+```bash
+curl -X POST http://localhost:8080/projects/my-project/artifacts
+```
+
+Inspect active artifacts:
+
+```bash
+curl http://localhost:8080/projects/my-project/artifacts
+```
+
+Recall can disable installed artifacts for baseline checks:
+
+```bash
+cuemap recall -p my_project --disable-cuebridge-artifacts "what foundation did we choose?"
 ```
 
 ### Cloud Backup Management
@@ -684,9 +704,11 @@ curl -X POST http://localhost:8080/recall/grounded \
   }'
 ```
 
-The "Hallucination Guardrail" module. Deterministically greedy-fills a token budget with the highest-scoring memories and produces a verifiable context block for LLM prompt injection.
+Grounded recall deterministically fills a token budget with the highest-scoring memories and returns a context block designed to be passed to an LLM alongside a structured proof.
 
-**Response**:
+Grounded recall enables `auto_reinforce` by default; set `"auto_reinforce": false` for read-only evaluation or benchmark runs.
+
+**Response** (example with Ed25519 signing configured):
 ```json
 {
   "verified_context": "[VERIFIED CONTEXT] (1) Fact... Rules:...",
@@ -695,22 +717,47 @@ The "Hallucination Guardrail" module. Deterministically greedy-fills a token bud
     "selected": [...],
     "excluded_top": [...]
   },
+  "signature_alg": "ed25519",
+  "signature": "9b2d...",
+  "public_key": "ed25519:4f8c...",
   "engine_latency_ms": 0.83
 }
 ```
 
-### Signed Memories (Immutable RAG)
+### Signed Context (Immutable RAG)
 
-To prevent prompt injection and guarantee data provenance, grounded recall responses now include a cryptographic signature.
+CueMap can sign grounded recall context so clients can verify that the `verified_context` block was produced by the configured CueMap server and was not modified in transit before it reaches an LLM.
 
-The `verified_context` block is signed using HMAC-SHA256 (key: `CUEMAP_SECRET_KEY`). Clients can verify this signature to ensure the context hasn't been tampered with or fabricated by a man-in-the-middle or hallucinatory process before reaching the LLM.
+Preferred setup uses Ed25519 asymmetric signatures. Generate one 32-byte private seed, store it securely, and reuse it across restarts:
+
+```bash
+openssl rand -hex 32 > ~/.cuemap/signing_ed25519_seed.hex
+CUEMAP_SIGNING_PRIVATE_KEY="$(cat ~/.cuemap/signing_ed25519_seed.hex)" cuemap start
+```
+
+Or configure it in `~/.cuemap/server_config.toml`:
+
+```toml
+[security]
+signing_private_key = "ed25519:<32-byte-hex-seed>"
+```
+
+Grounded recall responses include the signature algorithm and public key:
 
 ```json
 {
   "verified_context": "...",
-  "signature": "sha256:9b2d..."
+  "signature_alg": "ed25519",
+  "signature": "9b2d...",
+  "public_key": "ed25519:4f8c..."
 }
 ```
+
+Clients verify `signature` over the exact UTF-8 bytes of `verified_context` using the pinned Ed25519 public key. The signature is a lowercase hex-encoded 64-byte Ed25519 signature. The public key is `ed25519:` plus the lowercase hex-encoded raw 32-byte Ed25519 public key.
+
+Treat the response `public_key` as discovery metadata; production clients should pin the expected public key from deployment config rather than trusting a key delivered by the same response they are verifying.
+
+For compatibility, `CUEMAP_SECRET_KEY` still enables legacy `hmac-sha256` signatures. HMAC verification requires sharing the same secret with verifiers, so Ed25519 is recommended for client-side or third-party verification.
 
 ## System Architecture
 
@@ -721,7 +768,6 @@ graph TB
     subgraph "Clients"
         SDK[Python/TS SDKs]
         CURL[HTTP Clients]
-        UI[Web UI]
     end
     
     subgraph "API Layer"
@@ -737,14 +783,13 @@ graph TB
     end
     
     subgraph "Background Processing"
-        QUEUE[Job Queue<br/>MPSC 1000]
-        SESSION[Session Manager<br/>Buffered Ingestion]
-        SCHED[Scheduler<br/>24h Consolidation]
+        QUEUE[Job Queue<br/>Reinforcement + Agent Jobs]
+        SESSION[Session Manager<br/>Ingest Progress]
     end
     
     subgraph "Intelligence"
         NL[NL Tokenizer<br/>Lemmatization + RAKE]
-        SEMANTIC[Semantic Engine<br/>WordNet]
+        PACKS[CuePacks<br/>Facet + Intent Rules]
     end
     
     subgraph "Persistence"
@@ -753,7 +798,6 @@ graph TB
     
     SDK --> AXUM
     CURL --> AXUM
-    UI --> AXUM
     AXUM --> AUTH --> MT
     
     MT --> MAIN
@@ -761,11 +805,10 @@ graph TB
     MT --> ALIAS
     
     AXUM --> QUEUE
-    SESSION --> QUEUE
-    SCHED -.-> QUEUE
+    AXUM --> SESSION
     
-    QUEUE --> SEMANTIC
     QUEUE --> LEX
+    AXUM --> PACKS
     
     MAIN <-.-> PERSIST
     LEX <-.-> PERSIST
@@ -786,7 +829,6 @@ sequenceDiagram
     participant Norm as Normalizer
     participant Tax as Taxonomy
     participant Main as CueMap Engine
-    participant Q as Job Queue
     
     C->>API: POST /memories<br/>{content, cues[]}
     
@@ -807,13 +849,7 @@ sequenceDiagram
     API-->>C: 200 {id, cues, latency_ms}
     Note over C,API: ✅ Synchronous ~2ms
     
-    par Buffered Background Jobs
-        API->>Q: Buffer ProposeCues
-        API->>Q: Buffer TrainLexicon
-        API->>Q: Buffer UpdateGraph
-    end
-    
-    Note over Q: Jobs processed after<br/>ingestion session completes
+    Note over API,Main: Cue extraction and indexing happen synchronously
 ```
 
 ### 3. Read Flow (POST /recall)
@@ -824,6 +860,7 @@ sequenceDiagram
     participant API as API Handler
     participant Lex as Lexicon
     participant Alias as Alias Engine
+    participant Art as CueBridge Artifacts
     participant Main as CueMap Engine
     participant Q as Job Queue
     
@@ -836,13 +873,17 @@ sequenceDiagram
     
     API->>API: Merge & Normalize cues
     
-    opt disable_alias_expansion = false
-        API->>Alias: expand_query_cues(cues)
+    opt explicit aliases enabled
+        API->>Alias: apply_aliases(cues)
         Alias-->>API: weighted_cues[(cue, weight)]
+    end
+
+    opt exact recall is weak and artifacts are enabled
+        API->>Art: lookup GapPack(query_signature)
+        Art-->>API: capped expansion cues
     end
     
     API->>Main: recall_weighted(cues, limit, options)
-    Main->>Main: Pattern Completion (CA3)
     Main->>Main: Salience Bias
     Main->>Main: Score & Rank
     
@@ -861,50 +902,45 @@ sequenceDiagram
 ```mermaid
 graph TB
     subgraph "Job Sources"
-        WRITE[POST /memories]
+        INGEST[Ingest API]
         RECALL[POST /recall]
         AGENT[Self-Learning Agent]
-        TIMER[24h Scheduler]
+        TIMER[60s Heatmap Tick]
     end
     
     subgraph "Job Types"
-        J1[ProposeCues]
-        J2[TrainLexiconFromMemory]
-        J3[UpdateGraph]
         J4[ReinforceMemories]
         J5[ReinforceLexicon]
-        J6[ProposeAliases]
         J7[ExtractAndIngest]
         J8[VerifyFile]
-        J9[ConsolidateMemories]
+        J10[DeleteMemory]
+        J9[UpdateMarketHeatmap]
     end
     
     subgraph "Processing"
-        SESSION[Session Manager<br/>Buffers during ingestion]
+        SESSION[Session Manager<br/>Tracks write completion]
         QUEUE[MPSC Queue<br/>Async Worker]
     end
     
     subgraph "Side Effects"
-        E1[Lexicon Trained]
-        E2[Cues Attached]
-        E3[Graph Updated]
-        E4[Memories Reinforced]
-        E5[Overlaps Merged]
-        E6[Aliases Discovered]
+        E1[Memories Reinforced]
+        E2[Lexicon Reinforced]
+        E4[Content Extracted]
+        E5[Stale File Memories Deleted]
+        E6[Market Heatmap Updated]
     end
     
-    WRITE --> J1 & J2 & J3
     RECALL --> J4 & J5
-    AGENT --> J7 & J8
+    INGEST --> J7
+    AGENT --> J7 & J8 & J10
     TIMER --> J9
     
-    J1 & J2 & J3 --> SESSION
-    SESSION --> QUEUE
-    J4 & J5 & J6 --> QUEUE
-    J7 & J8 --> QUEUE
+    J7 --> SESSION
+    J4 & J5 --> QUEUE
+    J7 & J8 & J10 --> QUEUE
     J9 --> QUEUE
     
-    QUEUE --> E1 & E2 & E3 & E4 & E5 & E6
+    QUEUE --> E1 & E2 & E4 & E5 & E6
     
     style QUEUE fill:#9C27B0
     style SESSION fill:#673AB7
@@ -917,187 +953,69 @@ graph TB
 
 ### 1. Self-Learning Ingestion Agent
 
-The agent transforms your local filesystem into a semantic knowledge base with zero manual effort.
+The agent transforms your local filesystem into a deterministic structural knowledge base with zero manual effort.
 
 *   **Universal Format Support**: Deeply integrates with dozens of formats:
     *   **Languages**: Rust, Python, TypeScript, Go, Java, PHP, HTML, CSS (via Tree-sitter).
     *   **Documents**: PDF (text extraction), Word (DOCX), Excel (XLSX).
     *   **Data**: CSV (row-aware), JSON (key-aware), YAML, XML.
 *   **Tree-sitter Powered Chunking**: Smartly splits code into functions, classes, and modules while preserving context.
-*   **Robust Knowledge Extraction**: Uses a combination of structured JSON parsing and regex fallbacks to ensure high-density cue extraction even from smaller local models.
+*   **Deterministic Knowledge Extraction**: Uses tree-sitter structure, document parsers, metadata facets, token normalization, and CuePack rules; no runtime model call is required.
 *   **Idempotent Updates**: Uses content-aware hashing (`file:<path>:<hash>`) to prevent memory duplication and ensure stale memories are pruned.
 *   **Background Verification Loop**: Continuously verifies that memories in the engine still exist on disk, pruning stale references automatically.
 
 ### 2. Deterministic Natural Language Engine
 
-CueMap bridges the gap between unstructured text and structured recall without relying on slow, non-deterministic vector search.
+CueMap bridges unstructured text to sparse deterministic recall without vector search, runtime models, or background semantic expansion.
 
 #### How It Works
 
-The **Lexicon** is a self-learning inverted index that maps natural language tokens to canonical cues.
+At add-time, CueMap extracts cues synchronously from real structure:
 
-**Training Phase** (automatic background job):
+- normalized lexical cues
+- entity, quote, model-like, and quantity-object cues
+- evidence facets such as numbers, money, dates, durations, and lists
+- source facets from metadata such as role, channel, session, and order
+- CuePack-derived deterministic facet and intent cues
 
-```mermaid
-graph LR
-    subgraph "Add Memory"
-        M["Memory<br/>content: 'payments service timeout'<br/>cues: ['service:payment', 'error:timeout']"]
-    end
-    
-    subgraph "Tokenization"
-        T1[Normalize<br/>lowercase, remove specials]
-        T2[Remove stopwords<br/>'the', 'is', 'at'...]
-        T3["Extract tokens<br/>['payments', 'service', 'timeout']"]
-        T4["Create token cues<br/>['tok:payments', 'tok:service', 'tok:timeout']"]
-        T5["Create bigrams<br/>['phr:payments_service', 'phr:service_timeout']"]
-    end
-    
-    subgraph "Lexicon Update"
-        L1["For each canonical cue:<br/>ID: 'cue:service:payment'<br/>Content: 'service:payment'<br/>Cues: all tokens"]
-        L2["Result:<br/>tok:payments → service:payment<br/>tok:service → service:payment<br/>phr:payments_service → service:payment"]
-    end
-    
-    M --> T1 --> T2 --> T3 --> T4 --> T5 --> L1 --> L2
-    
-    style M fill:#4CAF50
-    style L2 fill:#2196F3
-```
+At query-time, CueMap uses the same deterministic normalization path, then applies only bounded in-memory expansions:
 
-**Resolution Phase** (query time):
+- explicit aliases when enabled
+- installed CueBridge AliasPack entries during query cue resolution
+- installed CueBridge GapPack entries only when exact recall is weak
+- optional ordered/evidence reconstruction passes when explicitly requested
 
-```mermaid
-sequenceDiagram
-    participant Q as Query: "payment timeout"
-    participant T as Tokenizer
-    participant L as Lexicon Engine
-    participant V as Validator
-    participant C as Cache
-    
-    Q->>T: Normalize & tokenize
-    T-->>Q: ["tok:payment", "tok:timeout",<br/>"phr:payment_timeout"]
-    
-    Q->>C: Check cache
-    C-->>Q: Miss
-    
-    Q->>L: Recall(tokens, limit=8)
-    Note over L: Rank by:<br/>1. Intersection count<br/>2. Recency (auto-reinforce)<br/>3. Position in lists
-    
-    L-->>Q: ["service:payment", "error:timeout",<br/>"topic:billing", ...]
-    
-    Q->>V: Validate cues
-    V-->>Q: Accepted cues
-    
-    Q->>C: Store result
-    Q-->>Q: ["service:payment", "error:timeout"]
-```
+#### Semantic Boundary
 
-#### Concrete Example
+CueMap Core does not try to infer broad semantic relationships from local co-occurrence. That keeps recall fast, deterministic, and inspectable. Semantic gap closure belongs in explicit artifacts:
 
-```
-📥 Training Data:
-Memory 1: "The payments service is experiencing high latency"
-         cues: ["service:payment", "status:slow"]
+- **CuePacks**: deterministic domain rules, facets, aliases, and query intent policies.
+- **Manual Lexicon Wiring**: explicit token-to-canonical cue connections for project owners.
+- **CueBridge Artifacts**: offline-compiled GapPack/AliasPack files generated by CueBridge Local or Cloud and loaded into CueMap.
 
-Memory 2: "Payment processing timeout error on checkout"
-         cues: ["service:payment", "error:timeout"]
+This split is intentional: CueMap Core stays lean and latency-stable, while CueBridge can use heavier local or cloud models offline to generate static lexical-gap artifacts.
 
-Memory 3: "Database timeout causing payment failures"  
-         cues: ["error:timeout", "component:database"]
+### 3. Advanced Contextual Recall
 
-📊 Lexicon State (simplified):
-tok:payment → [service:payment (2x), ...]
-tok:timeout → [error:timeout (2x), ...]
-phr:payment_processing → [service:payment]
-phr:processing_timeout → [error:timeout]
+CueMap keeps advanced recall behavior deterministic and inspectable:
 
-🔍 Query: "payment timeout"
+#### Source-Order Context and Episodes
+Long-form ingests, chat logs, files, and agent chunks preserve parent/session/order metadata. Recall can use `expansion_depth` to include nearby source-order chunks, and add-time temporal episode cues can be disabled on memory writes with `disable_temporal_chunking: true`.
 
-Tokenized: ["tok:payment", "tok:timeout", "phr:payment_timeout"]
-
-Lexicon Recall:
-- tok:payment matches → service:payment (strong)
-- tok:timeout matches → error:timeout (strong)
-- phr:payment_timeout matches → nothing (no exact bigram)
-
-✅ Result: ["service:payment", "error:timeout"]
-```
-
-#### Accuracy Characteristics
-
-| Factor | Impact | Example |
-|--------|--------|---------|
-| **Consistent terminology** | ✅ High | Always use "payment" not "pay", "payments", "paid" |
-| **Rich training data** | ✅ High | 100s of memories per cue |
-| **Token overlap** | ✅ High | Query uses same words as content |
-| **Synonym handling** | ⚠️ Needs aliases | "pay" vs "payment" requires alias |
-| **Sparse data** | ❌ Low | Only 1-2 memories per cue |
-| **Novel vocabulary** | ❌ Low | Query uses completely new terms |
-
-#### Disambiguation Through Usage Patterns
-
-By making the Lexicon itself a CueMapEngine, ambiguous words automatically resolve based on your **actual usage patterns** through recency, intersection, and reinforcement:
-
-```
-Example: The word "run" has multiple meanings
-
-Your System (DevOps focused):
-Memory 1: "Pipeline run failed on deployment stage"
-         cues: ["ci:pipeline", "status:failed"]
-
-Memory 2: "Container run terminated unexpectedly"  
-         cues: ["container:docker", "status:terminated"]
-
-Memory 3: "Cron job run completed successfully"
-         cues: ["job:cron", "status:success"]
-
-Lexicon learns:
-tok:run → [ci:pipeline (most recent), container:docker, job:cron]
-
-🔍 Query: "run failed"
-
-Lexicon Recall:
-- tok:run matches → ci:pipeline (position 0, most recent)
-                  → container:docker (position 1)
-                  → job:cron (position 2)
-- tok:failed matches → status:failed (strong)
-
-Intersection + Recency scoring:
-- ci:pipeline: high (recent, frequently reinforced if you query pipelines often)
-- container:docker: medium
-- job:cron: lower
-
-✅ Result: ["ci:pipeline", "status:failed"]
-
-💡 If you were a fitness app instead, "run" would map to ["activity:running", "sport:cardio"] 
-   based on YOUR domain's usage - same algorithm, different training data!
-```
-
-The Lexicon **adapts to your domain's semantics** automatically. No manual disambiguation rules needed!
-
-### 3. Brain-Inspired Advanced Recall
-
-CueMap introduces deep biological inspiration into the deterministic recall engine:
-
-#### Hippocampal Pattern Completion
-Given partial cues, the engine recalls the whole memory by maintaining an incremental cue co-occurrence matrix. This expansion happens strictly at retrieval-time and can be toggled off via `disable_pattern_completion: true` for pure deterministic matching.
-
-#### Temporal Episode Chunking
-Experiences are automatically chunked into episodes. Memories created in close temporal proximity with high cue overlap are tagged with `episode:<id>`, allowing the engine to recall entire "storylines" from a single member. Can be disabled per-request via `disable_temporal_chunking: true`.
-
-#### Salience Bias (Amygdala)
-Not all memories are created equal. The engine calculates a **Salience Multiplier** based on cue density, reinforcement frequency, and rare cue combinations. Salient memories persist longer in the "warm" cache and rank higher than routine events. Can be disabled per-recall via `disable_salience_bias: true`.
-
-#### Systems Consolidation
-Old, highly overlapping memories are periodically merged into summarized "gist" memories. This process is strictly additive: it keeps the original high-resolution memories intact as Ground Truth while creating new consolidated summaries to aid high-level recall. Can be toggled at retrieval via `disable_systems_consolidation: true`.
+#### Adaptive Salience Bias
+Not all memories are created equal. The engine calculates a **Salience Multiplier** based on cue density, reinforcement frequency, and rare cue combinations. High-signal memories rank above routine events when other structural evidence is comparable. Can be disabled per-recall via `disable_salience_bias: true`.
 
 #### Match Integrity
 Every recall result now includes a **Match Integrity** score. This internal diagnostic combines intersection strength, reinforcement history, and context agreement to tell you how structurally reliable a specific recall result is.
 
-#### Semantic Bootstrapping (WordNet)
-To bridge the gap between user queries and stored memories, CueMap integrates **WordNet** lookups during cue generation. This allows the engine to propose synonym-rich cues, ensuring that a memory tagged with "payment" is retrievable via "transaction" or "billing".
+#### Bounded Reconstruction
+For long-form chat logs, tickets, transcripts, and benchmark records, recall can optionally run bounded reconstruction passes:
 
-#### Multi-Hop Recall (Depth)
-Iteratively expands contextual reach by using the top retrieved memories from an initial recall as pivot points to discover deeper associations, all seamlessly orchestrated in a single request via the `depth` parameter while automatically mitigating context drift.
+- `parent_fusion`: stitch related chunks that share source parent metadata.
+- `ordered_reconstruction`: retrieve ordered evidence from a small number of matching sessions.
+- `evidence_coverage`: diversify results across multiple evidence cues for summary-style queries.
+
+These modes are off by default and are designed for diagnostics or workloads that explicitly trade a bounded second pass for higher evidence coverage.
 
 ## License
 

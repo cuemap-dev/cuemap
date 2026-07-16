@@ -33,9 +33,9 @@ pub fn validate_cues(cues: Vec<String>, taxonomy: &Taxonomy) -> ValidationReport
         let parts: Vec<&str> = cue.splitn(2, ':').collect();
         // Allow cues without keys (plain strings) based on new requirements
         if parts.len() == 1 {
-             // Accept plain cues, treating them as valid by default unless we implement a "plain cue" blocklist
-             accepted.push(cue);
-             continue;
+            // Accept plain cues, treating them as valid by default unless we implement a "plain cue" blocklist
+            accepted.push(cue);
+            continue;
         }
 
         if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
@@ -102,4 +102,3 @@ pub fn validate_cues(cues: Vec<String>, taxonomy: &Taxonomy) -> ValidationReport
 
     ValidationReport { accepted, rejected }
 }
-

@@ -1,16 +1,14 @@
-use crate::multi_tenant::MultiTenantEngine;
-use crate::projects::ProjectContext;
-use crate::structures::{MainStats, LexiconStats};
-use crate::normalization::normalize_cue;
-use crate::taxonomy::validate_cues;
 use crate::config::*;
 use crate::metrics::MetricsCollector;
-use std::sync::Arc;
-use tokio::sync::mpsc;
-use tracing::{info, warn, error, debug};
-use std::collections::HashSet;
+use crate::multi_tenant::MultiTenantEngine;
+use crate::projects::ProjectContext;
+use crate::structures::{MainStats, MemoryId};
 use rayon::prelude::*;
 use smallvec::SmallVec;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 // Alias Job Constants
@@ -22,25 +20,81 @@ pub const ALIAS_SIZE_SIMILARITY_MAX_RATIO: f64 = 0.5;
 pub const ALIAS_OVERLAP_THRESHOLD: f64 = 0.65;
 
 #[derive(Debug)]
+pub enum MemoryRef {
+    Id(MemoryId),
+    SourceKey(String),
+}
+
+impl Clone for MemoryRef {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Id(id) => Self::Id(*id),
+            Self::SourceKey(source_key) => Self::SourceKey(source_key.clone()),
+        }
+    }
+}
+
+impl std::fmt::Display for MemoryRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Id(id) => write!(f, "{}", id),
+            Self::SourceKey(source_key) => write!(f, "source_key:{}", source_key),
+        }
+    }
+}
+
+impl MemoryRef {
+    fn resolve_main(&self, ctx: &ProjectContext) -> Option<MemoryId> {
+        match self {
+            Self::Id(id) => Some(*id),
+            Self::SourceKey(source_key) => ctx.main.memory_id_for_source_key(source_key),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum Job {
-    ProposeCues { project_id: String, memory_id: String, content: String },
-    TrainLexiconFromMemory { project_id: String, memory_id: String },
-    ProposeAliases { project_id: String },
-    ExtractAndIngest { project_id: String, memory_id: String, content: String, file_path: String, structural_cues: Vec<String>, category: crate::agent::chunker::ChunkCategory },
-    VerifyFile { project_id: String, file_path: String, valid_memory_ids: Vec<String> },
-    UpdateGraph { project_id: String, memory_id: String },
-    ReinforceMemories { project_id: String, memory_ids: Vec<String>, cues: Vec<String> },
-    ReinforceLexicon { project_id: String, memory_ids: Vec<String>, cues: Vec<String> },
-    ConsolidateMemories { project_id: String },
-    UpdateMarketHeatmap { project_id: String },
-    DeleteMemory { project_id: String, memory_id: String },
+    ProposeAliases {
+        project_id: String,
+    },
+    ExtractAndIngest {
+        project_id: String,
+        source_key: String,
+        content: String,
+        file_path: String,
+        structural_cues: Vec<String>,
+        metadata: Option<HashMap<String, serde_json::Value>>,
+        category: crate::agent::chunker::ChunkCategory,
+    },
+    VerifyFile {
+        project_id: String,
+        file_path: String,
+        valid_source_keys: Vec<String>,
+    },
+    ReinforceMemories {
+        project_id: String,
+        memory_ids: Vec<MemoryId>,
+        cues: Vec<String>,
+    },
+    ReinforceLexicon {
+        project_id: String,
+        memory_ids: Vec<MemoryId>,
+        cues: Vec<String>,
+    },
+    UpdateMarketHeatmap {
+        project_id: String,
+    },
+    DeleteMemory {
+        project_id: String,
+        memory_ref: MemoryRef,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IngestionPhase {
-    Writing,      // Accepting writes, buffering jobs
-    Processing,   // Processing buffered jobs
-    Done,         // All jobs complete
+    Writing,    // Accepting writes, buffering jobs
+    Processing, // Processing buffered jobs
+    Done,       // All jobs complete
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -48,26 +102,14 @@ pub struct JobProgress {
     pub phase: String,
     pub writes_completed: usize,
     pub writes_total: usize,
-    pub propose_cues_completed: usize,
-    pub propose_cues_total: usize,
-    pub train_lexicon_completed: usize,
-    pub train_lexicon_total: usize,
-    pub update_graph_completed: usize,
-    pub update_graph_total: usize,
 }
 
 /// Tracks a bulk ingestion session with buffered jobs
 pub struct IngestionSession {
     pub project_id: String,
-    pub phase: std::sync::atomic::AtomicU8,  // 0=Writing, 1=Processing, 2=Done
+    pub phase: std::sync::atomic::AtomicU8, // 0=Writing, 1=Processing, 2=Done
     pub writes_completed: std::sync::atomic::AtomicUsize,
     pub writes_total: std::sync::atomic::AtomicUsize,
-    pending_propose_cues: tokio::sync::Mutex<Vec<(String, String, String)>>,  // (project_id, memory_id, content)
-    pending_train_lexicon: tokio::sync::Mutex<Vec<(String, String)>>,         // (project_id, memory_id)
-    pending_update_graph: tokio::sync::Mutex<Vec<(String, String)>>,          // (project_id, memory_id)
-    pub propose_cues_completed: std::sync::atomic::AtomicUsize,
-    pub train_lexicon_completed: std::sync::atomic::AtomicUsize,
-    pub update_graph_completed: std::sync::atomic::AtomicUsize,
     last_write: tokio::sync::Mutex<std::time::Instant>,
 }
 
@@ -78,16 +120,10 @@ impl IngestionSession {
             phase: std::sync::atomic::AtomicU8::new(0),
             writes_completed: std::sync::atomic::AtomicUsize::new(0),
             writes_total: std::sync::atomic::AtomicUsize::new(0),
-            pending_propose_cues: tokio::sync::Mutex::new(Vec::new()),
-            pending_train_lexicon: tokio::sync::Mutex::new(Vec::new()),
-            pending_update_graph: tokio::sync::Mutex::new(Vec::new()),
-            propose_cues_completed: std::sync::atomic::AtomicUsize::new(0),
-            train_lexicon_completed: std::sync::atomic::AtomicUsize::new(0),
-            update_graph_completed: std::sync::atomic::AtomicUsize::new(0),
             last_write: tokio::sync::Mutex::new(std::time::Instant::now()),
         }
     }
-    
+
     pub fn get_phase(&self) -> IngestionPhase {
         match self.phase.load(std::sync::atomic::Ordering::Relaxed) {
             0 => IngestionPhase::Writing,
@@ -95,7 +131,7 @@ impl IngestionSession {
             _ => IngestionPhase::Done,
         }
     }
-    
+
     pub fn get_progress(&self) -> JobProgress {
         let phase = match self.get_phase() {
             IngestionPhase::Writing => "writing",
@@ -104,114 +140,79 @@ impl IngestionSession {
         };
         JobProgress {
             phase: phase.to_string(),
-            writes_completed: self.writes_completed.load(std::sync::atomic::Ordering::Relaxed),
+            writes_completed: self
+                .writes_completed
+                .load(std::sync::atomic::Ordering::Relaxed),
             writes_total: self.writes_total.load(std::sync::atomic::Ordering::Relaxed),
-            propose_cues_completed: self.propose_cues_completed.load(std::sync::atomic::Ordering::Relaxed),
-            propose_cues_total: 0, // Will be set after flush
-            train_lexicon_completed: self.train_lexicon_completed.load(std::sync::atomic::Ordering::Relaxed),
-            train_lexicon_total: 0,
-            update_graph_completed: self.update_graph_completed.load(std::sync::atomic::Ordering::Relaxed),
-            update_graph_total: 0,
         }
     }
-    
+
     /// Buffer a job for later processing
     pub async fn buffer_job(&self, job: Job) {
         *self.last_write.lock().await = std::time::Instant::now();
-        
-        match job {
-            Job::ProposeCues { project_id, memory_id, content } => {
-                self.pending_propose_cues.lock().await.push((project_id, memory_id, content));
-            }
-            Job::TrainLexiconFromMemory { project_id, memory_id } => {
-                self.pending_train_lexicon.lock().await.push((project_id, memory_id));
-            }
-            Job::UpdateGraph { project_id, memory_id } => {
-                self.pending_update_graph.lock().await.push((project_id, memory_id));
-            }
-            _ => {} // Other jobs are not buffered
-        }
+
+        let _ = job;
     }
-    
+
     /// Mark a write as complete
     pub fn write_complete(&self) {
-        self.writes_completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.writes_completed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    
+
     /// Increment expected write count
     pub fn expect_write(&self) {
         // Reactivate session if it was done or processing
         self.phase.store(0, std::sync::atomic::Ordering::Relaxed);
-        self.writes_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.writes_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    
+
     /// Check if we should auto-flush (no writes for 2 seconds)
     pub async fn should_auto_flush(&self) -> bool {
         let last = *self.last_write.lock().await;
-        let writes_done = self.writes_completed.load(std::sync::atomic::Ordering::Relaxed);
+        let writes_done = self
+            .writes_completed
+            .load(std::sync::atomic::Ordering::Relaxed);
         let writes_expected = self.writes_total.load(std::sync::atomic::Ordering::Relaxed);
-        
+
         // Only auto-flush if all expected writes are done AND 2 seconds have passed
         writes_done >= writes_expected && writes_expected > 0 && last.elapsed().as_secs() >= 2
     }
-    
+
     pub fn is_stale(&self) -> bool {
         let phase = self.phase.load(std::sync::atomic::Ordering::Relaxed);
         // If done/idle for more than 5 minutes
-        phase == 2 && self.writes_total.load(std::sync::atomic::Ordering::Relaxed) > 0 
+        phase == 2 && self.writes_total.load(std::sync::atomic::Ordering::Relaxed) > 0
     }
-    
+
     /// Flush and process all buffered jobs in order
-    pub async fn flush(&self, provider: &Arc<dyn ProjectProvider>, metrics: &Option<Arc<MetricsCollector>>) {
+    pub async fn flush(
+        &self,
+        provider: &Arc<dyn ProjectProvider>,
+        metrics: &Option<Arc<MetricsCollector>>,
+        jobs_config: &JobsConfig,
+    ) {
         use std::sync::atomic::Ordering;
-        
+
         // Try to transition Writing -> Processing
         // If phase is not Writing (e.g. already Processing), skip
-        if self.phase.compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        if self
+            .phase
+            .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
             return;
         }
-        
-        // Get job counts for progress reporting
-        let propose_cues = std::mem::take(&mut *self.pending_propose_cues.lock().await);
-        let train_lexicon = std::mem::take(&mut *self.pending_train_lexicon.lock().await);
-        let update_graph = std::mem::take(&mut *self.pending_update_graph.lock().await);
-        
-        let total_propose = propose_cues.len();
-        let total_train = train_lexicon.len();
-        let total_graph = update_graph.len();
-        
-        if total_propose > 0 || total_train > 0 || total_graph > 0 {
-            debug!("[Jobs] Phase 2: Processing {} ProposeCues, {} TrainLexicon, {} UpdateGraph", 
-                  total_propose, total_train, total_graph);
-            
-            // Process ProposeCues first
-            for (_i, (project_id, memory_id, content)) in propose_cues.into_iter().enumerate() {
 
-                process_job(Job::ProposeCues { project_id, memory_id, content }, provider, metrics).await;
-                self.propose_cues_completed.fetch_add(1, Ordering::Relaxed);
-            }
-            
-            // Then TrainLexicon
-            for (_i, (project_id, memory_id)) in train_lexicon.into_iter().enumerate() {
+        let _ = (provider, metrics, jobs_config);
 
-                process_job(Job::TrainLexiconFromMemory { project_id, memory_id }, provider, metrics).await;
-                self.train_lexicon_completed.fetch_add(1, Ordering::Relaxed);
-            }
-            
-            // Finally UpdateGraph
-            for (_i, (project_id, memory_id)) in update_graph.into_iter().enumerate() {
-
-                process_job(Job::UpdateGraph { project_id, memory_id }, provider, metrics).await;
-                self.update_graph_completed.fetch_add(1, Ordering::Relaxed);
-            }
-            
-            debug!("[Jobs] All background jobs complete ✓");
-        }
-        
         // Try to transition Processing -> Done
         // If phase changed back to Writing during processing (via expect_write), this will fail,
         // leaving the session in Writing mode (which checks out, as we have new work).
-        let _ = self.phase.compare_exchange(1, 2, Ordering::Relaxed, Ordering::Relaxed);
+        let _ = self
+            .phase
+            .compare_exchange(1, 2, Ordering::Relaxed, Ordering::Relaxed);
     }
 }
 
@@ -220,58 +221,51 @@ pub struct SessionManager {
     sessions: dashmap::DashMap<String, Arc<IngestionSession>>,
     provider: Arc<dyn ProjectProvider>,
     metrics: Option<Arc<MetricsCollector>>,
+    jobs_config: JobsConfig,
 }
 
 impl SessionManager {
-    pub fn new(provider: Arc<dyn ProjectProvider>, metrics: Option<Arc<MetricsCollector>>) -> Self {
+    pub fn new(
+        provider: Arc<dyn ProjectProvider>,
+        metrics: Option<Arc<MetricsCollector>>,
+        jobs_config: JobsConfig,
+    ) -> Self {
         Self {
             sessions: dashmap::DashMap::new(),
             provider,
             metrics,
+            jobs_config,
         }
     }
-    
+
     /// Get aggregated progress across all sessions
     pub fn get_global_progress(&self) -> JobProgress {
         let mut global = JobProgress {
             phase: "idle".to_string(), // Default
             writes_completed: 0,
             writes_total: 0,
-            propose_cues_completed: 0,
-            propose_cues_total: 0,
-            train_lexicon_completed: 0,
-            train_lexicon_total: 0,
-            update_graph_completed: 0,
-            update_graph_total: 0,
         };
-        
+
         let mut active_count = 0;
-        
+
         for entry in self.sessions.iter() {
             let p = entry.value().get_progress();
-            
+
             global.writes_completed += p.writes_completed;
             global.writes_total += p.writes_total;
-            global.propose_cues_completed += p.propose_cues_completed;
-            global.propose_cues_total += p.propose_cues_total;
-            global.train_lexicon_completed += p.train_lexicon_completed;
-            global.train_lexicon_total += p.train_lexicon_total;
-            global.update_graph_completed += p.update_graph_completed;
-            global.update_graph_total += p.update_graph_total;
-            
+
             if p.phase != "idle" && p.phase != "done" {
                 active_count += 1;
             }
         }
-        
+
         if active_count > 0 {
             global.phase = format!("processing ({} projects)", active_count);
         }
-        
+
         global
     }
 
-    
     /// Get or create a session for a project
     pub fn get_or_create(&self, project_id: &str) -> Arc<IngestionSession> {
         self.sessions
@@ -279,45 +273,54 @@ impl SessionManager {
             .or_insert_with(|| Arc::new(IngestionSession::new(project_id.to_string())))
             .clone()
     }
-    
+
     /// Get session if it exists
     pub fn get(&self, project_id: &str) -> Option<Arc<IngestionSession>> {
         self.sessions.get(project_id).map(|r| r.clone())
     }
-    
+
     /// Flush a specific session
     pub async fn flush_session(&self, project_id: &str) {
         if let Some(session) = self.get(project_id) {
-            session.flush(&self.provider, &self.metrics).await;
+            session
+                .flush(&self.provider, &self.metrics, &self.jobs_config)
+                .await;
         }
     }
-    
+
     /// Start auto-flush background task
     pub fn start_auto_flush(self: Arc<Self>) {
         let manager = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
             let mut cleanup_interval = 0;
-            
+
             loop {
                 interval.tick().await;
-                
+
                 // Flush sessions
                 // 1. Collect sessions to flush (avoid holding DashMap lock during flush)
                 let mut sessions_to_flush = Vec::new();
                 for entry in manager.sessions.iter() {
                     let session = entry.value().clone();
-                    if session.get_phase() == IngestionPhase::Writing && session.should_auto_flush().await {
+                    if session.get_phase() == IngestionPhase::Writing
+                        && session.should_auto_flush().await
+                    {
                         sessions_to_flush.push(session);
                     }
                 }
-                
+
                 // 2. Flush sessions outside the lock
                 for session in sessions_to_flush {
-                    debug!("[Jobs] Auto-flushing session for project: {}", session.project_id);
-                    session.flush(&manager.provider, &manager.metrics).await;
+                    debug!(
+                        "[Jobs] Auto-flushing session for project: {}",
+                        session.project_id
+                    );
+                    session
+                        .flush(&manager.provider, &manager.metrics, &manager.jobs_config)
+                        .await;
                 }
-                
+
                 // Cleanup stale sessions every 30 iterations (60 seconds)
                 cleanup_interval += 1;
                 if cleanup_interval >= 30 {
@@ -335,6 +338,7 @@ pub struct JobQueue {
     sender: mpsc::Sender<Job>,
     pub session_manager: Arc<SessionManager>,
     pub metrics: Option<Arc<MetricsCollector>>,
+    background_processing: bool,
 }
 
 // Abstraction to access projects regardless of mode
@@ -348,26 +352,47 @@ impl ProjectProvider for MultiTenantEngine {
     fn get_project(&self, project_id: &str) -> Option<Arc<ProjectContext>> {
         self.get_or_create_project(project_id.to_string()).ok()
     }
-    
+
     fn save_project(&self, project_id: &str) -> Result<(), String> {
         self.save_project(&project_id.to_string()).map(|_| ())
     }
 
     fn list_active_projects(&self) -> Vec<String> {
-        self.list_projects().into_iter().map(|p| p.project_id).collect()
+        self.list_projects()
+            .into_iter()
+            .map(|p| p.project_id)
+            .collect()
     }
 }
 
-
-
 impl JobQueue {
-    pub fn new(provider: Arc<dyn ProjectProvider>, metrics: Option<Arc<MetricsCollector>>, disable_bg_jobs: bool) -> Self {
+    pub fn new(
+        provider: Arc<dyn ProjectProvider>,
+        metrics: Option<Arc<MetricsCollector>>,
+        disable_bg_jobs: bool,
+    ) -> Self {
+        let mut jobs_config = JobsConfig::default();
+        jobs_config.background_processing = !disable_bg_jobs;
+        Self::new_with_config(provider, metrics, jobs_config)
+    }
+
+    pub fn new_with_config(
+        provider: Arc<dyn ProjectProvider>,
+        metrics: Option<Arc<MetricsCollector>>,
+        jobs_config: JobsConfig,
+    ) -> Self {
         let (tx, mut rx) = mpsc::channel(1000);
         let provider_clone = provider.clone();
-        let session_manager = Arc::new(SessionManager::new(provider.clone(), metrics.clone()));
+        let session_manager = Arc::new(SessionManager::new(
+            provider.clone(),
+            metrics.clone(),
+            jobs_config.clone(),
+        ));
         let session_manager_clone = session_manager.clone();
         let metrics_clone = metrics.clone();
-        
+        let background_processing = jobs_config.background_processing;
+        let jobs_config_for_worker = jobs_config.clone();
+
         tokio::spawn(async move {
             while let Some(job) = rx.recv().await {
                 // Determine if this job should signal a session write completion
@@ -376,8 +401,14 @@ impl JobQueue {
                     _ => None,
                 };
 
-                if !disable_bg_jobs {
-                    process_job(job, &provider_clone, &metrics_clone).await;
+                if background_processing {
+                    process_job(
+                        job,
+                        &provider_clone,
+                        &metrics_clone,
+                        &jobs_config_for_worker,
+                    )
+                    .await;
                 }
 
                 // If it was a write job, signal completion to the session
@@ -389,10 +420,10 @@ impl JobQueue {
                 }
             }
         });
-        
-        if !disable_bg_jobs {
+
+        if jobs_config.background_processing {
             session_manager.clone().start_auto_flush();
-            
+
             // Background Task: Market Heatmap Sync (Every 60s)
             let tx_sync = tx.clone();
             let provider_sync = provider.clone();
@@ -402,40 +433,62 @@ impl JobQueue {
                 loop {
                     interval.tick().await;
                     let projects = provider_sync.list_active_projects();
-                    debug!("JobQueue: Ticking Market Heatmap Sync ({} projects)", projects.len());
+                    debug!(
+                        "JobQueue: Ticking Market Heatmap Sync ({} projects)",
+                        projects.len()
+                    );
                     // Trigger update for all active projects
                     for pid in projects {
-                        let _ = tx_sync.send(Job::UpdateMarketHeatmap { project_id: pid }).await;
+                        let _ = tx_sync
+                            .send(Job::UpdateMarketHeatmap { project_id: pid })
+                            .await;
                     }
                 }
             });
         }
-        
-        Self { 
+
+        Self {
             sender: tx,
             session_manager,
             metrics,
+            background_processing: jobs_config.background_processing,
         }
     }
-    
+
+    pub fn has_buffered_ingest_jobs(&self) -> bool {
+        false
+    }
+
+    pub fn should_buffer_job(&self, job: &Job) -> bool {
+        if !self.background_processing {
+            return false;
+        }
+
+        let _ = job;
+        false
+    }
+
     /// Enqueue a job immediately (for non-buffered jobs like Reinforce)
     pub async fn enqueue(&self, job: Job) {
         if let Err(e) = self.sender.send(job).await {
             warn!("Failed to enqueue job: {}", e);
         }
     }
-    
+
     /// Buffer a job for phased processing
     pub async fn buffer(&self, project_id: &str, job: Job) {
+        if !self.should_buffer_job(&job) {
+            return;
+        }
         let session = self.session_manager.get_or_create(project_id);
         session.buffer_job(job).await;
     }
-    
+
     /// Get session for a project
     pub fn get_session(&self, project_id: &str) -> Option<Arc<IngestionSession>> {
         self.session_manager.get(project_id)
     }
-    
+
     /// Get total pending job count across all sessions (for metrics)
     pub fn pending_count(&self) -> usize {
         let mut count = 0;
@@ -443,10 +496,9 @@ impl JobQueue {
             let session = entry.value();
             let progress = session.get_progress();
             // Count jobs that haven't completed yet
-            let pending = (progress.writes_total.saturating_sub(progress.writes_completed))
-                + (progress.propose_cues_total.saturating_sub(progress.propose_cues_completed))
-                + (progress.train_lexicon_total.saturating_sub(progress.train_lexicon_completed))
-                + (progress.update_graph_total.saturating_sub(progress.update_graph_completed));
+            let pending = progress
+                .writes_total
+                .saturating_sub(progress.writes_completed);
             count += pending;
         }
         count
@@ -460,7 +512,7 @@ impl JobQueue {
 struct CueCandidate {
     cue: String,
     len: usize,
-    sample: HashSet<String>, // Hashed set for fast lookups in stage 1
+    sample: HashSet<MemoryId>, // Hashed set for fast lookups in stage 1
 }
 
 // --- Helper Functions ---
@@ -469,7 +521,7 @@ struct CueCandidate {
 fn cue_tokens(cue: &str) -> SmallVec<[String; 8]> {
     let mut tokens = SmallVec::new();
     let parts = cue.split(|c| c == ':' || c == '-' || c == '_');
-    
+
     for part in parts {
         let lower = part.to_lowercase();
         if lower.len() >= 3 {
@@ -485,14 +537,18 @@ fn lexical_gate(a: &str, b: &str) -> bool {
     if a.contains(b) || b.contains(a) {
         return true;
     }
-    
+
     // 2. Token overlap
     let tokens_a = cue_tokens(a);
-    if tokens_a.is_empty() { return false; }
-    
+    if tokens_a.is_empty() {
+        return false;
+    }
+
     let tokens_b = cue_tokens(b);
-    if tokens_b.is_empty() { return false; }
-    
+    if tokens_b.is_empty() {
+        return false;
+    }
+
     for ta in &tokens_a {
         for tb in &tokens_b {
             if ta == tb {
@@ -500,7 +556,7 @@ fn lexical_gate(a: &str, b: &str) -> bool {
             }
         }
     }
-    
+
     false
 }
 
@@ -516,7 +572,7 @@ fn is_canonical_format(cue: &str) -> bool {
 fn choose_canonical(a: &str, b: &str) -> (String, String) {
     let a_canon = is_canonical_format(a);
     let b_canon = is_canonical_format(b);
-    
+
     if a_canon && !b_canon {
         (a.to_string(), b.to_string())
     } else if !a_canon && b_canon {
@@ -531,319 +587,13 @@ fn choose_canonical(a: &str, b: &str) -> (String, String) {
     }
 }
 
-/// Check if a cue is suitable for lexicon training (excluding high-cardinality cues)
-pub fn is_lexicon_trainable(cue: &str) -> bool {
-    let lower = cue.to_lowercase();
-    !lower.starts_with("path:") && 
-    !lower.starts_with("id:") && 
-    !lower.starts_with("memory_id:") && 
-    !lower.starts_with("file:") && 
-    !lower.starts_with("alias_id:") &&
-    !lower.starts_with("source:")
-}
-
-// Shared logic for training lexicon from memory content (Identity + WordNet Synonyms)
-fn train_lexicon_impl(ctx: &ProjectContext, memory_id: &str, content: &str) {
-    // Detect language from memory cues if available
-    let lang = if let Some(mem) = ctx.main.get_memory(memory_id) {
-        mem.cues.iter()
-            .find(|c| c.starts_with("lang:"))
-            .map(|c| crate::nl::Language::from(c.as_str()))
-            .unwrap_or(crate::nl::Language::Default)
-    } else {
-        crate::nl::Language::Default
-    };
-
-    // Tokenize content
-    let tokens = crate::nl::tokenize_to_cues_with_lang(content, lang);
-
-    
-    if tokens.is_empty() {
-        return;
-    }
-    
-    let mut identity_count = 0;
-    let mut synonym_count = 0;
-    let mut sample_synonyms: Vec<String> = Vec::new();
-    
-    // REFACTOR: Avoid global N^2 association.
-    // 1. Associate each token with ITSELF (Identity).
-    // 2. Associate each token with its DIRECT synonyms (WordNet).
-    
-    for token in &tokens {
-        if !is_lexicon_trainable(&token) {
-            continue;
-        }
-
-        // 1. Train Identity: Token -> Token
-        let lex_id = token.clone();
-        ctx.lexicon.upsert_memory_with_id(
-            lex_id,
-            token.clone(),
-            vec![token.clone()], 
-            None,
-            Some(LexiconStats::default()),
-            false,
-            false
-        );
-        identity_count += 1;
-
-        // 2. Train Synonyms: Token -> Synonym (WordNet)
-        let expanded = ctx.semantic_engine.expand_wordnet(&token, &[token.clone()], 0.65, 3);
-        
-        for synonym in expanded {
-            if !is_lexicon_trainable(&synonym) {
-                continue;
-            }
-            // Upsert: Synonym triggered by Token
-            let syn_id = synonym.clone();
-            ctx.lexicon.upsert_memory_with_id(
-                syn_id,
-                synonym.clone(),
-                vec![token.clone()],
-                None,
-                Some(LexiconStats::default()),
-                false,
-                false
-            );
-            synonym_count += 1;
-            if sample_synonyms.len() < 5 {
-                sample_synonyms.push(format!("{}->{}", token, synonym));
-            }
-        }
-    }
-    
-    if identity_count > 0 || synonym_count > 0 {
-        let sample_str = if !sample_synonyms.is_empty() {
-            format!(" (e.g. {})", sample_synonyms.join(", "))
-        } else {
-            String::new()
-        };
-        debug!("Job: Lexicon trained {} identity + {} synonym mappings for memory {}{}", 
-            identity_count, synonym_count, memory_id, sample_str);
-    }
-}
-
-async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>, metrics: &Option<Arc<MetricsCollector>>) {
+async fn process_job(
+    job: Job,
+    provider: &Arc<dyn ProjectProvider>,
+    metrics: &Option<Arc<MetricsCollector>>,
+    _jobs_config: &JobsConfig,
+) {
     match job {
-        Job::TrainLexiconFromMemory { project_id, memory_id } => {
-            if let Some(ctx) = provider.get_project(&project_id) {
-                let ctx_clone = ctx.clone();
-                let memory_id_clone = memory_id.clone();
-                
-                tokio::task::spawn_blocking(move || {
-                     // Fetch memory from main engine
-                     if let Some(memory) = ctx_clone.main.get_memory(&memory_id_clone) {
-                         let content = memory.access_content(ctx_clone.main.get_master_key().as_deref()).unwrap_or_default();
-                         train_lexicon_impl(&ctx_clone, &memory_id_clone, &content);
-                     }
-                }).await.unwrap();
-            }
-        }
-
-        Job::ProposeCues { project_id, memory_id, content } => {
-             if let Some(ctx) = provider.get_project(&project_id) {
-                 let ctx_clone = ctx.clone();
-                 let memory_id_clone = memory_id.clone();
-                 let content_clone = content.clone();
-                 let project_id_clone = project_id.clone();
-                 
-                 tokio::task::spawn_blocking(move || {
-                     let ctx = ctx_clone;
-                     let memory_id = memory_id_clone;
-                     let content = content_clone;
-                     let project_id = project_id_clone;
-                     let rt_handle = tokio::runtime::Handle::current();
-
-                     debug!("Job: Proposing cues for memory {} in project {} (strategy: {:?})", memory_id, project_id, ctx.cuegen_strategy);
-                 
-                 // 1. Resolve known cues (Lexicon recall)
-                  // Detect language from memory cues
-                  let lang = ctx.main.get_memory(&memory_id)
-                      .map(|mem| mem.cues.iter()
-                          .find(|c| c.starts_with("lang:"))
-                          .map(|c| crate::nl::Language::from(c.as_str()))
-                          .unwrap_or(crate::nl::Language::Default))
-                      .unwrap_or(crate::nl::Language::Default);
-
-                  // 1. Resolve known cues (Lexicon recall)
-                  let (mut known_cues, _, _) = ctx.resolve_cues_from_text_with_lang(&content, false, lang);
-
-                 
-                 // 2. Bootstrap if needed (for static strategies to have something to expand)
-                 // If Lexicon found very few cues, add raw tokens as seed cues for expansion.
-                 // Limit to 10 seeds because expansion multiplies them (each seed → multiple synonyms).
-                 if known_cues.len() < 3 {
-                     let tokens = crate::nl::tokenize_to_cues_with_lang(&content, lang);
-                     for token in tokens.into_iter().take(10) {
-                         if !known_cues.contains(&token) {
-                             known_cues.push(token);
-                         }
-                     }
-                 }
-                 
-                 // Track cues by source for detailed logging
-                 let mut wordnet_cues: Vec<String> = Vec::new();
-                 let mut glove_cues: Vec<String> = Vec::new();
-                 let mut context_cues: Vec<String> = Vec::new();
-                 let mut llm_cues: Vec<String> = Vec::new();
-                 
-                 // IDF Filtering: Identify expansion candidates (rare cues only)
-                 let total = ctx.total_memories();
-                 // Threshold: % of corpus, minimum count.
-                 let threshold = (total as f64 * ctx.tuning.idf_threshold_percent).max(ctx.tuning.idf_min_count as f64) as usize;
-
-                 // PERF/QUALITY: Use raw tokens for expansion to avoid Lexicon Pollution loop.
-                 // We only expand what is explicitly in the content.
-                 // Filter by IDF to skip common words (e.g. "the").
-                 let tokens = crate::nl::tokenize_to_cues_with_lang(&content, lang);
-                 let expansion_candidates: Vec<String> = tokens.iter()
-                     .filter(|c| ctx.get_cue_frequency(c) <= threshold)
-                     .cloned()
-                     .collect();
-                 
-                 
-                 // 3. Static Semantic Expansion (Always on - WordNet)
-                 if ctx.tuning.expansion_threshold > 0.0 {
-                     let wn_result = ctx.semantic_engine.expand_wordnet(&content, &expansion_candidates, ctx.tuning.expansion_threshold as f32, ctx.tuning.expansion_limit);
-                     wordnet_cues.extend(wn_result);
-                 }
-                 
-                // 4. Strategy Specific Expansion
-                match ctx.cuegen_strategy {
-                    CueGenStrategy::Default => {
-                        // Minimal strategy: Only WordNet (handled below always-on)
-                        // No extra expansion.
-                    },
-                    CueGenStrategy::Glove => {
-                        // GloVe Expansion (Nearest Neighbors of Cues)
-                        let glove_result = ctx.semantic_engine.expand_glove(&content, &expansion_candidates);
-                        glove_cues.extend(glove_result);
-                        
-                        // Global Context Expansion (Nearest Neighbors of Context Vector)
-                        let context_result = ctx.semantic_engine.expand_global_context(&content);
-                        context_cues.extend(context_result);
-                    },
-                     CueGenStrategy::Ollama => {
-                         // LLM Expansion
-                         // Use global config or fallback if enabled
-                         if ctx.llm_config.enabled || matches!(ctx.cuegen_strategy, CueGenStrategy::Ollama) {
-                             let content_ref = content.clone();
-                             let known_cues_ref = known_cues.clone();
-                             // Convert to legacy config for llm module
-                             let legacy_config = ctx.llm_config.to_legacy();
-                             
-                             match rt_handle.block_on(async move {
-                                 // ensure we are using the function from llm module
-                                 crate::llm::propose_cues(&content_ref, &legacy_config, &known_cues_ref).await
-                             }) {
-                                 Ok(result) => llm_cues.extend(result),
-                                 Err(e) => error!("Job: LLM failed: {}", e),
-                             }
-                         }
-                     }
-                 }
-                 
-                 // Log source breakdown before normalization
-                 let log_sample = |name: &str, cues: &[String]| {
-                     if !cues.is_empty() {
-                         let sample: Vec<_> = cues.iter().take(5).collect();
-                         let suffix = if cues.len() > 5 { format!(" (+{} more)", cues.len() - 5) } else { String::new() };
-                         debug!("  └─ {}: {:?}{}", name, sample, suffix);
-                     }
-                 };
-                 
-                 log_sample("WordNet", &wordnet_cues);
-                 log_sample("GloVe", &glove_cues);
-                 log_sample("Context", &context_cues);
-                 log_sample("LLM", &llm_cues);
-                 
-
-                 
-                 // Merge all proposed cues with deduplication and filtering
-                 let mut seen = HashSet::new();
-                 let mut proposed_cues = Vec::new();
-                 
-                 let filter_and_add = |cues: Vec<String>, seen: &mut HashSet<String>, out: &mut Vec<String>| {
-                     for cue in cues {
-                         let lower = cue.to_lowercase();
-
-                         // Skip very short cues
-                         if lower.len() < 3 {
-                             continue;
-                         }
-                         // Skip duplicates
-                         if seen.contains(&lower) {
-                             continue;
-                         }
-                         seen.insert(lower);
-                         out.push(cue);
-                     }
-                 };
-                 
-                 filter_and_add(wordnet_cues, &mut seen, &mut proposed_cues);
-                 filter_and_add(glove_cues, &mut seen, &mut proposed_cues);
-                 filter_and_add(context_cues, &mut seen, &mut proposed_cues);
-                 filter_and_add(llm_cues, &mut seen, &mut proposed_cues);
-                 
-                 // Cap total proposed cues to prevent explosion
-                 const MAX_PROPOSED_CUES: usize = 10;
-                 if proposed_cues.len() > MAX_PROPOSED_CUES {
-                     proposed_cues.truncate(MAX_PROPOSED_CUES);
-                     debug!("Job: Truncated proposed cues to {}", MAX_PROPOSED_CUES);
-                 }
-                 
-                 // 5. Merge, Normalize & Validate
-                 let mut normalized_cues = Vec::new();
-                 for cue in proposed_cues {
-                     let (normalized, _) = normalize_cue(&cue, &ctx.normalization);
-                     normalized_cues.push(normalized);
-                 }
-                 
-                 let report = validate_cues(normalized_cues, &ctx.taxonomy);
-                 
-                 // 6. Attach accepted cues
-                 if !report.accepted.is_empty() {
-                     ctx.main.attach_cues(&memory_id, report.accepted.clone());
-                     let sample: Vec<_> = report.accepted.iter().take(8).collect();
-                     let suffix = if report.accepted.len() > 8 { format!(" (+{} more)", report.accepted.len() - 8) } else { String::new() };
-                     debug!("Job: Attached {} cues to memory {}: {:?}{}", report.accepted.len(), memory_id, sample, suffix);
-                     
-                     // 7. Retrain lexicon with new cues
-                     let tokens = crate::nl::tokenize_to_cues_with_lang(&content, lang);
-                     if !tokens.is_empty() {
-                         for canonical_cue in report.accepted {
-                             if !is_lexicon_trainable(&canonical_cue) {
-                                 continue;
-                             }
-                             
-                              let lex_id = format!("cue:{}", canonical_cue);
-                              
-                              // Filter out identity mappings
-                              let filtered_tokens: Vec<String> = tokens.iter()
-                                  .filter(|t| t.as_str() != canonical_cue.as_str() && !canonical_cue.contains(t.as_str()))
-                                  .cloned()
-                                  .collect();
-                                  
-                              if filtered_tokens.is_empty() {
-                                  continue;
-                              }
-
-                              ctx.lexicon.upsert_memory_with_id(
-                                  lex_id, 
-                                  canonical_cue, 
-                                  filtered_tokens, 
-                                  None,
-                                  Some(LexiconStats::default()),
-                                  false,
-                                  false
-                              );
-                         }
-                     }
-                 }
-                 }).await.unwrap();
-             }
-        }
         Job::ProposeAliases { project_id } => {
             if let Some(ctx) = provider.get_project(&project_id) {
                 let ctx_clone = ctx.clone();
@@ -851,29 +601,37 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>, metrics: &Op
 
                 tokio::task::spawn_blocking(move || {
                     let cue_index = ctx_clone.main.get_cue_index();
-                    
+
                     // 1. Filter and Select Mid-Frequency Cues
                     let mut stats: Vec<(String, usize)> = cue_index
                         .iter()
                         .map(|entry| (entry.key().clone(), entry.value().len()))
-                        .filter(|(k, cnt)| k.len() >= 3 && *cnt >= ALIAS_MIN_CUE_MEMORIES && *cnt <= ALIAS_MAX_CUE_MEMORIES)
+                        .filter(|(k, cnt)| {
+                            k.len() >= 3
+                                && *cnt >= ALIAS_MIN_CUE_MEMORIES
+                                && *cnt <= ALIAS_MAX_CUE_MEMORIES
+                        })
                         .collect();
-                    
+
                     stats.sort_unstable_by(|a, b| b.1.cmp(&a.1));
                     let drop_count = (stats.len() as f64 * 0.01) as usize;
-                    let stats = stats.into_iter().skip(drop_count).take(ALIAS_MAX_CANDIDATES).collect::<Vec<_>>();
-                    
+                    let stats = stats
+                        .into_iter()
+                        .skip(drop_count)
+                        .take(ALIAS_MAX_CANDIDATES)
+                        .collect::<Vec<_>>();
+
                     if stats.is_empty() {
                         return;
                     }
-                    
+
                     // 2. Build Candidates
                     let candidates: Vec<CueCandidate> = stats
                         .into_iter()
                         .filter_map(|(key, len)| {
                             if let Some(entry) = cue_index.get(&key) {
                                 let sample_vec = entry.get_recent_owned(Some(ALIAS_SAMPLE_SIZE));
-                                let sample_set: HashSet<String> = sample_vec.into_iter().collect();
+                                let sample_set: HashSet<MemoryId> = sample_vec.into_iter().collect();
                                 Some(CueCandidate {
                                     cue: key,
                                     len,
@@ -884,9 +642,13 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>, metrics: &Op
                             }
                         })
                         .collect();
-                    
-                    info!("Job: Analyzing {} candidates for aliases in project {}", candidates.len(), project_id_clone);
-                    
+
+                    info!(
+                        "Job: Analyzing {} candidates for aliases in project {}",
+                        candidates.len(),
+                        project_id_clone
+                    );
+
                     // 3. Parallel Comparison
                     let proposals: Vec<(String, String, f64, String)> = candidates
                         .par_iter()
@@ -895,23 +657,28 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>, metrics: &Op
                             for cand_b in candidates.iter().skip(i + 1) {
                                 let diff = (cand_a.len as isize - cand_b.len as isize).abs();
                                 let max_len = std::cmp::max(cand_a.len, cand_b.len);
-                                if (diff as f64 / max_len as f64) > ALIAS_SIZE_SIMILARITY_MAX_RATIO {
+                                if (diff as f64 / max_len as f64) > ALIAS_SIZE_SIMILARITY_MAX_RATIO
+                                {
                                     continue;
                                 }
-                                
+
                                 if !lexical_gate(&cand_a.cue, &cand_b.cue) {
                                     continue;
                                 }
-                                
-                                let intersection = cand_a.sample.intersection(&cand_b.sample).count();
-                                let min_sample_len = std::cmp::min(cand_a.sample.len(), cand_b.sample.len());
-                                if min_sample_len == 0 { continue; }
-                                
+
+                                let intersection =
+                                    cand_a.sample.intersection(&cand_b.sample).count();
+                                let min_sample_len =
+                                    std::cmp::min(cand_a.sample.len(), cand_b.sample.len());
+                                if min_sample_len == 0 {
+                                    continue;
+                                }
+
                                 let sample_score = intersection as f64 / min_sample_len as f64;
                                 if sample_score < (ALIAS_OVERLAP_THRESHOLD - 0.15) {
                                     continue;
                                 }
-                                
+
                                 if let Some(entry_a) = cue_index.get(&cand_a.cue) {
                                     if let Some(entry_b) = cue_index.get(&cand_b.cue) {
                                         let (smaller, larger) = if entry_a.len() < entry_b.len() {
@@ -919,26 +686,44 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>, metrics: &Op
                                         } else {
                                             (&entry_b.items, &entry_a.items)
                                         };
-                                        
-                                        let exact_intersection = smaller.iter().filter(|id| larger.contains(*id)).count();
+
+                                        let exact_intersection = smaller
+                                            .iter()
+                                            .filter(|id| larger.contains(*id))
+                                            .count();
                                         let min_len = smaller.len();
-                                        if min_len == 0 { continue; }
-                                        
-                                        let exact_score = exact_intersection as f64 / min_len as f64;
-                                        
+                                        if min_len == 0 {
+                                            continue;
+                                        }
+
+                                        let exact_score =
+                                            exact_intersection as f64 / min_len as f64;
+
                                         if exact_score >= ALIAS_OVERLAP_THRESHOLD {
-                                            let (canon, alias) = choose_canonical(&cand_a.cue, &cand_b.cue);
+                                            let (canon, alias) =
+                                                choose_canonical(&cand_a.cue, &cand_b.cue);
                                             let alias_id_str = format!("{}->{}", alias, canon);
-                                            let alias_uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, alias_id_str.as_bytes());
-                                            acc.push((alias, canon, exact_score, alias_uuid.to_string()));
+                                            let alias_uuid = Uuid::new_v5(
+                                                &Uuid::NAMESPACE_OID,
+                                                alias_id_str.as_bytes(),
+                                            );
+                                            acc.push((
+                                                alias,
+                                                canon,
+                                                exact_score,
+                                                alias_uuid.to_string(),
+                                            ));
                                         }
                                     }
                                 }
                             }
                             acc
                         })
-                        .reduce(Vec::new, |mut a, b| { a.extend(b); a });
-                    
+                        .reduce(Vec::new, |mut a, b| {
+                            a.extend(b);
+                            a
+                        });
+
                     // 4. Register Proposals
                     for (from, to, score, alias_id) in proposals {
                         let id_cue = format!("alias_id:{}", alias_id);
@@ -949,83 +734,101 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>, metrics: &Op
                                 "downweight": score,
                                 "status": "proposed",
                                 "reason": "overlap_analysis"
-                            }).to_string();
-                            
+                            })
+                            .to_string();
+
                             let cues = vec![
                                 "type:alias".to_string(),
                                 "status:proposed".to_string(),
                                 "reason:overlap_analysis".to_string(),
-                                id_cue
+                                id_cue,
                             ];
-                            
-                            ctx_clone.aliases.upsert_memory_with_id(alias_id.clone(), content, cues, None, Some(MainStats::default()), false, false);
-                            info!("Job: Proposed alias {} -> {} (score: {:.2})", from, to, score);
+
+                            ctx_clone.aliases.upsert_memory_with_source_key(
+                                alias_id.clone(),
+                                content,
+                                cues,
+                                None,
+                                Some(MainStats::default()),
+                                false,
+                                false,
+                            );
+                            info!(
+                                "Job: Proposed alias {} -> {} (score: {:.2})",
+                                from, to, score
+                            );
                         }
                     }
-                }).await.unwrap();
+                })
+                .await
+                .unwrap();
             }
-
         }
-        Job::ExtractAndIngest { project_id, memory_id, content, file_path, structural_cues, category } => {
+        Job::ExtractAndIngest {
+            project_id,
+            source_key,
+            content,
+            file_path,
+            structural_cues,
+            metadata,
+            category,
+        } => {
             if let Some(ctx) = provider.get_project(&project_id) {
                 let ctx_clone = ctx.clone();
-                let memory_id_clone = memory_id.clone();
+                let source_key_clone = source_key.clone();
                 let content_clone = content.clone();
                 let file_path_clone = file_path.clone();
                 let structural_cues_clone = structural_cues.clone();
+                let metadata_clone = metadata.clone();
 
                 tokio::task::spawn_blocking(move || {
-                    debug!("Agent: Fast extraction starting for {} (category: {:?})", memory_id_clone, category);
-                    
-                    use crate::agent::chunker::ChunkCategory;
-                    
-                    let mut resolved_cues: Vec<String>;
-                    
+                    debug!(
+                        "Agent: Fast extraction starting for {} (category: {:?})",
+                        source_key_clone, category
+                    );
+
                     // 1. Resolve raw content cues (tokens only, no expansion)
-                    let lang = structural_cues_clone.iter()
+                    let lang = structural_cues_clone
+                        .iter()
                         .find(|c| c.starts_with("lang:"))
                         .map(|c| crate::nl::Language::from(c.as_str()))
                         .unwrap_or(crate::nl::Language::Default);
 
-                    match category {
-                        ChunkCategory::Conversation => {
-                            resolved_cues = structural_cues_clone;
-                            let (normalized_tokens, _, _) = ctx_clone.resolve_cues_from_text_with_lang(&content_clone, true, lang);
-                            for token in normalized_tokens {
-                                if !resolved_cues.contains(&token) {
-                                    resolved_cues.push(token);
-                                }
-                            }
-                        },
-                        // Treat all other categories similarly: Just get tokens.
-                        // Prose/WebContent getting WordNet expansion is now handled by Lexicon Training below.
-                        _ => {
-                             let (normalized_tokens, _, _) = ctx_clone.resolve_cues_from_text_with_lang(&content_clone, true, lang);
-                             resolved_cues = normalized_tokens;
+                    let mut resolved_cues = structural_cues_clone;
+                    let (normalized_tokens, _, _) =
+                        ctx_clone.resolve_cues_from_text_with_lang(&content_clone, true, lang);
+                    for token in normalized_tokens {
+                        if !resolved_cues.contains(&token) {
+                            resolved_cues.push(token);
                         }
                     }
-                    
+
                     // 2. Add metadata cues
                     resolved_cues.push(format!("path:{}", file_path_clone));
                     resolved_cues.push("source:agent".to_string());
                     resolved_cues.push(format!("category:{:?}", category).to_lowercase());
-                    
+
                     // 3. Upsert memory (Lean cues only)
-                    ctx_clone.main.upsert_memory_with_id(
-                        memory_id_clone.clone(),
+                    let memory_id = ctx_clone.main.upsert_memory_with_source_key(
+                        source_key_clone.clone(),
                         content_clone,
                         resolved_cues.clone(),
-                        None,
+                        metadata_clone,
                         Some(MainStats::default()),
                         false,
-                        true
+                        true,
                     );
-                    
-                    // Note: Lexicon training is now handled by buffered TrainLexiconFromMemory jobs
-                    // to ensure all writes complete before background processing starts.
-                    
-                    debug!("Agent: Ingested {} ({:?}, {} cues)", memory_id_clone, category, resolved_cues.len());
-                }).await.unwrap();
+
+                    debug!(
+                        "Agent: Ingested {} as memory {} ({:?}, {} cues)",
+                        source_key_clone,
+                        memory_id,
+                        category,
+                        resolved_cues.len()
+                    );
+                })
+                .await
+                .unwrap();
 
                 // Record ingestion metric
                 if let Some(m) = metrics {
@@ -1034,96 +837,109 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>, metrics: &Op
             }
         }
 
-        Job::VerifyFile { project_id, file_path, valid_memory_ids } => {
-             if let Some(ctx) = provider.get_project(&project_id) {
-                  // Strategy:
-                  // 1. Look up all memories associated with "path:{file_path}"
-                  // 2. Filter for those that are NOT in valid_memory_ids
-                  // 3. Delete them
-                  
-                  let path_cue = format!("path:{}", file_path);
-                  if let Some(ordered_set) = ctx.main.get_cue_index().get(&path_cue) {
-                      // Get all memory IDs associated with this file
-                      let current_memories = ordered_set.get_recent_owned(None);
-                      let valid_set: HashSet<String> = valid_memory_ids.into_iter().collect();
-                      
-                      let mut deleted_count = 0;
-                      for mem_id in current_memories {
-                          // Only delete if it's an agent-managed memory (check prefix "file:")
-                          // and not in the valid set.
-                          if mem_id.starts_with("file:") && !valid_set.contains(&mem_id) {
-                               if ctx.main.delete_memory(&mem_id) {
-                                   deleted_count += 1;
-                               }
-                          }
-                      }
-                      
-                      if deleted_count > 0 {
-                          info!("Agent: Verified {}. Pruned {} stale memories.", file_path, deleted_count);
-                      } else {
-                          debug!("Agent: Verified {}. No stale memories found.", file_path);
-                      }
-                  }
-             }
-        }
-        Job::DeleteMemory { project_id, memory_id } => {
+        Job::VerifyFile {
+            project_id,
+            file_path,
+            valid_source_keys,
+        } => {
             if let Some(ctx) = provider.get_project(&project_id) {
-                if ctx.main.delete_memory(&memory_id) {
+                // Strategy:
+                // 1. Look up all memories associated with "path:{file_path}"
+                // 2. Filter for those that are NOT in valid_memory_ids
+                // 3. Delete them
+
+                let path_cue = format!("path:{}", file_path);
+                if let Some(ordered_set) = ctx.main.get_cue_index().get(&path_cue) {
+                    // Get all memory IDs associated with this file
+                    let current_memories = ordered_set.get_recent_owned(None);
+                    let valid_set: HashSet<String> = valid_source_keys.into_iter().collect();
+
+                    let mut deleted_count = 0;
+                    for mem_id in current_memories {
+                        let is_stale = ctx
+                            .main
+                            .get_memory(mem_id)
+                            .and_then(|memory| memory.source_key)
+                            .map(|source_key| !valid_set.contains(&source_key))
+                            .unwrap_or(false);
+                        if is_stale {
+                            if ctx.main.delete_memory(mem_id) {
+                                deleted_count += 1;
+                            }
+                        }
+                    }
+
+                    if deleted_count > 0 {
+                        info!(
+                            "Agent: Verified {}. Pruned {} stale memories.",
+                            file_path, deleted_count
+                        );
+                    } else {
+                        debug!("Agent: Verified {}. No stale memories found.", file_path);
+                    }
+                }
+            }
+        }
+        Job::DeleteMemory {
+            project_id,
+            memory_ref,
+        } => {
+            if let Some(ctx) = provider.get_project(&project_id) {
+                let Some(memory_id) = memory_ref.resolve_main(&ctx) else {
+                    debug!("Job: DeleteMemory skipped unresolved memory {}", memory_ref);
+                    return;
+                };
+                if ctx.main.delete_memory(memory_id) {
                     debug!("Job: Deleted stale memory {}", memory_id);
                 }
             }
         }
-        Job::UpdateGraph { project_id, memory_id } => {
-            if let Some(ctx) = provider.get_project(&project_id) {
-                let ctx_clone = ctx.clone();
-                let memory_id_clone = memory_id.clone();
-                tokio::task::spawn_blocking(move || {
-                    if let Some(memory) = ctx_clone.main.get_memories().get(&memory_id_clone) {
-                        let cues = memory.cues.clone();
-                        // Update of the co-occurrence matrix
-                        ctx_clone.main.update_cue_co_occurrence(&cues);
-                        debug!("Job: Updated graph connectivity for {} cues (memory: {})", cues.len(), memory_id_clone);
-                    }
-                }).await.unwrap();
-            }
-        }
-
-        Job::ReinforceMemories { project_id, memory_ids, cues } => {
+        Job::ReinforceMemories {
+            project_id,
+            memory_ids,
+            cues,
+        } => {
             if let Some(ctx) = provider.get_project(&project_id) {
                 // 1. Primary Reinforcement
-                debug!("Job: Starting reinforcement for {} memories", memory_ids.len());
+                debug!(
+                    "Job: Starting reinforcement for {} memories",
+                    memory_ids.len()
+                );
                 for memory_id in &memory_ids {
                     // Use dynamic reinforcement logic (logarithmic saturation)
-                    ctx.main.reinforce_dynamic(memory_id, 1.0);
+                    ctx.main.reinforce_dynamic(*memory_id, 1.0);
                 }
-                
+
                 // 2. Ripple Effect (Retrieval-Induced Activation)
-                // If this reinforcement was triggered by a Recall (indicated by presence of cues?), 
+                // If this reinforcement was triggered by a Recall (indicated by presence of cues?),
                 // we "prime" related memories.
                 if !cues.is_empty() && !memory_ids.is_empty() {
                     let ctx_clone = ctx.clone();
                     // Take top 5 memory contents (limiter)
-                    let source_memories: Vec<String> = memory_ids.iter().take(5).cloned().collect();
-                    
+                    let source_memories: Vec<MemoryId> = memory_ids.iter().take(5).copied().collect();
+
                     // let project_id_clone = project_id.clone(); // Unused
 
                     tokio::task::spawn_blocking(move || {
-                        let mut ripple_targets: HashSet<String> = HashSet::new();
-                        
+                        let mut ripple_targets: HashSet<MemoryId> = HashSet::new();
+
                         // For each source memory, perform a lightweight recall
                         for mem_id in source_memories {
-                            if let Some(mem) = ctx_clone.main.get_memory(&mem_id) {
-                                let lang = mem.cues.iter()
+                            if let Some(mem) = ctx_clone.main.get_memory(mem_id) {
+                                let lang = mem
+                                    .cues
+                                    .iter()
                                     .find(|c| c.starts_with("lang:"))
                                     .map(|c| crate::nl::Language::from(c.as_str()))
                                     .unwrap_or(crate::nl::Language::Default);
                                 // Use content as query
-                                let content = mem.access_content(ctx_clone.main.get_master_key().as_deref()).unwrap_or_default();
+                                let content =
+                                    ctx_clone.main.read_memory_content(&mem).unwrap_or_default();
                                 let ripple_results = ctx_clone.main.recall_fast(
-                                    crate::nl::tokenize_to_cues_with_lang(&content, lang), 
-                                    10
+                                    crate::nl::tokenize_to_cues_with_lang(&content, lang),
+                                    10,
                                 );
-                                
+
                                 for res in ripple_results {
                                     // Don't boost the source itself again
                                     if res.memory_id != mem_id {
@@ -1132,83 +948,81 @@ async fn process_job(job: Job, provider: &Arc<dyn ProjectProvider>, metrics: &Op
                                 }
                             }
                         }
-                        
+
                         // Boost Tier 2 (Ripple) memories
                         if !ripple_targets.is_empty() {
-                            debug!("Job: [Ripple Effect] Priming {} related memories", ripple_targets.len());
+                            debug!(
+                                "Job: [Ripple Effect] Priming {} related memories",
+                                ripple_targets.len()
+                            );
                             for target_id in ripple_targets {
                                 // Smaller boost (0.5) for priming
-                                ctx_clone.main.reinforce_dynamic(&target_id, 0.5);
+                                ctx_clone.main.reinforce_dynamic(target_id, 0.5);
                             }
                         }
                     });
                 }
             }
         }
-        Job::ReinforceLexicon { project_id, memory_ids, cues } => {
+        Job::ReinforceLexicon {
+            project_id,
+            memory_ids,
+            cues,
+        } => {
             if let Some(ctx) = provider.get_project(&project_id) {
                 for memory_id in &memory_ids {
                     // Use tiered reinforcement logic (buckets)
-                    ctx.lexicon.reinforce_tiered(memory_id, 1);
+                    ctx.lexicon.reinforce_tiered(*memory_id, 1);
                 }
-                debug!("Job: Reinforced {} lexicon entries with {} cues", memory_ids.len(), cues.len());
-            }
-        }
-        Job::ConsolidateMemories { project_id } => {
-            if let Some(ctx) = provider.get_project(&project_id) {
-                info!("Starting autonomous consolidation for project '{}'", project_id);
-                let merged = ctx.main.consolidate_memories(0.9); // 90% overlap threshold
-                if !merged.is_empty() {
-                        info!("Consolidation: Merged {} overlapping groups in project '{}'", merged.len(), project_id);
-                        // Save snapshot after significant change
-                        if let Err(e) = provider.save_project(&project_id) {
-                            error!("Failed to save project '{}' after consolidation: {}", project_id, e);
-                        }
-                } else {
-                    info!("Consolidation: No overlapping memories found for '{}'", project_id);
-                }
+                debug!(
+                    "Job: Reinforced {} lexicon entries with {} cues",
+                    memory_ids.len(),
+                    cues.len()
+                );
             }
         }
         Job::UpdateMarketHeatmap { project_id } => {
             if let Some(ctx) = provider.get_project(&project_id) {
-                // Sync Lexicon Trending -> Market Heatmap
-                // 1. Get trending items (Top 1000?)
-                let trending = ctx.lexicon.get_trending_items(1000);
-                
+                // Sync recently reinforced main-memory cues -> Market Heatmap.
+                // This is driven by recall/reinforcement events, not by identity lexicon entries.
+                let trending = ctx.main.get_trending_cues(1000);
+
                 if !trending.is_empty() {
                     let mut map = ctx.market_heatmap.write().unwrap();
                     map.clear();
-                    
+
                     for (cue, velocity) in trending {
                         // Normalize velocity to 0.0 - 2.0 range
                         // Log10(1 + v) is a good start.
                         let score = (1.0 + velocity).log10() as f32;
-                        
+
                         // Cap at 2.0 to prevent runaway market override
                         let final_score = score.min(2.0);
-                        
+
                         if final_score > 0.1 {
-                            let clean_cue = cue.strip_prefix("cue:").unwrap_or(&cue).to_string();
-                            map.insert(clean_cue.clone(), final_score);
+                            map.insert(cue.clone(), final_score);
                             // Log top 10 cues contributing to heatmap
                             if map.len() <= 10 {
-                                debug!("Job: [Heatmap] Cue '{}' added (original id: '{}') with lift {:.2} (velocity={:.2})", clean_cue, cue, final_score, velocity);
+                                debug!("Job: [Heatmap] Cue '{}' added with lift {:.2} (velocity={:.2})", cue, final_score, velocity);
                             }
                         }
                     }
-                    
+
                     let total_cues = map.len();
                     let avg_lift = if total_cues > 0 {
                         map.values().sum::<f32>() / total_cues as f32
                     } else {
                         0.0
                     };
-                    
+
                     debug!("Job: Updated Market Heatmap for '{}' with {} active cues (avg lift: {:.2})", project_id, total_cues, avg_lift);
                 } else {
-                    debug!("Job: No trending cues found for project '{}', heatmap unchanged", project_id);
+                    debug!(
+                        "Job: No trending cues found for project '{}', heatmap unchanged",
+                        project_id
+                    );
                 }
             }
         }
-        }
     }
+}
