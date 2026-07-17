@@ -90,6 +90,10 @@ impl MultiTenantEngine {
         config: crate::config::ServerConfig,
         snapshots_dir: PathBuf,
     ) -> Self {
+        if let Err(e) = fs::create_dir_all(&snapshots_dir) {
+            eprintln!("Warning: Failed to create snapshots directory: {}", e);
+        }
+
         Self {
             projects: Arc::new(DashMap::with_hasher(RandomState::new())),
             snapshots_dir,

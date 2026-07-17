@@ -89,6 +89,16 @@ impl ServerConfig {
                 config.server.port = p;
             }
         }
+        if let Ok(data_dir) = env::var("CUEMAP_DATA_DIR") {
+            if !data_dir.trim().is_empty() {
+                config.server.data_dir = data_dir;
+            }
+        }
+        if let Ok(snapshot_interval) = env::var("CUEMAP_SNAPSHOT_INTERVAL_SECONDS") {
+            if let Ok(seconds) = snapshot_interval.parse() {
+                config.persistence.snapshot_interval_seconds = seconds;
+            }
+        }
         if let Ok(key) = env::var("CUEMAP_SECRET_KEY") {
             config.security.secret_key = Some(key);
         }

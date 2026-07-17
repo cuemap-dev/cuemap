@@ -2,6 +2,13 @@
 
 All notable changes to the CueMap Rust Engine will be documented in this file.
 
+## [0.7.1] - 2026-07-17
+
+### Fixed
+- **Native npm Packages**: Bundled the compiled English tokenizer and added a package launcher so installed engine binaries resolve runtime assets without external setup.
+- **Linux Compatibility**: Built the Linux x64 package on Debian Bookworm and switched HTTP TLS to rustls, removing the runtime OpenSSL dependency and avoiding a too-new glibc baseline.
+- **Container Runtime**: Consolidated the production Docker build, added checksum-pinned tokenizer assets, non-root execution, health checks, and writable snapshot directories.
+
 ## [0.7.0] - 2026-05-19
 
 ### Added

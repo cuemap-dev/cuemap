@@ -1,4 +1,5 @@
 target/
+dist/
 *.rs.bk
 .DS_Store
 .env
@@ -10,3 +11,4 @@ data/reports/
 data/snapshots/
 tests/data/
 snapshots/
+scripts/

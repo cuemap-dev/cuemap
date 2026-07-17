@@ -31,14 +31,27 @@ cargo build --release
 cargo run -- start
 ```
 
-CueMap treats the nlprule tokenizer as a runtime asset, not a build artifact. Set `TOKENIZER_PATH` to a tokenizer `.bin` file or an nlprule language directory, or place `en_tokenizer.bin` under `~/.cuemap/data`. The repository and production Docker image include `data/nlprule/en` for this purpose.
+CueMap treats the nlprule tokenizer as a runtime asset, not a build artifact. Set `TOKENIZER_PATH` to a compiled tokenizer `.bin` file, or place `en_tokenizer.bin` under `~/.cuemap/data`. The production Docker image downloads the same checksum-pinned tokenizer used by the install script and packages it at `/app/assets/en_tokenizer.bin`.
 
 ### Docker
 
 ```bash
-docker build -f Dockerfile.production -t cuemap/engine .
-docker run -p 8080:8080 -v "$(pwd)/local_snapshot_dir:/app/data" cuemap/engine
+docker build -t cuemap/engine:0.7.1 .
+docker run -p 8080:8080 -v "$(pwd)/local_snapshot_dir:/app/data" cuemap/engine:0.7.1
 ```
+
+The container runs as the unprivileged `cuemap` user. Ensure a bind-mounted data directory is writable by UID/GID `10001`, or use a Docker-managed volume. Runtime defaults can be overridden with `CUEMAP_PORT`, `CUEMAP_DATA_DIR`, `CUEMAP_SNAPSHOT_INTERVAL_SECONDS`, `TOKENIZER_PATH`, and `RUST_LOG`.
+
+### Native npm packages
+
+Build the Darwin ARM64, Darwin x64, and Linux x64 native packages without publishing them:
+
+```bash
+./scripts/build-npm-native-packages.sh
+./scripts/verify-npm-native-packages.sh
+```
+
+The packager builds Linux on Debian Bookworm for an older glibc baseline, bundles the checksum-pinned tokenizer, and writes package tarballs plus `SHA256SUMS` under `dist/npm-native/tarballs`.
 
 ### CLI Commands
 

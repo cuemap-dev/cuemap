@@ -264,15 +264,24 @@ fn get_nlprule_tokenizer() -> Option<&'static nlprule::Tokenizer> {
             }
         }
 
-        // 2. Try to load from the Cuemap base directory or repo path
+        // 2. Try conventional install and package-relative locations.
         let base_dir = crate::config::get_base_dir();
-        let possible_paths = [
+        let mut possible_paths = vec![
             base_dir.join("en_tokenizer.bin"),
             base_dir.join("data").join("en_tokenizer.bin"),
-            // Repo paths (for development)
-            std::path::PathBuf::from("data/nlprule/en"),
-            std::path::PathBuf::from("rust_engine/data/nlprule/en"),
         ];
+
+        if let Ok(executable) = std::env::current_exe() {
+            if let Some(binary_dir) = executable.parent() {
+                // Docker layout: /app/cuemap + /app/assets/en_tokenizer.bin
+                possible_paths.push(binary_dir.join("assets").join("en_tokenizer.bin"));
+
+                // Native npm layout: package/bin/cuemap-native + package/assets/en_tokenizer.bin
+                if let Some(package_dir) = binary_dir.parent() {
+                    possible_paths.push(package_dir.join("assets").join("en_tokenizer.bin"));
+                }
+            }
+        }
 
         for tokenizer_path in possible_paths {
             if !tokenizer_path.exists() {
@@ -290,6 +299,9 @@ fn get_nlprule_tokenizer() -> Option<&'static nlprule::Tokenizer> {
             }
         }
 
+        tracing::warn!(
+            "No nlprule tokenizer found; lemmatization will be limited. Set TOKENIZER_PATH to en_tokenizer.bin"
+        );
         None
     }).as_ref()
 }
