@@ -24,6 +24,25 @@ impl Watcher {
         let watcher_plugin = move |res: notify::Result<Event>| {
             match res {
                 Ok(event) => {
+                    if event
+                        .paths
+                        .iter()
+                        .any(|path| Ingester::is_ignore_config_path(path))
+                    {
+                        let ingester = tx_ingester.clone();
+                        let state_file = tx_state_file.clone();
+                        handle.spawn(async move {
+                            let mut locked = ingester.lock().await;
+                            if let Err(e) = locked.reload_filters_and_rescan().await {
+                                error!("Error reloading ignore configuration: {}", e);
+                            }
+                            if let Some(ref sp) = state_file {
+                                let _ = locked.save_state(sp);
+                            }
+                        });
+                        return;
+                    }
+
                     if event.kind.is_remove() {
                         for path in event.paths {
                             let ingester = tx_ingester.clone();

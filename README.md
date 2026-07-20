@@ -430,7 +430,8 @@ curl -X POST http://localhost:8080/memories \
   -d '{
     "content": "API Rate Limit Policy: 1000/min",
     "cues": ["api", "rate_limit", "policy"],
-    "source_key": "doc:api-rate-limit-policy"
+    "source_key": "doc:api-rate-limit-policy",
+    "event_time": 1704067200.25
   }'
 
 # Deterministic cues are extracted from content when `cues` is omitted or empty
@@ -441,6 +442,8 @@ curl -X POST http://localhost:8080/memories \
     "content": "The payments service is down due to a timeout."
   }'
 ```
+
+`source_key` makes ingestion idempotent: adding the same source again updates its existing memory. `event_time` is the original event time as Unix seconds and defaults to ingestion time. Importers may instead provide `metadata.source_timestamp` as Unix seconds or RFC 3339; an explicit `event_time` takes precedence.
 
 ### Recall Memories
 

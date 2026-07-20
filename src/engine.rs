@@ -1018,6 +1018,55 @@ where
         cuepack_selection: Option<&[String]>,
         source_key: Option<String>,
     ) -> MemoryId {
+        self.add_memory_with_cuepacks_source_key_and_event_time(
+            content,
+            cues,
+            metadata,
+            stats,
+            disable_temporal_chunking,
+            cuepacks,
+            cuepack_selection,
+            source_key,
+            None,
+        )
+    }
+
+    pub fn add_memory_with_cuepacks_and_event_time(
+        &self,
+        content: String,
+        cues: Vec<String>,
+        metadata: Option<HashMap<String, serde_json::Value>>,
+        stats: T,
+        disable_temporal_chunking: bool,
+        cuepacks: &crate::cuepacks::CuePackRegistry,
+        cuepack_selection: Option<&[String]>,
+        event_time: Option<f64>,
+    ) -> MemoryId {
+        self.add_memory_with_cuepacks_source_key_and_event_time(
+            content,
+            cues,
+            metadata,
+            stats,
+            disable_temporal_chunking,
+            cuepacks,
+            cuepack_selection,
+            None,
+            event_time,
+        )
+    }
+
+    fn add_memory_with_cuepacks_source_key_and_event_time(
+        &self,
+        content: String,
+        cues: Vec<String>,
+        metadata: Option<HashMap<String, serde_json::Value>>,
+        stats: T,
+        disable_temporal_chunking: bool,
+        cuepacks: &crate::cuepacks::CuePackRegistry,
+        cuepack_selection: Option<&[String]>,
+        source_key: Option<String>,
+        event_time: Option<f64>,
+    ) -> MemoryId {
         let cues = self.with_synchronous_facets(
             &content,
             metadata.as_ref(),
@@ -1041,6 +1090,9 @@ where
         let mut memory = Memory::new(payload, metadata);
         memory.id = memory_id;
         memory.source_key = source_key.clone();
+        if let Some(event_time) = event_time {
+            memory.created_at = event_time;
+        }
 
         // Store cues in memory
         memory.cues = cues.clone();
@@ -1080,7 +1132,10 @@ where
                 0.0
             };
 
-            if time_diff < 300.0 && overlap_ratio > 0.5 && !disable_temporal_chunking {
+            if (0.0..300.0).contains(&time_diff)
+                && overlap_ratio > 0.5
+                && !disable_temporal_chunking
+            {
                 let episode_cue = format!("episode:{}", last_id);
                 memory.cues.push(episode_cue.clone());
             }
@@ -1217,12 +1272,42 @@ where
         reinforce: bool,
         overwrite_cues: bool,
     ) -> MemoryId {
+        self.upsert_memory_with_source_key_and_options(
+            source_key,
+            content,
+            cues,
+            metadata,
+            stats,
+            reinforce,
+            overwrite_cues,
+            true,
+            crate::cuepacks::default_registry(),
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_memory_with_source_key_and_options(
+        &self,
+        source_key: String,
+        content: String,
+        cues: Vec<String>,
+        metadata: Option<HashMap<String, serde_json::Value>>,
+        stats: Option<T>,
+        reinforce: bool,
+        overwrite_cues: bool,
+        disable_temporal_chunking: bool,
+        cuepacks: &crate::cuepacks::CuePackRegistry,
+        cuepack_selection: Option<&[String]>,
+        event_time: Option<f64>,
+    ) -> MemoryId {
         let cues = self.with_synchronous_facets(
             &content,
             metadata.as_ref(),
             cues,
-            crate::cuepacks::default_registry(),
-            None,
+            cuepacks,
+            cuepack_selection,
         );
 
         if let Some(existing_id) = self.source_key_to_id.get(&source_key).map(|entry| *entry) {
@@ -1259,6 +1344,9 @@ where
                     }
                     if let Some(s) = stats.clone() {
                         memory.stats = s;
+                    }
+                    if let Some(event_time) = event_time {
+                        memory.created_at = event_time;
                     }
                     memory.source_key = Some(source_key.clone());
                     // We need to drop lock before attach/overwrite ops to avoid deadlocks
@@ -1313,18 +1401,62 @@ where
         let mut memory = Memory::new(payload, metadata);
         memory.id = memory_id;
         memory.source_key = Some(source_key.clone());
+        if let Some(event_time) = event_time {
+            memory.created_at = event_time;
+        }
         memory.cues = cues.clone();
+
+        if self.config.server.store_content_on_disk {
+            let path = self
+                .get_disk_content_dir()
+                .join(format!("{}.bin", memory.id));
+            if let Err(error) = std::fs::write(&path, &memory.content) {
+                tracing::error!("Failed to write memory content to disk: {}", error);
+            } else {
+                memory.content = Vec::new();
+                memory.disk_backed = true;
+            }
+        }
+
+        let project_id = memory
+            .metadata
+            .get("project_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("default")
+            .to_string();
+        if let Some(last_event) = self.last_events.get(&project_id) {
+            let (last_id, last_time, last_cues) = last_event.clone();
+            let time_diff = memory.created_at - last_time;
+            let overlap = memory.cues.iter().filter(|cue| last_cues.contains(cue)).count();
+            let overlap_ratio = if memory.cues.is_empty() {
+                0.0
+            } else {
+                (overlap as f64) / (memory.cues.len() as f64)
+            };
+
+            if (0.0..300.0).contains(&time_diff)
+                && overlap_ratio > 0.5
+                && !disable_temporal_chunking
+            {
+                memory.cues.push(format!("episode:{}", last_id));
+            }
+        }
         memory.scoring_features = compute_memory_scoring_features(&memory.cues);
         if let Some(s) = stats {
             memory.stats = s;
         }
+        let indexed_cues = memory.cues.clone();
         let source_order_link = Self::source_order_link_for_memory(&memory);
+        self.last_events.insert(
+            project_id,
+            (memory_id, memory.created_at, memory.cues.clone()),
+        );
 
         if self.memories.insert(memory_id, memory).is_none() {
             self.memory_count.fetch_add(1, Ordering::Relaxed);
         }
         self.source_key_to_id.insert(source_key, memory_id);
-        self.index_memory_cues(memory_id, &cues);
+        self.index_memory_cues(memory_id, &indexed_cues);
         if let Some((session, order)) = source_order_link {
             self.add_source_order_entry(session, order, memory_id);
         }

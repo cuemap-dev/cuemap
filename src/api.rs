@@ -27,6 +27,9 @@ pub struct AddMemoryRequest {
     pub cues: Vec<String>,
     #[serde(default)]
     pub source_key: Option<String>,
+    /// Original event timestamp as Unix seconds. When omitted, ingestion time is used.
+    #[serde(default)]
+    pub event_time: Option<f64>,
     #[serde(default)]
     pub metadata: Option<HashMap<String, serde_json::Value>>,
     #[serde(default)]
@@ -3743,6 +3746,19 @@ pub struct CreateProjectRequest {
 pub struct SetWatchDirRequest {
     pub watch_dir: String,
     #[serde(default)]
+    pub included_paths: Option<Vec<String>>,
+    #[serde(default)]
+    pub ignored_patterns: Option<Vec<String>>,
+    #[serde(default)]
+    pub ignored_extensions: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PreviewDirectoryRequest {
+    pub watch_dir: String,
+    #[serde(default)]
+    pub included_paths: Option<Vec<String>>,
+    #[serde(default)]
     pub ignored_patterns: Option<Vec<String>>,
     #[serde(default)]
     pub ignored_extensions: Option<Vec<String>>,
@@ -3814,7 +3830,10 @@ pub fn routes(
             get(project_artifacts).post(reload_project_artifacts),
         )
         .route("/projects/:id/export", get(export_project))
-        .route("/projects/:id/watch-dir", post(set_project_watch_dir))
+        .route(
+            "/projects/:id/watch-dir",
+            get(get_project_watch_dir).post(set_project_watch_dir),
+        )
         .route("/aliases", post(add_alias).get(get_aliases))
         .route("/aliases/merge", post(merge_aliases))
         .route("/lexicon/inspect/:cue", get(lexicon_inspect))
@@ -3824,6 +3843,7 @@ pub fn routes(
         .route("/ingest/url", post(ingest_url))
         .route("/ingest/content", post(ingest_content))
         .route("/ingest/file", post(ingest_file))
+        .route("/ingest/directory/preview", post(preview_directory))
         .route("/jobs/status", get(jobs_status))
         .route("/debug/analyze-text", post(debug_analyze_text))
         .route("/metrics", get(prometheus_metrics))
@@ -3860,7 +3880,8 @@ async fn root() -> impl IntoResponse {
     Json(serde_json::json!({
         "name": "CueMap Rust Engine",
         "version": env!("CARGO_PKG_VERSION"),
-        "description": "High-performance Temporal-Associative Memory Store"
+        "description": "High-performance Temporal-Associative Memory Store",
+        "capabilities": ["repository_ingestion_scope_v1"]
     }))
 }
 
@@ -3894,6 +3915,26 @@ fn extract_project_id_optional(headers: &HeaderMap) -> Option<String> {
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
         .filter(|s| validate_project_id(s))
+}
+
+fn source_event_time(
+    explicit: Option<f64>,
+    metadata: Option<&HashMap<String, serde_json::Value>>,
+) -> Option<f64> {
+    if explicit.is_some() {
+        return explicit;
+    }
+
+    let value = metadata?.get("source_timestamp")?;
+    if let Some(timestamp) = value.as_f64() {
+        return (timestamp.is_finite() && timestamp >= 0.0).then_some(timestamp);
+    }
+
+    let parsed = chrono::DateTime::parse_from_rfc3339(value.as_str()?).ok()?;
+    Some(
+        parsed.timestamp() as f64
+            + f64::from(parsed.timestamp_subsec_nanos()) / 1_000_000_000.0,
+    )
 }
 
 async fn store_memory_request(
@@ -3938,6 +3979,7 @@ async fn store_memory_request(
         content,
         cues,
         source_key,
+        event_time,
         metadata,
         cuepacks,
         disable_temporal_chunking,
@@ -3945,6 +3987,16 @@ async fn store_memory_request(
         minimal_response: _,
         trace_timing: _,
     } = req;
+
+    if event_time.is_some_and(|timestamp| !timestamp.is_finite() || timestamp < 0.0) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "error": "event_time must be a finite, non-negative Unix timestamp in seconds"
+            }),
+        ));
+    }
+    let event_time = source_event_time(event_time, metadata.as_ref());
 
     phase_start = Instant::now();
     let mut initial_cues = cues;
@@ -3994,16 +4046,32 @@ async fn store_memory_request(
 
     phase_start = Instant::now();
     let cuepack_selection = cuepacks.as_deref();
-    let memory_id = ctx.main.add_memory_with_cuepacks_and_source_key(
-        content,
-        report.accepted,
-        metadata,
-        MainStats::default(),
-        disable_temporal_chunking,
-        &state.cuepack_registry,
-        cuepack_selection,
-        source_key,
-    );
+    let memory_id = if let Some(source_key) = source_key {
+        ctx.main.upsert_memory_with_source_key_and_options(
+            source_key,
+            content,
+            report.accepted,
+            metadata,
+            None,
+            false,
+            true,
+            disable_temporal_chunking,
+            &state.cuepack_registry,
+            cuepack_selection,
+            event_time,
+        )
+    } else {
+        ctx.main.add_memory_with_cuepacks_and_event_time(
+            content,
+            report.accepted,
+            metadata,
+            MainStats::default(),
+            disable_temporal_chunking,
+            &state.cuepack_registry,
+            cuepack_selection,
+            event_time,
+        )
+    };
     if trace_timing {
         timing.insert(
             "engine_add_ms".to_string(),
@@ -5818,6 +5886,123 @@ async fn export_project(
     )
 }
 
+fn normalize_included_paths(paths: Option<Vec<String>>) -> Result<Vec<String>, String> {
+    let mut normalized = Vec::new();
+    for raw_path in paths.unwrap_or_default() {
+        let candidate = raw_path.trim().replace('\\', "/");
+        let candidate = candidate.trim_matches('/');
+        if candidate.is_empty() || candidate == "." {
+            return Ok(Vec::new());
+        }
+
+        let mut components = Vec::new();
+        for component in std::path::Path::new(candidate).components() {
+            match component {
+                std::path::Component::Normal(value) => {
+                    components.push(value.to_string_lossy().to_string())
+                }
+                std::path::Component::CurDir => {}
+                _ => {
+                    return Err(format!(
+                        "Included path '{}' must stay within the watch directory",
+                        raw_path
+                    ))
+                }
+            }
+        }
+        if !components.is_empty() {
+            normalized.push(components.join("/"));
+        }
+    }
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
+}
+
+fn normalize_ignored_extensions(extensions: Option<Vec<String>>) -> Vec<String> {
+    let mut normalized: Vec<String> = extensions
+        .unwrap_or_default()
+        .into_iter()
+        .map(|extension| extension.trim().trim_start_matches('.').to_lowercase())
+        .filter(|extension| !extension.is_empty())
+        .collect();
+    normalized.sort();
+    normalized.dedup();
+    normalized
+}
+
+async fn preview_directory(
+    State(state): State<EngineState>,
+    Json(req): Json<PreviewDirectoryRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let watch_dir = match std::fs::canonicalize(&req.watch_dir) {
+        Ok(path) if path.is_dir() => path.to_string_lossy().to_string(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("Directory '{}' does not exist", req.watch_dir)
+                })),
+            )
+        }
+    };
+    let included_paths = match normalize_included_paths(req.included_paths) {
+        Ok(paths) => paths,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": error})),
+            )
+        }
+    };
+    let config = crate::agent::AgentConfig {
+        project_id: "directory-preview".to_string(),
+        watch_dir,
+        throttle_ms: 0,
+        state_file: None,
+        included_paths,
+        ignored_patterns: req.ignored_patterns.unwrap_or_default(),
+        ignored_extensions: normalize_ignored_extensions(req.ignored_extensions),
+    };
+    let ingester = crate::agent::ingester::Ingester::new(config, state.job_queue);
+
+    match ingester.preview_scope() {
+        Ok(preview) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(preview).unwrap_or_else(|error| {
+                serde_json::json!({"error": format!("Failed to serialize preview: {}", error)})
+            })),
+        ),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": error})),
+        ),
+    }
+}
+
+async fn get_project_watch_dir(
+    State(state): State<EngineState>,
+    Path(project_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match state.mt_engine.load_project_meta(&project_id) {
+        Ok(meta) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "project_id": project_id,
+                "initialized": meta.agent_enabled && meta.watch_dir.is_some(),
+                "watch_dir": meta.watch_dir,
+                "included_paths": meta.included_paths,
+                "ignored_patterns": meta.ignored_patterns,
+                "ignored_extensions": meta.ignored_extensions,
+            })),
+        ),
+        Err(error) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": error})),
+        ),
+    }
+}
+
 async fn set_project_watch_dir(
     State(state): State<EngineState>,
     Path(project_id): Path<String>,
@@ -5827,6 +6012,7 @@ async fn set_project_watch_dir(
         mt_engine,
         read_only,
         agent_manager,
+        data_dir,
         ..
     } = state;
 
@@ -5839,19 +6025,50 @@ async fn set_project_watch_dir(
         );
     }
 
-    match mt_engine.set_project_watch_dir(&project_id, Some(req.watch_dir.clone())) {
+    let watch_dir = match std::fs::canonicalize(&req.watch_dir) {
+        Ok(path) if path.is_dir() => path.to_string_lossy().to_string(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("Directory '{}' does not exist", req.watch_dir)
+                })),
+            )
+        }
+    };
+    let included_paths = match normalize_included_paths(req.included_paths) {
+        Ok(paths) => paths,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": error})),
+            )
+        }
+    };
+    let ignored_patterns = req.ignored_patterns.unwrap_or_default();
+    let ignored_extensions = normalize_ignored_extensions(req.ignored_extensions);
+
+    match mt_engine.set_project_watch_config(
+        &project_id,
+        watch_dir.clone(),
+        included_paths.clone(),
+        ignored_patterns.clone(),
+        ignored_extensions.clone(),
+    ) {
         Ok(_) => {
             // Immediately start/update the agent
             let agent_config = crate::agent::AgentConfig {
                 project_id: project_id.clone(),
-                watch_dir: req.watch_dir.clone(),
+                watch_dir: watch_dir.clone(),
                 throttle_ms: 100, // Small throttle to prevent CPU pinning
-                state_file: Some(std::path::PathBuf::from(format!(
-                    "./snapshots/{}_agent_state.json",
-                    project_id
-                ))),
-                ignored_patterns: req.ignored_patterns.unwrap_or_default(),
-                ignored_extensions: req.ignored_extensions.unwrap_or_default(),
+                state_file: Some(
+                    std::path::PathBuf::from(data_dir)
+                        .join("snapshots")
+                        .join(format!("{}_agent_state.json", project_id)),
+                ),
+                included_paths: included_paths.clone(),
+                ignored_patterns: ignored_patterns.clone(),
+                ignored_extensions: ignored_extensions.clone(),
             };
 
             // Spawn the starting of the agent securely
@@ -5866,7 +6083,11 @@ async fn set_project_watch_dir(
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "status": "updated",
-                    "project_id": project_id
+                    "project_id": project_id,
+                    "watch_dir": watch_dir,
+                    "included_paths": included_paths,
+                    "ignored_patterns": ignored_patterns,
+                    "ignored_extensions": ignored_extensions,
                 })),
             )
         }
@@ -6408,6 +6629,7 @@ async fn recall_web(
         watch_dir: String::new(),
         throttle_ms: 0,
         state_file: None,
+        included_paths: Vec::new(),
         ignored_patterns: Vec::new(),
         ignored_extensions: Vec::new(),
     };
@@ -6552,6 +6774,7 @@ async fn recall_web(
                 watch_dir: String::new(),
                 throttle_ms: 0,
                 state_file: None,
+                included_paths: Vec::new(),
                 ignored_patterns: Vec::new(),
                 ignored_extensions: Vec::new(),
             };
@@ -6639,6 +6862,7 @@ async fn ingest_url(
         watch_dir: String::new(), // Not used for API-driven ingestion
         throttle_ms: 0,
         state_file: None,
+        included_paths: Vec::new(),
         ignored_patterns: Vec::new(),
         ignored_extensions: Vec::new(),
     };
@@ -6976,6 +7200,7 @@ async fn ingest_content(
         watch_dir: String::new(),
         throttle_ms: 0,
         state_file: None,
+        included_paths: Vec::new(),
         ignored_patterns: Vec::new(),
         ignored_extensions: Vec::new(),
     };
@@ -7563,6 +7788,21 @@ mod tests {
     use crate::taxonomy::Taxonomy;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[test]
+    fn source_event_time_prefers_explicit_and_reads_structured_metadata() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "source_timestamp".to_string(),
+            serde_json::json!("2024-01-01T00:00:00.250Z"),
+        );
+
+        assert_eq!(source_event_time(Some(42.0), Some(&metadata)), Some(42.0));
+        assert_eq!(
+            source_event_time(None, Some(&metadata)),
+            Some(1_704_067_200.25)
+        );
+    }
 
     fn recall_result(
         match_integrity: f64,

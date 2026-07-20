@@ -788,8 +788,9 @@ async fn run_server(config: config::ServerConfig, load_static: Option<String>, _
                                 .join("snapshots")
                                 .join(format!("{}_agent_state.json", meta.project_id)),
                         ),
-                        ignored_patterns: Vec::new(),
-                        ignored_extensions: Vec::new(),
+                        included_paths: meta.included_paths,
+                        ignored_patterns: meta.ignored_patterns,
+                        ignored_extensions: meta.ignored_extensions,
                     };
                     agent_manager
                         .start_agent(&meta.project_id, agent_config)
@@ -981,6 +982,7 @@ async fn handle_add(args: AddArgs) {
     let payload = api::AddMemoryRequest {
         content: args.content,
         source_key: None,
+        event_time: None,
         metadata: args
             .metadata
             .map(|m| serde_json::from_str(&m).unwrap_or_default()),

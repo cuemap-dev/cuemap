@@ -75,6 +75,49 @@ fn test_source_key_upsert_reuses_numeric_id() {
 }
 
 #[test]
+fn test_historical_source_upsert_preserves_event_time_and_is_idempotent() {
+    let engine = CueMapEngine::new();
+    let event_time = 1_704_067_200.25;
+    let first = engine.upsert_memory_with_source_key_and_options(
+        "openclaw:agent-1:session-1:message-1".to_string(),
+        "The deployment moved to Friday".to_string(),
+        vec!["deployment".to_string()],
+        None,
+        Some(MainStats::default()),
+        false,
+        true,
+        false,
+        cuemap::cuepacks::default_registry(),
+        None,
+        Some(event_time),
+    );
+    assert!(engine.reinforce_memory(first, vec!["deployment".to_string()]));
+    let second = engine.upsert_memory_with_source_key_and_options(
+        "openclaw:agent-1:session-1:message-1".to_string(),
+        "The deployment moved to next Friday".to_string(),
+        vec!["deployment".to_string()],
+        None,
+        None,
+        false,
+        true,
+        false,
+        cuemap::cuepacks::default_registry(),
+        None,
+        Some(event_time + 60.0),
+    );
+
+    assert_eq!(first, second);
+    assert_eq!(engine.total_memories(), 1);
+    let memory = engine.get_memory(first).unwrap();
+    assert_eq!(memory.created_at, event_time + 60.0);
+    assert_eq!(memory.stats.reinforcement_count, 1);
+    assert_eq!(
+        memory.source_key.as_deref(),
+        Some("openclaw:agent-1:session-1:message-1")
+    );
+}
+
+#[test]
 fn test_source_order_index_tracks_add_upsert_and_delete() {
     let engine = CueMapEngine::new();
     let mut metadata = HashMap::new();

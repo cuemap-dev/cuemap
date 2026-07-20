@@ -35,6 +35,12 @@ pub struct ProjectMeta {
     pub created_at: u64,
     pub watch_dir: Option<String>,
     pub agent_enabled: bool,
+    #[serde(default)]
+    pub included_paths: Vec<String>,
+    #[serde(default)]
+    pub ignored_patterns: Vec<String>,
+    #[serde(default)]
+    pub ignored_extensions: Vec<String>,
 }
 
 impl ProjectMeta {
@@ -47,6 +53,9 @@ impl ProjectMeta {
                 .as_secs(),
             watch_dir: None,
             agent_enabled: false,
+            included_paths: Vec::new(),
+            ignored_patterns: Vec::new(),
+            ignored_extensions: Vec::new(),
         }
     }
 }
@@ -454,6 +463,30 @@ impl MultiTenantEngine {
         self.save_project_meta(&meta)?;
 
         Ok(())
+    }
+
+    /// Persist the complete repository ingestion scope for a project.
+    pub fn set_project_watch_config(
+        &self,
+        project_id: &str,
+        watch_dir: String,
+        included_paths: Vec<String>,
+        ignored_patterns: Vec<String>,
+        ignored_extensions: Vec<String>,
+    ) -> Result<ProjectMeta, String> {
+        let path = Path::new(&watch_dir);
+        if !path.is_dir() {
+            return Err(format!("Directory '{}' does not exist", watch_dir));
+        }
+
+        let mut meta = self.load_project_meta(&project_id.to_string())?;
+        meta.watch_dir = Some(watch_dir);
+        meta.agent_enabled = true;
+        meta.included_paths = included_paths;
+        meta.ignored_patterns = ignored_patterns;
+        meta.ignored_extensions = ignored_extensions;
+        self.save_project_meta(&meta)?;
+        Ok(meta)
     }
 
     pub fn get_global_stats(&self) -> HashMap<String, serde_json::Value> {

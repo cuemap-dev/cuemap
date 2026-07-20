@@ -2,30 +2,119 @@ use crate::agent::chunker::Chunker;
 use crate::agent::AgentConfig;
 use crate::jobs::{Job, JobQueue, MemoryRef};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use ignore::Match;
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, info, warn};
+
+const DEFAULT_NOISE_PATTERNS: &[&str] = &[
+    // JS/TS
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "bun.lockb",
+    "tsconfig.json",
+    "node_modules/",
+    ".npmrc",
+    ".eslintcache",
+    ".next/",
+    ".nuxt/",
+    "bower_components/",
+    "__snapshots__/",
+    // Rust
+    "Cargo.lock",
+    "target/",
+    // Python
+    "poetry.lock",
+    "Pipfile.lock",
+    "__pycache__/",
+    "venv/",
+    ".venv/",
+    "env/",
+    ".env/",
+    ".pytest_cache/",
+    ".ipynb_checkpoints/",
+    "*.pyc",
+    "*.pyo",
+    "*.pyd",
+    // Go
+    "go.sum",
+    // Java/JVM
+    ".gradle/",
+    ".m2/",
+    "build/",
+    // PHP
+    "composer.lock",
+    // Ruby
+    "Gemfile.lock",
+    // iOS/macOS
+    "Pods/",
+    "DerivedData/",
+    "*.xcodeproj/",
+    "*.xcworkspace/",
+    // System & IDEs
+    ".DS_Store",
+    "Thumbs.db",
+    ".idea/",
+    ".vscode/",
+    ".history/",
+    ".git/",
+    ".svn/",
+    ".hg/",
+];
+const REPOSITORY_IGNORE_FILENAMES: &[&str] =
+    &[".gitignore", ".antigravityignore", ".cuemapignore"];
+const INGESTER_STATE_VERSION: u32 = 2;
 
 pub struct Ingester {
     config: AgentConfig,
     job_queue: Arc<JobQueue>,
     file_hashes: HashMap<String, String>, // path -> sha256
-    gitignore: Option<Gitignore>,
+    policy_ignore: Option<Gitignore>,
+    repository_ignores: Vec<Gitignore>,
     memory_hashes: HashMap<String, String>, // memory_id -> content_hash
     path_to_memories: HashMap<String, HashSet<String>>, // path -> set of current memory_ids
 }
 
 #[derive(Serialize, Deserialize, Default)]
 struct IngesterState {
+    #[serde(default)]
+    schema_version: u32,
     file_hashes: HashMap<String, String>,
     memory_hashes: HashMap<String, String>,
     path_to_memories: HashMap<String, HashSet<String>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DirectoryPreviewEntry {
+    pub path: String,
+    pub kind: String,
+    pub supported_files: usize,
+    pub bytes: u64,
+    pub categories: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DirectoryPreview {
+    pub watch_dir: String,
+    pub supported_files: usize,
+    pub bytes: u64,
+    pub entries: Vec<DirectoryPreviewEntry>,
+    pub scan_errors: usize,
+}
+
+#[derive(Default)]
+struct PreviewEntryAccumulator {
+    kind: String,
+    supported_files: usize,
+    bytes: u64,
+    categories: BTreeMap<String, usize>,
 }
 
 impl Ingester {
@@ -35,127 +124,8 @@ impl Ingester {
             .unwrap_or_else(|_| PathBuf::from(&config.watch_dir));
         debug!("Agent initializing with watch root: {:?}", watch_path);
 
-        // Prepare gitignore
-        let mut gitignore = None;
-        let mut builder = GitignoreBuilder::new(&watch_path);
-
-        // Search for all .*ignore files recursively in watch_dir
-        // AND its parents (walking up from watch_dir)
-        let mut found_any = false;
-
-        // 1. Walk UP from watch_dir to root
-        let mut current = Some(watch_path.as_path());
-        while let Some(p) = current {
-            if let Ok(entries) = fs::read_dir(p) {
-                for entry in entries.flatten() {
-                    let file_name = entry.file_name();
-                    let name_str = file_name.to_string_lossy();
-                    if name_str.starts_with('.') && name_str.ends_with("ignore") {
-                        let p_gi = entry.path();
-                        if let Some(err) = builder.add(&p_gi) {
-                            warn!("Error loading ignore file at {:?}: {}", p_gi, err);
-                        } else {
-                            found_any = true;
-                        }
-                    }
-                }
-            }
-            current = p.parent();
-        }
-
-        // 2. Walk DOWN from watch_dir (recursive)
-        for result in WalkBuilder::new(&watch_path)
-            .hidden(false)
-            .git_ignore(false)
-            .build()
-        {
-            if let Ok(entry) = result {
-                let file_name = entry.file_name();
-                let name_str = file_name.to_string_lossy();
-                if name_str.starts_with('.') && name_str.ends_with("ignore") {
-                    let p_gi = entry.path();
-                    if let Some(err) = builder.add(&p_gi) {
-                        warn!("Error loading ignore file at {:?}: {}", p_gi, err);
-                    } else {
-                        found_any = true;
-                    }
-                }
-            }
-        }
-
-        // Add default "noise" patterns
-        let default_noise = [
-            // JS/TS
-            "package-lock.json",
-            "yarn.lock",
-            "pnpm-lock.yaml",
-            "bun.lockb",
-            "tsconfig.json",
-            "node_modules/",
-            ".npmrc",
-            ".eslintcache",
-            ".next/",
-            ".nuxt/",
-            "bower_components/",
-            "__snapshots__/",
-            // Rust
-            "Cargo.lock",
-            "target/",
-            // Python
-            "poetry.lock",
-            "Pipfile.lock",
-            "__pycache__/",
-            "venv/",
-            ".venv/",
-            "env/",
-            ".env/",
-            ".pytest_cache/",
-            ".ipynb_checkpoints/",
-            "*.pyc",
-            "*.pyo",
-            "*.pyd",
-            // Go
-            "go.sum",
-            // Java/JVM
-            ".gradle/",
-            ".m2/",
-            "build/", // covers Gradle, target/ is in Rust but also Maven
-            // PHP
-            "composer.lock",
-            // Ruby
-            "Gemfile.lock",
-            // iOS/macOS
-            "Pods/",
-            "DerivedData/",
-            "*.xcodeproj/",
-            "*.xcworkspace/",
-            // System & IDEs
-            ".DS_Store",
-            "Thumbs.db",
-            ".idea/",
-            ".vscode/",
-            ".history/",
-            ".git/",
-            ".svn/",
-            ".hg/",
-        ];
-        for pattern in default_noise {
-            let _ = builder.add_line(None, pattern);
-        }
-
-        // Add custom patterns from config
-        for pattern in &config.ignored_patterns {
-            let _ = builder.add_line(None, pattern);
-        }
-
-        if found_any || !default_noise.is_empty() || !config.ignored_patterns.is_empty() {
-            match builder.build() {
-                Ok(gi) => gitignore = Some(gi),
-                Err(e) => warn!("Failed to build gitignore: {}", e),
-            }
-        } else {
-            debug!("No ignore files or patterns found");
-        }
+        let policy_ignore = Self::build_policy_ignore(&watch_path, &config.ignored_patterns);
+        let repository_ignores = Self::build_repository_ignores(&watch_path);
 
         let mut config = config;
         config.watch_dir = watch_path.to_string_lossy().to_string();
@@ -164,10 +134,121 @@ impl Ingester {
             config,
             job_queue,
             file_hashes: HashMap::new(),
-            gitignore,
+            policy_ignore,
+            repository_ignores,
             memory_hashes: HashMap::new(),
             path_to_memories: HashMap::new(),
         }
+    }
+
+    fn is_ignore_file(path: &Path) -> bool {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| REPOSITORY_IGNORE_FILENAMES.contains(&name))
+            .unwrap_or(false)
+    }
+
+    pub fn is_ignore_config_path(path: &Path) -> bool {
+        Self::is_ignore_file(path)
+    }
+
+    fn build_policy_ignore(watch_path: &Path, ignored_patterns: &[String]) -> Option<Gitignore> {
+        let mut builder = GitignoreBuilder::new(watch_path);
+
+        for pattern in DEFAULT_NOISE_PATTERNS {
+            let _ = builder.add_line(None, pattern);
+        }
+        for pattern in ignored_patterns {
+            let _ = builder.add_line(None, pattern);
+        }
+
+        match builder.build() {
+            Ok(gitignore) => Some(gitignore),
+            Err(error) => {
+                warn!("Failed to build gitignore: {}", error);
+                None
+            }
+        }
+    }
+
+    fn build_repository_ignores(watch_path: &Path) -> Vec<Gitignore> {
+        let mut directories = HashSet::new();
+
+        let mut current = Some(watch_path);
+        while let Some(directory) = current {
+            if REPOSITORY_IGNORE_FILENAMES
+                .iter()
+                .any(|name| directory.join(name).is_file())
+            {
+                directories.insert(directory.to_path_buf());
+            }
+            current = directory.parent();
+        }
+
+        for result in WalkBuilder::new(watch_path)
+            .hidden(false)
+            .git_ignore(true)
+            .build()
+        {
+            if let Ok(entry) = result {
+                let ignore_path = entry.path();
+                if Self::is_ignore_file(ignore_path) {
+                    if let Some(directory) = ignore_path.parent() {
+                        directories.insert(directory.to_path_buf());
+                    }
+                }
+            }
+        }
+
+        let mut directories: Vec<PathBuf> = directories.into_iter().collect();
+        directories.sort_by_key(|path| path.components().count());
+
+        directories
+            .into_iter()
+            .filter_map(|directory| {
+                let mut builder = GitignoreBuilder::new(&directory);
+                for filename in REPOSITORY_IGNORE_FILENAMES {
+                    let ignore_path = directory.join(filename);
+                    if ignore_path.is_file() {
+                        if let Some(error) = builder.add(&ignore_path) {
+                            warn!("Error loading ignore file at {:?}: {}", ignore_path, error);
+                        }
+                    }
+                }
+                match builder.build() {
+                    Ok(ignore) if !ignore.is_empty() => Some(ignore),
+                    Ok(_) => None,
+                    Err(error) => {
+                        warn!("Failed to build repository ignore matcher: {}", error);
+                        None
+                    }
+                }
+            })
+            .collect()
+    }
+
+    fn path_is_ignored(&self, path: &Path) -> bool {
+        if let Some(policy_ignore) = &self.policy_ignore {
+            if policy_ignore
+                .matched_path_or_any_parents(path, false)
+                .is_ignore()
+            {
+                return true;
+            }
+        }
+
+        for repository_ignore in self.repository_ignores.iter().rev() {
+            if !path.starts_with(repository_ignore.path()) {
+                continue;
+            }
+            match repository_ignore.matched_path_or_any_parents(path, false) {
+                Match::Ignore(_) => return true,
+                Match::Whitelist(_) => return false,
+                Match::None => {}
+            }
+        }
+
+        false
     }
 
     pub fn load_state(&mut self, state_path: &std::path::Path) -> Result<(), String> {
@@ -181,8 +262,17 @@ impl Ingester {
         let state: IngesterState = serde_json::from_str(&content)
             .map_err(|e| format!("Failed to parse agent state: {}", e))?;
 
-        self.file_hashes = state.file_hashes;
-        self.memory_hashes = state.memory_hashes;
+        if state.schema_version < INGESTER_STATE_VERSION {
+            debug!(
+                "Upgrading agent state from schema {} to {}; tracked files will be reingested",
+                state.schema_version, INGESTER_STATE_VERSION
+            );
+            self.file_hashes = HashMap::new();
+            self.memory_hashes = HashMap::new();
+        } else {
+            self.file_hashes = state.file_hashes;
+            self.memory_hashes = state.memory_hashes;
+        }
         self.path_to_memories = state.path_to_memories;
 
         debug!(
@@ -194,6 +284,7 @@ impl Ingester {
 
     pub fn save_state(&self, state_path: &std::path::Path) -> Result<(), String> {
         let state = IngesterState {
+            schema_version: INGESTER_STATE_VERSION,
             file_hashes: self.file_hashes.clone(),
             memory_hashes: self.memory_hashes.clone(),
             path_to_memories: self.path_to_memories.clone(),
@@ -212,13 +303,163 @@ impl Ingester {
         Ok(())
     }
 
+    fn path_is_selected(&self, path: &Path) -> bool {
+        if self.config.included_paths.is_empty() {
+            return true;
+        }
+
+        let Ok(relative) = path.strip_prefix(&self.config.watch_dir) else {
+            return false;
+        };
+
+        self.config.included_paths.iter().any(|included| {
+            let included_path = Path::new(included);
+            relative == included_path || relative.starts_with(included_path)
+        })
+    }
+
+    fn path_is_allowed(&self, path: &Path) -> bool {
+        if !path.is_file() || Chunker::detect_type(path).is_none() {
+            return false;
+        }
+
+        if Self::is_ignore_file(path) {
+            return false;
+        }
+
+        if let Some(ref state_path) = self.config.state_file {
+            let matches_state = fs::canonicalize(state_path)
+                .map(|canonical_state| canonical_state == path)
+                .unwrap_or_else(|_| state_path == path);
+            if matches_state {
+                return false;
+            }
+        }
+
+        let Ok(relative) = path.strip_prefix(&self.config.watch_dir) else {
+            return false;
+        };
+
+        if relative.components().any(|component| {
+            let name = component.as_os_str().to_string_lossy();
+            name.starts_with('.')
+                && name != "."
+                && name != ".."
+                && name != ".gitignore"
+                && name != ".cuemapignore"
+                && name != ".antigravityignore"
+        }) {
+            return false;
+        }
+
+        if !self.path_is_selected(path) {
+            return false;
+        }
+
+        if self.path_is_ignored(path) {
+            return false;
+        }
+
+        if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
+            if self
+                .config
+                .ignored_extensions
+                .iter()
+                .any(|ignored| ignored.eq_ignore_ascii_case(extension))
+            {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    pub fn preview_scope(&self) -> Result<DirectoryPreview, String> {
+        let mut entries: BTreeMap<String, PreviewEntryAccumulator> = BTreeMap::new();
+        let mut supported_files = 0usize;
+        let mut total_bytes = 0u64;
+        let mut scan_errors = 0usize;
+
+        let walker = WalkBuilder::new(&self.config.watch_dir)
+            .hidden(false)
+            .git_ignore(true)
+            .build();
+
+        for result in walker {
+            let entry = match result {
+                Ok(entry) => entry,
+                Err(error) => {
+                    scan_errors += 1;
+                    warn!("Directory preview walk error: {}", error);
+                    continue;
+                }
+            };
+            let path = match fs::canonicalize(entry.path()) {
+                Ok(path) if self.path_is_allowed(&path) => path,
+                _ => continue,
+            };
+            let Ok(relative) = path.strip_prefix(&self.config.watch_dir) else {
+                continue;
+            };
+
+            let mut components = relative.components();
+            let Some(first_component) = components.next() else {
+                continue;
+            };
+            let nested = components.next().is_some();
+            let key = if nested {
+                first_component.as_os_str().to_string_lossy().to_string()
+            } else {
+                relative.to_string_lossy().replace('\\', "/")
+            };
+            let kind = if nested { "directory" } else { "file" };
+            let bytes = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+            let category = format!("{:?}", Chunker::get_category_for_file(&path)).to_lowercase();
+
+            let aggregate = entries.entry(key).or_default();
+            aggregate.kind = kind.to_string();
+            aggregate.supported_files += 1;
+            aggregate.bytes += bytes;
+            *aggregate.categories.entry(category).or_default() += 1;
+            supported_files += 1;
+            total_bytes += bytes;
+        }
+
+        Ok(DirectoryPreview {
+            watch_dir: self.config.watch_dir.clone(),
+            supported_files,
+            bytes: total_bytes,
+            entries: entries
+                .into_iter()
+                .map(|(path, entry)| DirectoryPreviewEntry {
+                    path,
+                    kind: entry.kind,
+                    supported_files: entry.supported_files,
+                    bytes: entry.bytes,
+                    categories: entry.categories,
+                })
+                .collect(),
+            scan_errors,
+        })
+    }
+
+    pub async fn reload_filters_and_rescan(&mut self) -> Result<(), String> {
+        let watch_path = PathBuf::from(&self.config.watch_dir);
+        self.policy_ignore =
+            Self::build_policy_ignore(&watch_path, &self.config.ignored_patterns);
+        self.repository_ignores = Self::build_repository_ignores(&watch_path);
+        self.scan_all().await
+    }
+
     pub async fn scan_all(&mut self) -> Result<(), String> {
         debug!("Starting full scan of {}", self.config.watch_dir);
 
         let path_str = self.config.watch_dir.clone();
+        let mut eligible_paths = HashSet::new();
+        let mut walk_failed = false;
 
-        // Use ignore crate to respect .gitignore natively (for early pruning)
-        // All other .*ignore files are handled by our unified Gitignore check in process_file_path
+        // Use ignore crate to respect .gitignore natively for early pruning.
+        // CueMap-specific ignore files are evaluated with directory-scoped matchers.
         let walker = WalkBuilder::new(&path_str)
             .hidden(false)
             .git_ignore(true)
@@ -227,18 +468,34 @@ impl Ingester {
         for result in walker {
             match result {
                 Ok(entry) => {
-                    let path = entry.path();
-                    if path.is_file() {
-                        if let Err(_e) = self.process_file_path(path.to_path_buf()).await {
-                            // warn!("Failed to process {:?}: {}", path, e);
-                        }
-                        // Throttle
-                        if self.config.throttle_ms > 0 {
-                            sleep(Duration::from_millis(self.config.throttle_ms)).await;
-                        }
+                    let path = match fs::canonicalize(entry.path()) {
+                        Ok(path) if self.path_is_allowed(&path) => path,
+                        _ => continue,
+                    };
+                    eligible_paths.insert(path.to_string_lossy().to_lowercase());
+                    if let Err(error) = self.process_file_path(path.clone()).await {
+                        debug!("Skipping file {:?}: {}", path, error);
+                    }
+                    if self.config.throttle_ms > 0 {
+                        sleep(Duration::from_millis(self.config.throttle_ms)).await;
                     }
                 }
-                Err(err) => warn!("Walk error: {}", err),
+                Err(err) => {
+                    walk_failed = true;
+                    warn!("Walk error: {}", err);
+                }
+            }
+        }
+
+        if !walk_failed {
+            let stale_paths: Vec<String> = self
+                .file_hashes
+                .keys()
+                .filter(|path| !eligible_paths.contains(*path))
+                .cloned()
+                .collect();
+            for stale_path in stale_paths {
+                self.delete_tracked_path_key(&stale_path).await;
             }
         }
 
@@ -251,61 +508,9 @@ impl Ingester {
             .map_err(|e| format!("Failed to canonicalize path {:?}: {}", path, e))?;
         let path_str = path.to_string_lossy().to_string();
 
-        // 0. Ignore state file
-        if let Some(ref state_path) = self.config.state_file {
-            if let Ok(abs_path) = std::fs::canonicalize(&path) {
-                if let Ok(abs_state) = std::fs::canonicalize(state_path) {
-                    if abs_path == abs_state {
-                        debug!("Skipping agent state file: {}", path_str);
-                        return Ok(());
-                    }
-                } else {
-                    // If state file doesn't exist yet but paths match string-wise
-                    if path == *state_path {
-                        debug!("Skipping agent state file: {}", path_str);
-                        return Ok(());
-                    }
-                }
-            }
-        }
-
-        // 0.1 Hidden file check (only for files/dirs BELOW watch_dir)
-        if let Ok(rel) = path.strip_prefix(&self.config.watch_dir) {
-            if rel.components().any(|c| {
-                let s = c.as_os_str().to_string_lossy();
-                s.starts_with('.')
-                    && s != "."
-                    && s != ".."
-                    && s != ".gitignore"
-                    && s != ".cuemapignore"
-                    && s != ".antigravityignore"
-            }) {
-                debug!("Skipping hidden path: {}", path_str);
-                return Ok(());
-            }
-        }
-
-        // 0.1 Check Gitignore
-        if let Some(gi) = &self.gitignore {
-            // gi.matched_path_or_any_parents handles absolute paths by making them relative to the builder's root.
-            let match_result = gi.matched_path_or_any_parents(&path, path.is_dir());
-            if match_result.is_ignore() {
-                debug!("Skipping ignored file: {}", path_str);
-                return Ok(());
-            }
-        }
-
-        // 0.2 Check custom ignored extensions
-        if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-            if self
-                .config
-                .ignored_extensions
-                .iter()
-                .any(|e| e.eq_ignore_ascii_case(ext))
-            {
-                debug!("Skipping blacklisted extension: {}", path_str);
-                return Ok(());
-            }
+        if !self.path_is_allowed(&path) {
+            debug!("Skipping out-of-scope or unsupported file: {}", path_str);
+            return Ok(());
         }
 
         // Standardize casing for case-insensitive filesystems (MacOS/Windows)
@@ -377,14 +582,34 @@ impl Ingester {
             self.memory_hashes.insert(memory_id.clone(), chunk_hash);
             session.expect_write();
 
+            let category = format!("{:?}", chunk.category).to_lowercase();
+            let mut structural_cues = chunk.structural_cues.clone();
+            structural_cues.push("source_type:repository_file".to_string());
+            structural_cues.push("source_channel:filesystem".to_string());
+
+            let mut metadata = HashMap::new();
+            metadata.insert(
+                "source_type".to_string(),
+                serde_json::json!("repository_file"),
+            );
+            metadata.insert(
+                "source_channel".to_string(),
+                serde_json::json!("filesystem"),
+            );
+            metadata.insert(
+                "source_path".to_string(),
+                serde_json::json!(path_str.clone()),
+            );
+            metadata.insert("source_category".to_string(), serde_json::json!(category));
+
             self.job_queue
                 .enqueue(Job::ExtractAndIngest {
                     project_id: project_id.clone(),
                     source_key: memory_id.clone(),
                     content: chunk.content.clone(),
                     file_path: path_norm.clone(),
-                    structural_cues: chunk.structural_cues.clone(),
-                    metadata: None,
+                    structural_cues,
+                    metadata: Some(metadata),
                     category: chunk.category,
                 })
                 .await;
@@ -420,25 +645,27 @@ impl Ingester {
         Ok(())
     }
 
+    async fn delete_tracked_path_key(&mut self, path_norm: &str) {
+        self.file_hashes.remove(path_norm);
+        if let Some(memories) = self.path_to_memories.remove(path_norm) {
+            for memory_id in memories {
+                self.memory_hashes.remove(&memory_id);
+                self.job_queue
+                    .enqueue(Job::DeleteMemory {
+                        project_id: self.config.project_id.clone(),
+                        memory_ref: MemoryRef::SourceKey(memory_id),
+                    })
+                    .await;
+            }
+        }
+    }
+
     pub async fn delete_file_path(&mut self, path: PathBuf) -> Result<(), String> {
         let path_str = path.to_string_lossy().to_string();
         let path_norm = path_str.to_lowercase();
         debug!("Processing deletion: {}", path_str);
 
-        // Remove from tracking
-        self.file_hashes.remove(&path_norm);
-        if let Some(mems) = self.path_to_memories.remove(&path_norm) {
-            for m_id in mems {
-                self.memory_hashes.remove(&m_id);
-                // Explicitly delete from engine
-                self.job_queue
-                    .enqueue(Job::DeleteMemory {
-                        project_id: self.config.project_id.clone(),
-                        memory_ref: MemoryRef::SourceKey(m_id),
-                    })
-                    .await;
-            }
-        }
+        self.delete_tracked_path_key(&path_norm).await;
 
         Ok(())
     }

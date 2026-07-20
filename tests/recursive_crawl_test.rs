@@ -70,6 +70,7 @@ async fn test_recursive_crawl_depth_1() {
         watch_dir: String::new(),
         throttle_ms: 100, // Throttle to be polite
         state_file: None,
+        included_paths: Vec::new(),
         ignored_patterns: Vec::new(),
         ignored_extensions: Vec::new(),
     };
@@ -153,6 +154,7 @@ async fn test_job_phase_ordering() {
         watch_dir: String::new(),
         throttle_ms: 0,
         state_file: None,
+        included_paths: Vec::new(),
         ignored_patterns: Vec::new(),
         ignored_extensions: Vec::new(),
     };

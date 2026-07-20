@@ -2,6 +2,12 @@
 
 All notable changes to the CueMap Rust Engine will be documented in this file.
 
+## [0.7.2] - 2026-07-19
+
+### Fixed
+- **Native npm Publishing**: Updated the GitHub Actions publisher to ship the checksum-verified tokenizer and package launcher on every supported platform, matching the local release packager.
+- **Snapshot Coverage**: Added regression coverage for periodically persisting projects created after the snapshot scheduler starts.
+
 ## [0.7.1] - 2026-07-17
 
 ### Fixed
