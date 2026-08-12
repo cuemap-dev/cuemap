@@ -31,6 +31,16 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
+      - name: Install nlprule tokenizer
+        env:
+          TOKENIZER_URL: https://cuemap.dev/assets/en_tokenizer.bin.gz
+          TOKENIZER_SHA256: f54fd31ec463f8646d0239bb531a64e0210ed1ae02bf5e3b42aeeb9bff8305ba
+        run: |
+          curl -fsSL --retry 3 "${TOKENIZER_URL}" -o "${RUNNER_TEMP}/en_tokenizer.bin.gz"
+          echo "${TOKENIZER_SHA256}  ${RUNNER_TEMP}/en_tokenizer.bin.gz" | sha256sum -c -
+          gzip -dc "${RUNNER_TEMP}/en_tokenizer.bin.gz" > "${RUNNER_TEMP}/en_tokenizer.bin"
+          echo "TOKENIZER_PATH=${RUNNER_TEMP}/en_tokenizer.bin" >> "${GITHUB_ENV}"
+
       - name: Generate LCOV report
         run: |
           cargo llvm-cov clean --workspace
