@@ -23,6 +23,1162 @@ struct Cli {
     command: Commands,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn mock_http_server(responses: Vec<(u16, String)>) -> String {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for (status, body) in responses {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = [0_u8; 8192];
+                let _ = stream.read(&mut request).await;
+                let reason = match status {
+                    200 => "OK",
+                    404 => "Not Found",
+                    500 => "Internal Server Error",
+                    _ => "Response",
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        format!("http://{address}")
+    }
+
+    fn add_args(url: String) -> AddArgs {
+        AddArgs {
+            content: "cli memory".to_string(),
+            project: Some("cli-project".to_string()),
+            metadata: Some(r#"{"source":"cli-test"}"#.to_string()),
+            cues: vec!["cli".to_string()],
+            disable_temporal_chunking: false,
+            async_ingest: false,
+            url,
+        }
+    }
+
+    fn recall_args(url: String) -> RecallArgs {
+        RecallArgs {
+            query: "cli query".to_string(),
+            project: Some("cli-project".to_string()),
+            limit: 5,
+            cues: vec!["cli".to_string()],
+            semantic_mode: "lexical".to_string(),
+            depth: 1,
+            token_budget: 128,
+            port: 8080,
+            no_auto_reinforce: false,
+            min_intersection: None,
+            query_time: None,
+            disable_salience_bias: false,
+            parent_fusion: "off".to_string(),
+            parent_fusion_limit: 80,
+            parent_fusion_min_chunks: 2,
+            ordered_reconstruction: "off".to_string(),
+            ordered_reconstruction_limit: 80,
+            ordered_session_scan_limit: 4096,
+            ordered_max_sessions: 3,
+            evidence_coverage: "off".to_string(),
+            evidence_coverage_limit: 100,
+            evidence_coverage_session_scan_limit: 4096,
+            evidence_coverage_max_sessions: 3,
+            expansion_depth: 1,
+            enable_alias_expansion: false,
+            disable_cuebridge_artifacts: false,
+            cuebridge_gap_limit: 6,
+            grounded: false,
+            explain: true,
+            trace_timing: true,
+            url,
+            web: false,
+            target_url: None,
+            persist: false,
+        }
+    }
+
+    #[test]
+    fn cli_parses_start_overrides_and_nested_project_commands() {
+        let cli = Cli::try_parse_from([
+            "cuemap", "start", "--port", "9090", "--data-dir", "/tmp/cuemap-data",
+            "--profile", "benchmark", "--disable-bg-jobs", "--disable-snapshots", "--disk-content",
+        ]).unwrap();
+        match cli.command {
+            Commands::Start(args) => {
+                assert_eq!(args.port, Some(9090));
+                assert_eq!(args.data_dir.as_deref(), Some("/tmp/cuemap-data"));
+                assert_eq!(args.profile.as_deref(), Some("benchmark"));
+                assert!(args.disable_bg_jobs);
+                assert!(args.disable_snapshots);
+                assert!(args.disk_content);
+            }
+            _ => panic!("expected start command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "cuemap", "projects", "set-watch-dir", "project", "/tmp/repo", "--url", "http://example.test",
+        ]).unwrap();
+        assert!(matches!(cli.command, Commands::Projects(ProjectArgs { cmd: ProjectCmd::SetWatchDir { .. } })));
+    }
+
+    #[test]
+    fn cli_rejects_invalid_ports_and_unknown_commands() {
+        assert!(Cli::try_parse_from(["cuemap", "start", "--port", "70000"]).is_err());
+        assert!(Cli::try_parse_from(["cuemap", "unknown"]).is_err());
+    }
+
+    #[test]
+    fn startup_overrides_apply_all_cli_options() {
+        let cli = Cli::try_parse_from([
+            "cuemap",
+            "start",
+            "--port",
+            "9091",
+            "--data-dir",
+            "/tmp/cuemap-data",
+            "--assets-dir",
+            "/tmp/cuemap-assets",
+            "--snapshot-interval",
+            "17",
+            "--agent-dir",
+            "/tmp/cuemap-watch",
+            "--agent-throttle",
+            "250",
+            "--disable-bg-jobs",
+            "--disable-snapshots",
+            "--disk-content",
+            "--cloud-backup",
+            "local",
+            "--cloud-bucket",
+            "/tmp/cuemap-cloud",
+            "--cloud-region",
+            "eu-west-1",
+            "--cloud-endpoint",
+            "http://localhost:9000",
+            "--cloud-prefix",
+            "release/",
+            "--cloud-auto-backup",
+        ])
+        .unwrap();
+
+        let args = match cli.command {
+            Commands::Start(args) => args,
+            _ => panic!("expected start command"),
+        };
+        let config = apply_start_overrides(config::ServerConfig::default(), &args);
+
+        assert_eq!(config.server.port, 9091);
+        assert_eq!(config.server.data_dir, "/tmp/cuemap-data");
+        assert_eq!(config.server.assets_dir.as_deref(), Some("/tmp/cuemap-assets"));
+        assert_eq!(config.persistence.snapshot_interval_seconds, 17);
+        assert_eq!(config.agent.watch_dir.as_deref(), Some("/tmp/cuemap-watch"));
+        assert!(config.agent.enabled);
+        assert_eq!(config.agent.throttle_ms, 250);
+        assert!(!config.jobs.background_processing);
+        assert!(!config.persistence.enabled);
+        assert!(config.server.store_content_on_disk);
+        assert_eq!(config.persistence.cloud.provider, "local");
+        assert_eq!(config.persistence.cloud.bucket, "/tmp/cuemap-cloud");
+        assert_eq!(config.persistence.cloud.region, "eu-west-1");
+        assert_eq!(
+            config.persistence.cloud.endpoint.as_deref(),
+            Some("http://localhost:9000")
+        );
+        assert_eq!(config.persistence.cloud.prefix, "release/");
+        assert!(config.persistence.cloud.auto_backup);
+    }
+
+    #[test]
+    fn startup_config_loading_applies_profile_and_cli_overrides() {
+        let root = tempfile::tempdir().unwrap();
+        let config_path = root.path().join("missing.toml");
+        let cli = Cli::try_parse_from([
+            "cuemap",
+            "start",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--profile",
+            "benchmark",
+            "--port",
+            "9191",
+        ])
+        .unwrap();
+        let args = match cli.command {
+            Commands::Start(args) => args,
+            _ => panic!("expected start command"),
+        };
+
+        let config = load_start_config(&args).unwrap();
+        assert_eq!(config.server.port, 9191);
+        assert!(!config.persistence.enabled);
+        assert!(!config.jobs.background_processing);
+    }
+
+    #[test]
+    fn snapshot_selection_handles_static_auxiliary_main_and_legacy_layouts() {
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("data");
+        let configured = data_dir.join("snapshots");
+        let legacy = root.path().join("snapshots");
+        std::fs::create_dir_all(&configured).unwrap();
+
+        assert_eq!(
+            select_snapshots_dir(data_dir.to_str().unwrap(), Some("/tmp/static")),
+            "/tmp/static"
+        );
+        assert!(!has_main_snapshot(&configured));
+
+        std::fs::write(configured.join("project_aliases.bin"), b"aliases").unwrap();
+        std::fs::write(configured.join("project_lexicon.bin"), b"lexicon").unwrap();
+        assert!(!has_main_snapshot(&configured));
+        assert_eq!(
+            select_snapshots_dir(data_dir.to_str().unwrap(), None),
+            configured.to_string_lossy()
+        );
+
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("project.bin"), b"snapshot").unwrap();
+        assert!(has_main_snapshot(&legacy));
+        assert_eq!(
+            select_snapshots_dir(data_dir.to_str().unwrap(), None),
+            data_dir.join("..").join("snapshots").to_string_lossy()
+        );
+
+        std::fs::write(configured.join("project.bin"), b"new snapshot").unwrap();
+        assert_eq!(
+            select_snapshots_dir(data_dir.to_str().unwrap(), None),
+            configured.to_string_lossy()
+        );
+        assert!(!has_main_snapshot(&root.path().join("missing")));
+    }
+
+    #[test]
+    fn master_key_resolution_obeys_precedence_and_validation() {
+        let mut security = config::SecurityConfig::default();
+        let config_key = "22".repeat(32);
+        security.master_key = Some(config_key);
+
+        let env_key = "11".repeat(32);
+        let resolved = resolve_master_key(&security, Some(&env_key), None, None).unwrap();
+        assert_eq!(resolved.as_bytes(), &[0x11; 32]);
+
+        // An explicitly supplied but malformed environment key must not silently
+        // fall back to a lower-precedence config value.
+        assert!(resolve_master_key(&security, Some("not-hex"), None, None).is_none());
+
+        let password_key = resolve_master_key(
+            &config::SecurityConfig::default(),
+            None,
+            Some("correct horse battery staple"),
+            Some(b"test-salt"),
+        )
+        .unwrap();
+        assert_eq!(password_key.as_bytes().len(), 32);
+
+        let config_key = resolve_master_key(&security, None, None, None).unwrap();
+        assert_eq!(config_key.as_bytes(), &[0x22; 32]);
+
+        security.master_key = Some("short".to_string());
+        assert!(resolve_master_key(&security, None, None, None).is_none());
+        assert!(resolve_master_key(&config::SecurityConfig::default(), None, None, None).is_none());
+    }
+
+    #[test]
+    fn context_signer_resolution_handles_ed25519_legacy_and_invalid_keys() {
+        let mut security = config::SecurityConfig::default();
+        assert!(resolve_context_signer(&security).is_none());
+
+        security.secret_key = Some("legacy-secret".to_string());
+        assert!(resolve_context_signer(&security).is_some());
+
+        security.signing_private_key = Some("00".repeat(32));
+        assert!(resolve_context_signer(&security).is_some());
+
+        security.signing_private_key = Some("not-hex".to_string());
+        assert!(resolve_context_signer(&security).is_none());
+    }
+
+    #[test]
+    fn kdf_salt_environment_override_is_used_for_startup() {
+        let previous = std::env::var("CUEMAP_KDF_SALT").ok();
+        std::env::set_var("CUEMAP_KDF_SALT", "release-test-salt");
+        assert_eq!(get_or_create_salt(), b"release-test-salt");
+
+        if let Some(value) = previous {
+            std::env::set_var("CUEMAP_KDF_SALT", value);
+        } else {
+            std::env::remove_var("CUEMAP_KDF_SALT");
+        }
+    }
+
+    #[test]
+    fn local_kdf_salt_loading_handles_existing_short_and_unwritable_files() {
+        let root = tempfile::tempdir().unwrap();
+        let existing = vec![7_u8; 32];
+        std::fs::write(root.path().join("salt"), &existing).unwrap();
+        assert_eq!(load_or_create_salt(root.path(), None), existing);
+
+        std::fs::write(root.path().join("salt"), b"short").unwrap();
+        let regenerated = load_or_create_salt(root.path(), None);
+        assert_eq!(regenerated.len(), 32);
+        assert_eq!(std::fs::read(root.path().join("salt")).unwrap(), regenerated);
+
+        let missing_root = tempfile::tempdir().unwrap();
+        let generated = load_or_create_salt(missing_root.path(), None);
+        assert_eq!(generated.len(), 32);
+
+        let file_root = root.path().join("not-a-directory");
+        std::fs::write(&file_root, b"file").unwrap();
+        assert_eq!(load_or_create_salt(&file_root, None).len(), 32);
+        assert_eq!(load_or_create_salt(root.path(), Some("override")), b"override");
+    }
+
+    #[tokio::test]
+    async fn detached_readiness_waiter_handles_offsets_success_timeout_and_missing_logs() {
+        let root = tempfile::tempdir().unwrap();
+        let log_path = root.path().join("server.log");
+        std::fs::write(&log_path, "old line\nready: Unstable sorting for speed\n").unwrap();
+        let start_pos = "old line\n".len() as u64;
+        assert!(wait_for_readiness(
+            &log_path,
+            start_pos,
+            "Unstable sorting for speed",
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap());
+
+        let empty_path = root.path().join("empty.log");
+        std::fs::write(&empty_path, "").unwrap();
+        assert!(!wait_for_readiness(
+            &empty_path,
+            0,
+            "never appears",
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap());
+        assert!(wait_for_readiness(
+            &root.path().join("missing.log"),
+            0,
+            "ready",
+            Duration::from_millis(1),
+        )
+        .await
+        .is_err());
+
+        let spawned_log = root.path().join("spawned.log");
+        let shell_args = vec![
+            "-c".to_string(),
+            "printf 'Unstable sorting for speed\\n'".to_string(),
+        ];
+        assert!(spawn_detached_process(
+            Path::new("/bin/sh"),
+            &shell_args,
+            &spawned_log,
+            "Unstable sorting for speed",
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap());
+
+        let timeout_args = vec!["-c".to_string(), "true".to_string()];
+        assert!(!spawn_detached_process(
+            Path::new("/bin/sh"),
+            &timeout_args,
+            &root.path().join("spawn-timeout.log"),
+            "never appears",
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap());
+        assert!(spawn_detached_process(
+            Path::new("/definitely/missing/cuemap-child"),
+            &[],
+            &root.path().join("spawn-error.log"),
+            "ready",
+            Duration::from_millis(1),
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn static_server_startup_builds_and_binds_the_cli_router() {
+        let root = tempfile::tempdir().unwrap();
+        let snapshots = root.path().join("snapshots");
+        std::fs::create_dir_all(&snapshots).unwrap();
+        let pid_path = root.path().join("server.pid");
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+
+        let mut server_config = config::ServerConfig::default();
+        server_config.server.port = port;
+        server_config.server.data_dir = root.path().join("data").to_string_lossy().to_string();
+        server_config.persistence.enabled = false;
+        server_config.jobs.background_processing = false;
+        server_config.semantic.enabled = false;
+        server_config.semantic.encoder_enabled = false;
+        server_config.semantic.profile = cuemap::semantic::SemanticProfile::Off;
+
+        let task = tokio::spawn(run_server_with_pid_path(
+            server_config,
+            Some(snapshots.to_string_lossy().to_string()),
+            true,
+            pid_path.clone(),
+        ));
+
+        let ready = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(ready, "static server did not bind its configured port");
+        assert_eq!(std::fs::read_to_string(&pid_path).unwrap(), std::process::id().to_string());
+
+        task.abort();
+        let _ = task.await;
+
+        let live_port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let live_pid_path = root.path().join("live-server.pid");
+        let mut live_config = config::ServerConfig::default();
+        live_config.server.port = live_port;
+        live_config.server.data_dir = root.path().join("live-data").to_string_lossy().to_string();
+        live_config.persistence.enabled = false;
+        live_config.jobs.background_processing = false;
+        live_config.semantic.enabled = false;
+        live_config.semantic.encoder_enabled = false;
+        live_config.semantic.profile = cuemap::semantic::SemanticProfile::Off;
+        live_config.persistence.cloud.provider = "s3".to_string();
+
+        let live_task = tokio::spawn(run_server_with_pid_path(
+            live_config,
+            None,
+            true,
+            live_pid_path,
+        ));
+        let live_ready = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if tokio::net::TcpStream::connect(("127.0.0.1", live_port)).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(live_ready, "live server did not bind its configured port");
+        live_task.abort();
+        let _ = live_task.await;
+    }
+
+    #[tokio::test]
+    async fn stop_handler_covers_missing_success_and_failed_pid_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let missing_path = root.path().join("missing.pid");
+        handle_stop_at(missing_path).await;
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid_path = root.path().join("running.pid");
+        std::fs::write(&pid_path, child.id().to_string()).unwrap();
+        handle_stop_at(pid_path.clone()).await;
+        assert!(!pid_path.exists());
+        let _ = child.wait();
+
+        let failed_path = root.path().join("failed.pid");
+        std::fs::write(&failed_path, u32::MAX.to_string()).unwrap();
+        handle_stop_at(failed_path.clone()).await;
+        assert!(failed_path.exists());
+    }
+
+    #[tokio::test]
+    async fn cli_http_handlers_cover_success_and_failure_paths() {
+        let add_url = mock_http_server(vec![(200, r#"{"id":42}"#.to_string())]).await;
+        handle_add(add_args(add_url)).await;
+        let add_error_url = mock_http_server(vec![(500, r#"{"error":"rejected"}"#.to_string())]).await;
+        handle_add(add_args(add_error_url)).await;
+
+        let ingest_url = mock_http_server(vec![(200, r#"{"status":"ingested"}"#.to_string())]).await;
+        handle_ingest(IngestArgs {
+            type_: IngestType::Content {
+                content: "content from cli".to_string(),
+                project: Some("cli-project".to_string()),
+                filename: "note.md".to_string(),
+                source_key: Some("cli-note".to_string()),
+                metadata: Some(r#"{"source":"test"}"#.to_string()),
+                structural_cues: vec!["cli".to_string()],
+                segmenter: "sentence_window".to_string(),
+                segment_window_size: Some(2),
+                segment_overlap: Some(1),
+                segment_min_chunk_chars: Some(16),
+                segment_max_chunk_chars: Some(128),
+                url: ingest_url,
+            },
+        })
+        .await;
+
+        let file_dir = tempfile::tempdir().unwrap();
+        let file_path = file_dir.path().join("cli-note.md");
+        std::fs::write(&file_path, "file content from cli").unwrap();
+        let file_url = mock_http_server(vec![(200, r#"{"status":"ingested"}"#.to_string())]).await;
+        handle_ingest(IngestArgs {
+            type_: IngestType::File {
+                path: file_path.to_string_lossy().to_string(),
+                project: Some("cli-project".to_string()),
+                url: file_url,
+            },
+        })
+        .await;
+
+        let file_error_url = mock_http_server(vec![(500, r#"{"error":"file rejected"}"#.to_string())]).await;
+        handle_ingest(IngestArgs {
+            type_: IngestType::File {
+                path: file_path.to_string_lossy().to_string(),
+                project: Some("cli-project".to_string()),
+                url: file_error_url,
+            },
+        })
+        .await;
+        handle_ingest(IngestArgs {
+            type_: IngestType::File {
+                path: file_dir.path().join("missing.md").to_string_lossy().to_string(),
+                project: Some("cli-project".to_string()),
+                url: "http://127.0.0.1:1".to_string(),
+            },
+        })
+        .await;
+
+        let url_ingest_server =
+            mock_http_server(vec![(200, r#"{"status":"started"}"#.to_string())]).await;
+        handle_ingest(IngestArgs {
+            type_: IngestType::Url {
+                url: "https://example.test/docs".to_string(),
+                project: Some("cli-project".to_string()),
+                depth: 2,
+                same_domain_only: true,
+                server_url: url_ingest_server,
+            },
+        })
+        .await;
+
+        let url_ingest_error_server =
+            mock_http_server(vec![(500, r#"{"error":"crawl rejected"}"#.to_string())]).await;
+        handle_ingest(IngestArgs {
+            type_: IngestType::Url {
+                url: "https://example.test/docs".to_string(),
+                project: Some("cli-project".to_string()),
+                depth: 0,
+                same_domain_only: false,
+                server_url: url_ingest_error_server,
+            },
+        })
+        .await;
+
+        let recall_url = mock_http_server(vec![
+            (
+                200,
+                r#"{"results":[{"score":1.25,"memory_id":42,"content":"cli result"}],"timing":{"total_ms":1.0}}"#.to_string(),
+            ),
+        ])
+        .await;
+        handle_recall(recall_args(recall_url)).await;
+
+        let grounded_body = serde_json::json!({
+            "verified_context": "grounded context",
+            "proof": {
+                "trace_id": "trace",
+                "query_text": "cli query",
+                "normalized_query": [],
+                "expanded_cues": [],
+                "token_budget": 128,
+                "selected": [],
+                "excluded_top": []
+            },
+            "engine_latency_ms": 1.0,
+            "signature_alg": "none",
+            "signature": "",
+            "public_key": null
+        })
+        .to_string();
+        let grounded_url = mock_http_server(vec![(200, grounded_body)]).await;
+        let mut grounded = recall_args(grounded_url);
+        grounded.grounded = true;
+        handle_recall(grounded).await;
+
+        let web_url = mock_http_server(vec![
+            (
+                200,
+                r#"{"results":[{"score":0.8,"intersection":2,"content":"web result"}],"urls":["https://example.test"]}"#.to_string(),
+            ),
+        ])
+        .await;
+        let mut web = recall_args(web_url);
+        web.web = true;
+        web.target_url = Some("https://example.test/page".to_string());
+        web.persist = true;
+        handle_recall(web).await;
+
+        let recall_error_url = mock_http_server(vec![(500, r#"{"error":"down"}"#.to_string())]).await;
+        handle_recall(recall_args(recall_error_url)).await;
+    }
+
+    #[tokio::test]
+    async fn cli_status_project_alias_and_memory_handlers_use_http_api() {
+        let status_url = mock_http_server(vec![
+            (200, r#"{"total_memories":2}"#.to_string()),
+            (200, "cuemap_requests_total 2\n".to_string()),
+        ])
+        .await;
+        handle_status(StatusArgs {
+            server: false,
+            jobs: false,
+            project: Some("cli-project".to_string()),
+            json: true,
+            url: status_url,
+        })
+        .await;
+
+        let jobs_url = mock_http_server(vec![(200, r#"{"phase":"done"}"#.to_string())]).await;
+        handle_status(StatusArgs {
+            server: false,
+            jobs: true,
+            project: Some("cli-project".to_string()),
+            json: false,
+            url: jobs_url,
+        })
+        .await;
+
+        let jobs_json_url = mock_http_server(vec![(200, r#"{"phase":"queued"}"#.to_string())]).await;
+        handle_status(StatusArgs {
+            server: false,
+            jobs: true,
+            project: Some("cli-project".to_string()),
+            json: true,
+            url: jobs_json_url,
+        })
+        .await;
+
+        let list_url = mock_http_server(vec![
+            (200, r#"[{"project_id":"cli-project","total_memories":2}]"#.to_string()),
+        ])
+        .await;
+        handle_projects(ProjectArgs {
+            cmd: ProjectCmd::List { url: list_url },
+        })
+        .await;
+
+        let create_url = mock_http_server(vec![(200, r#"{"project_id":"new-project"}"#.to_string())]).await;
+        handle_projects(ProjectArgs {
+            cmd: ProjectCmd::Create {
+                name: "new-project".to_string(),
+                url: create_url,
+            },
+        })
+        .await;
+
+        let watch_url = mock_http_server(vec![(200, r#"{"status":"updated"}"#.to_string())]).await;
+        handle_projects(ProjectArgs {
+            cmd: ProjectCmd::SetWatchDir {
+                project: "cli-project".to_string(),
+                path: "/tmp".to_string(),
+                url: watch_url,
+            },
+        })
+        .await;
+
+        let alias_add_url = mock_http_server(vec![(200, r#"{"id":1}"#.to_string())]).await;
+        handle_alias(AliasArgs {
+            text: "rust".to_string(),
+            project: Some("cli-project".to_string()),
+            add: Some("rust-language".to_string()),
+            weight: Some(0.9),
+            url: alias_add_url,
+        })
+        .await;
+
+        let alias_query_url = mock_http_server(vec![(200, "[]".to_string())]).await;
+        handle_alias(AliasArgs {
+            text: "rust".to_string(),
+            project: Some("cli-project".to_string()),
+            add: None,
+            weight: None,
+            url: alias_query_url,
+        })
+        .await;
+
+        let memory_get_url = mock_http_server(vec![(200, r#"{"content":"memory","created_at":1.0,"cues":["cli"],"stats":{"reinforcement":1}}"#.to_string())]).await;
+        handle_memories(MemoriesArgs {
+            id: 42,
+            reinforce: false,
+            delete: false,
+            cues: Vec::new(),
+            project: Some("cli-project".to_string()),
+            url: memory_get_url,
+        })
+        .await;
+
+        let memory_reinforce_url = mock_http_server(vec![(200, r#"{"status":"reinforced"}"#.to_string())]).await;
+        handle_memories(MemoriesArgs {
+            id: 42,
+            reinforce: true,
+            delete: false,
+            cues: vec!["cli".to_string()],
+            project: Some("cli-project".to_string()),
+            url: memory_reinforce_url,
+        })
+        .await;
+
+        let memory_delete_url = mock_http_server(vec![(200, r#"{"status":"deleted"}"#.to_string())]).await;
+        handle_memories(MemoriesArgs {
+            id: 42,
+            reinforce: false,
+            delete: true,
+            cues: Vec::new(),
+            project: Some("cli-project".to_string()),
+            url: memory_delete_url,
+        })
+        .await;
+
+        let memory_missing_url = mock_http_server(vec![(404, r#"{"error":"missing"}"#.to_string())]).await;
+        handle_memories(MemoriesArgs {
+            id: 999,
+            reinforce: false,
+            delete: false,
+            cues: Vec::new(),
+            project: Some("cli-project".to_string()),
+            url: memory_missing_url,
+        })
+        .await;
+
+        let delete_missing_url = mock_http_server(vec![(404, "missing".to_string())]).await;
+        handle_memories(MemoriesArgs {
+            id: 404,
+            reinforce: false,
+            delete: true,
+            cues: Vec::new(),
+            project: Some("cli-project".to_string()),
+            url: delete_missing_url,
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn cli_logs_handler_covers_missing_head_tail_and_full_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("server.log");
+        std::fs::write(&log_path, "first\nsecond\nthird\n").unwrap();
+
+        handle_logs(LogsArgs {
+            head: Some(2),
+            tail: None,
+            follow: false,
+            path: Some(log_path.to_string_lossy().to_string()),
+        })
+        .await;
+        handle_logs(LogsArgs {
+            head: None,
+            tail: Some(2),
+            follow: false,
+            path: Some(log_path.to_string_lossy().to_string()),
+        })
+        .await;
+        handle_logs(LogsArgs {
+            head: None,
+            tail: None,
+            follow: false,
+            path: Some(log_path.to_string_lossy().to_string()),
+        })
+        .await;
+
+        let follow_path = log_path.clone();
+        let follow_task = tokio::spawn(async move {
+            handle_logs(LogsArgs {
+                head: None,
+                tail: None,
+                follow: true,
+                path: Some(follow_path.to_string_lossy().to_string()),
+            })
+            .await;
+        });
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .unwrap()
+            .write_all(b"followed\n")
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        follow_task.abort();
+        let _ = follow_task.await;
+
+        handle_logs(LogsArgs {
+            head: None,
+            tail: None,
+            follow: false,
+            path: Some(dir.path().join("missing.log").to_string_lossy().to_string()),
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn cli_handlers_cover_error_responses_and_alias_defaults() {
+        let ingest_error_url =
+            mock_http_server(vec![(500, r#"{"error":"invalid content"}"#.to_string())]).await;
+        handle_ingest(IngestArgs {
+            type_: IngestType::Content {
+                content: "bad content".to_string(),
+                project: Some("cli-project".to_string()),
+                filename: "note.txt".to_string(),
+                source_key: None,
+                metadata: None,
+                structural_cues: Vec::new(),
+                segmenter: "sentence_window".to_string(),
+                segment_window_size: None,
+                segment_overlap: None,
+                segment_min_chunk_chars: None,
+                segment_max_chunk_chars: None,
+                url: ingest_error_url,
+            },
+        })
+        .await;
+
+        let status_error_url = mock_http_server(vec![(500, "server error".to_string())]).await;
+        handle_status(StatusArgs {
+            server: true,
+            jobs: false,
+            project: None,
+            json: false,
+            url: status_error_url,
+        })
+        .await;
+        let jobs_error_url = mock_http_server(vec![(500, "jobs error".to_string())]).await;
+        handle_status(StatusArgs {
+            server: false,
+            jobs: true,
+            project: None,
+            json: true,
+            url: jobs_error_url,
+        })
+        .await;
+
+        let list_error_url = mock_http_server(vec![(500, "list error".to_string())]).await;
+        handle_projects(ProjectArgs {
+            cmd: ProjectCmd::List { url: list_error_url },
+        })
+        .await;
+        let create_error_url = mock_http_server(vec![(500, "create error".to_string())]).await;
+        handle_projects(ProjectArgs {
+            cmd: ProjectCmd::Create {
+                name: "bad-project".to_string(),
+                url: create_error_url,
+            },
+        })
+        .await;
+        let watch_error_url = mock_http_server(vec![(500, "watch error".to_string())]).await;
+        handle_projects(ProjectArgs {
+            cmd: ProjectCmd::SetWatchDir {
+                project: "cli-project".to_string(),
+                path: "/missing".to_string(),
+                url: watch_error_url,
+            },
+        })
+        .await;
+
+        let alias_add_error_url = mock_http_server(vec![(500, "alias error".to_string())]).await;
+        handle_alias(AliasArgs {
+            text: "rust".to_string(),
+            project: Some("cli-project".to_string()),
+            add: Some("rust-language".to_string()),
+            weight: None,
+            url: alias_add_error_url,
+        })
+        .await;
+        let alias_query_result_url = mock_http_server(vec![
+            (
+                200,
+                r#"[{"id":1,"from":"rust","to":"rust-language","weight":0.9}]"#.to_string(),
+            ),
+        ])
+        .await;
+        handle_alias(AliasArgs {
+            text: "rust".to_string(),
+            project: Some("cli-project".to_string()),
+            add: None,
+            weight: None,
+            url: alias_query_result_url,
+        })
+        .await;
+
+        let reinforce_missing_url = mock_http_server(vec![(404, "missing".to_string())]).await;
+        handle_memories(MemoriesArgs {
+            id: 404,
+            reinforce: true,
+            delete: false,
+            cues: Vec::new(),
+            project: Some("cli-project".to_string()),
+            url: reinforce_missing_url,
+        })
+        .await;
+        let delete_error_url = mock_http_server(vec![(500, "delete error".to_string())]).await;
+        handle_memories(MemoriesArgs {
+            id: 500,
+            reinforce: false,
+            delete: true,
+            cues: Vec::new(),
+            project: Some("cli-project".to_string()),
+            url: delete_error_url,
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn cli_lexicon_and_project_config_paths_are_covered() {
+        let lexicon_url = mock_http_server(vec![
+            (
+                200,
+                r#"{"cue":"rust","outgoing":[],"incoming":[]}"#.to_string(),
+            ),
+        ])
+        .await;
+        handle_lexicon(LexiconArgs {
+            cmd: LexiconCmd::Inspect {
+                cue: "rust".to_string(),
+                project: Some("cli-project".to_string()),
+                url: lexicon_url,
+            },
+        })
+        .await;
+
+        let lexicon_error_url = mock_http_server(vec![(500, "lexicon unavailable".to_string())]).await;
+        handle_lexicon(LexiconArgs {
+            cmd: LexiconCmd::Inspect {
+                cue: "missing".to_string(),
+                project: Some("cli-project".to_string()),
+                url: lexicon_error_url,
+            },
+        })
+        .await;
+
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.json");
+        assert_eq!(read_default_project(&config_path), None);
+        write_default_project(&config_path, "cli-project").unwrap();
+        assert_eq!(read_default_project(&config_path).as_deref(), Some("cli-project"));
+
+        std::fs::write(&config_path, "not-json").unwrap();
+        assert_eq!(read_default_project(&config_path), None);
+        std::fs::write(&config_path, r#"{"default_project":42}"#).unwrap();
+        assert_eq!(read_default_project(&config_path), None);
+        assert!(write_default_project(config_dir.path(), "bad-path").is_err());
+    }
+
+    #[tokio::test]
+    async fn cli_handlers_cover_connection_failures_and_recall_modes() {
+        let dead_url = "http://127.0.0.1:1".to_string();
+        handle_add(add_args(dead_url.clone())).await;
+
+        handle_ingest(IngestArgs {
+            type_: IngestType::Content {
+                content: "connection failure".to_string(),
+                project: Some("cli-project".to_string()),
+                filename: "failure.txt".to_string(),
+                source_key: None,
+                metadata: None,
+                structural_cues: Vec::new(),
+                segmenter: "sentence_window".to_string(),
+                segment_window_size: None,
+                segment_overlap: None,
+                segment_min_chunk_chars: None,
+                segment_max_chunk_chars: None,
+                url: dead_url.clone(),
+            },
+        })
+        .await;
+        handle_ingest(IngestArgs {
+            type_: IngestType::Url {
+                url: "https://example.test".to_string(),
+                project: Some("cli-project".to_string()),
+                depth: 0,
+                same_domain_only: true,
+                server_url: dead_url.clone(),
+            },
+        })
+        .await;
+
+        for semantic_mode in ["semantic", "hybrid"] {
+            let mut recall = recall_args(dead_url.clone());
+            recall.semantic_mode = semantic_mode.to_string();
+            recall.trace_timing = false;
+            handle_recall(recall).await;
+        }
+
+        let mut grounded = recall_args(dead_url.clone());
+        grounded.grounded = true;
+        handle_recall(grounded).await;
+        let grounded_error_url = mock_http_server(vec![(500, "grounded error".to_string())]).await;
+        let mut grounded_error = recall_args(grounded_error_url);
+        grounded_error.grounded = true;
+        handle_recall(grounded_error).await;
+
+        let web_error_url = mock_http_server(vec![(500, "web error".to_string())]).await;
+        let mut web_error = recall_args(web_error_url);
+        web_error.web = true;
+        handle_recall(web_error).await;
+        let mut web_failure = recall_args(dead_url.clone());
+        web_failure.web = true;
+        handle_recall(web_failure).await;
+
+        let status_url = mock_http_server(vec![(200, r#"{"total_memories":1}"#.to_string())]).await;
+        handle_status(StatusArgs {
+            server: true,
+            jobs: false,
+            project: Some("cli-project".to_string()),
+            json: false,
+            url: status_url,
+        })
+        .await;
+        handle_status(StatusArgs {
+            server: true,
+            jobs: false,
+            project: Some("cli-project".to_string()),
+            json: false,
+            url: dead_url.clone(),
+        })
+        .await;
+        handle_status(StatusArgs {
+            server: false,
+            jobs: true,
+            project: Some("cli-project".to_string()),
+            json: false,
+            url: dead_url.clone(),
+        })
+        .await;
+
+        handle_memories(MemoriesArgs {
+            id: 1,
+            reinforce: false,
+            delete: true,
+            cues: Vec::new(),
+            project: Some("cli-project".to_string()),
+            url: dead_url.clone(),
+        })
+        .await;
+        handle_memories(MemoriesArgs {
+            id: 1,
+            reinforce: true,
+            delete: false,
+            cues: vec!["cli".to_string()],
+            project: Some("cli-project".to_string()),
+            url: dead_url.clone(),
+        })
+        .await;
+        handle_memories(MemoriesArgs {
+            id: 1,
+            reinforce: false,
+            delete: false,
+            cues: Vec::new(),
+            project: Some("cli-project".to_string()),
+            url: dead_url.clone(),
+        })
+        .await;
+
+        handle_alias(AliasArgs {
+            text: "rust".to_string(),
+            project: Some("cli-project".to_string()),
+            add: Some("language".to_string()),
+            weight: None,
+            url: dead_url.clone(),
+        })
+        .await;
+        handle_alias(AliasArgs {
+            text: "rust".to_string(),
+            project: Some("cli-project".to_string()),
+            add: None,
+            weight: None,
+            url: dead_url.clone(),
+        })
+        .await;
+
+        handle_projects(ProjectArgs {
+            cmd: ProjectCmd::List {
+                url: dead_url.clone(),
+            },
+        })
+        .await;
+        handle_projects(ProjectArgs {
+            cmd: ProjectCmd::Create {
+                name: "dead-project".to_string(),
+                url: dead_url.clone(),
+            },
+        })
+        .await;
+        handle_projects(ProjectArgs {
+            cmd: ProjectCmd::SetWatchDir {
+                project: "cli-project".to_string(),
+                path: "/tmp".to_string(),
+                url: dead_url,
+            },
+        })
+        .await;
+    }
+
+    #[test]
+    fn cli_ingest_and_lexicon_server_url_defaults_parse() {
+        let cli = Cli::try_parse_from(["cuemap", "ingest", "file", "note.md", "--project", "p"])
+            .unwrap();
+        match cli.command {
+            Commands::Ingest(IngestArgs {
+                type_: IngestType::File { url, .. },
+            }) => assert_eq!(url, "http://localhost:8080"),
+            _ => panic!("expected file ingest command"),
+        }
+
+        let cli = Cli::try_parse_from(["cuemap", "ingest", "url", "https://example.test"])
+            .unwrap();
+        match cli.command {
+            Commands::Ingest(IngestArgs {
+                type_: IngestType::Url { server_url, .. },
+            }) => assert_eq!(server_url, "http://localhost:8080"),
+            _ => panic!("expected URL ingest command"),
+        }
+
+        let cli = Cli::try_parse_from(["cuemap", "lexicon", "inspect", "rust"]).unwrap();
+        match cli.command {
+            Commands::Lexicon(LexiconArgs {
+                cmd: LexiconCmd::Inspect { url, .. },
+            }) => assert_eq!(url, "http://localhost:8080"),
+            _ => panic!("expected lexicon inspect command"),
+        }
+    }
+}
+
 #[derive(clap::Subcommand, Debug)]
 enum Commands {
     /// Start the CueMap server
@@ -39,9 +1195,6 @@ enum Commands {
 
     /// Manage lexicon entries
     Lexicon(LexiconArgs),
-
-    /// Manage deterministic CuePacks
-    Cuepack(CuePackArgs),
 
     /// Manage aliases
     Alias(AliasArgs),
@@ -205,12 +1358,6 @@ struct AddArgs {
     /// Manual cues to associate
     #[arg(short, long)]
     cues: Vec<String>,
-    /// CuePacks to apply while extracting synchronous facets (comma-separated)
-    #[arg(long, value_delimiter = ',')]
-    cuepacks: Option<Vec<String>>,
-    /// Disable bundled default CuePacks for this add request
-    #[arg(long)]
-    disable_default_cuepacks: bool,
     /// Disable temporal chunking for this memory
     #[arg(long)]
     disable_temporal_chunking: bool,
@@ -271,6 +1418,9 @@ enum IngestType {
         path: String,
         #[arg(short, long)]
         project: Option<String>,
+        /// Server URL
+        #[arg(long, default_value = "http://localhost:8080")]
+        url: String,
     },
     /// Ingest a URL
     Url {
@@ -283,6 +1433,9 @@ enum IngestType {
         /// Only follow links within the same domain
         #[arg(long, default_value = "true")]
         same_domain_only: bool,
+        /// Server URL
+        #[arg(long, default_value = "http://localhost:8080")]
+        server_url: String,
     },
 }
 
@@ -299,6 +1452,9 @@ struct RecallArgs {
     /// Manual cues to filter by
     #[arg(short, long)]
     cues: Vec<String>,
+    /// Query signal mode: lexical, semantic, or hybrid
+    #[arg(long, default_value = "hybrid", value_parser = ["lexical", "semantic", "hybrid"])]
+    semantic_mode: String,
     /// Multi-hop recall depth
     #[arg(long, default_value = "1")]
     depth: usize,
@@ -357,13 +1513,6 @@ struct RecallArgs {
     #[arg(long, default_value_t = 1)]
     pub expansion_depth: usize,
 
-    /// CuePacks to apply (comma-separated, e.g. "memory-general")
-    #[arg(long, value_delimiter = ',')]
-    pub cuepacks: Option<Vec<String>>,
-    /// Disable bundled default CuePacks for this recall request
-    #[arg(long)]
-    pub disable_default_cuepacks: bool,
-
     /// Enable alias expansion (default: disabled)
     #[arg(long)]
     pub enable_alias_expansion: bool,
@@ -412,23 +1561,10 @@ enum LexiconCmd {
         cue: String,
         #[arg(short, long)]
         project: Option<String>,
+        /// Server URL
+        #[arg(long, default_value = "http://localhost:8080")]
+        url: String,
     },
-}
-
-#[derive(Parser, Debug)]
-struct CuePackArgs {
-    #[command(subcommand)]
-    cmd: CuePackCmd,
-}
-
-#[derive(clap::Subcommand, Debug)]
-enum CuePackCmd {
-    /// List bundled and local CuePacks
-    List,
-    /// Inspect a loaded CuePack by name
-    Inspect { name: String },
-    /// Validate a CuePack TOML file
-    Validate { path: String },
 }
 
 #[derive(Parser, Debug)]
@@ -506,6 +1642,171 @@ enum ProjectCmd {
     },
 }
 
+fn apply_start_overrides(
+    mut server_config: config::ServerConfig,
+    args: &StartArgs,
+) -> config::ServerConfig {
+    if let Some(port) = args.port {
+        server_config.server.port = port;
+    }
+    if let Some(data_dir) = &args.data_dir {
+        server_config.server.data_dir = data_dir.clone();
+    }
+    if let Some(assets_dir) = &args.assets_dir {
+        server_config.server.assets_dir = Some(assets_dir.clone());
+    }
+    if let Some(snapshot_interval) = args.snapshot_interval {
+        server_config.persistence.snapshot_interval_seconds = snapshot_interval;
+    }
+    if let Some(agent_throttle) = args.agent_throttle {
+        server_config.agent.throttle_ms = agent_throttle;
+    }
+    if let Some(agent_dir) = &args.agent_dir {
+        server_config.agent.watch_dir = Some(agent_dir.clone());
+        server_config.agent.enabled = true;
+    }
+
+    if args.disable_bg_jobs {
+        server_config.jobs.background_processing = false;
+    }
+    if args.disable_snapshots {
+        server_config.persistence.enabled = false;
+    }
+    if args.disk_content {
+        server_config.server.store_content_on_disk = true;
+    }
+
+    if let Some(provider) = &args.cloud_backup {
+        server_config.persistence.cloud.provider = provider.clone();
+    }
+    if let Some(bucket) = &args.cloud_bucket {
+        server_config.persistence.cloud.bucket = bucket.clone();
+    }
+    if let Some(region) = &args.cloud_region {
+        server_config.persistence.cloud.region = region.clone();
+    }
+    if let Some(endpoint) = &args.cloud_endpoint {
+        server_config.persistence.cloud.endpoint = Some(endpoint.clone());
+    }
+    if let Some(prefix) = &args.cloud_prefix {
+        server_config.persistence.cloud.prefix = prefix.clone();
+    }
+    if args.cloud_auto_backup {
+        server_config.persistence.cloud.auto_backup = true;
+    }
+
+    server_config
+}
+
+fn load_start_config(args: &StartArgs) -> Result<config::ServerConfig, String> {
+    let config_path = args.config.clone().map(std::path::PathBuf::from);
+    let config = config::ServerConfig::load(config_path, args.profile.clone())?;
+    Ok(apply_start_overrides(config, args))
+}
+
+fn has_main_snapshot(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries.flatten().any(|entry| {
+                entry
+                    .path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| {
+                        name.ends_with(".bin")
+                            && !name.ends_with("_aliases.bin")
+                            && !name.ends_with("_lexicon.bin")
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn select_snapshots_dir(data_dir: &str, load_static: Option<&str>) -> String {
+    if let Some(static_dir) = load_static {
+        return static_dir.to_string();
+    }
+
+    let configured = PathBuf::from(data_dir).join("snapshots");
+    let legacy = PathBuf::from(data_dir).join("..").join("snapshots");
+    let selected = if !has_main_snapshot(&configured) && has_main_snapshot(&legacy) {
+        warn!(
+            configured = %configured.display(),
+            legacy = %legacy.display(),
+            "No snapshots found in configured data directory; using legacy snapshot directory"
+        );
+        legacy
+    } else {
+        configured
+    };
+    selected.to_string_lossy().to_string()
+}
+
+fn resolve_master_key(
+    security: &config::SecurityConfig,
+    env_master_key: Option<&str>,
+    env_password: Option<&str>,
+    password_salt: Option<&[u8]>,
+) -> Option<Arc<cuemap::crypto::EncryptionKey>> {
+    if let Some(key_hex) = env_master_key {
+        match hex::decode(key_hex) {
+            Ok(bytes) if bytes.len() == 32 => {
+                info!("Security: Master key loaded from CUEMAP_MASTER_KEY (Hex)");
+                Some(Arc::new(cuemap::crypto::EncryptionKey::new(bytes)))
+            }
+            _ => {
+                error!("Security: CUEMAP_MASTER_KEY must be a 32-byte hex string");
+                None
+            }
+        }
+    } else if let Some(passphrase) = env_password {
+        info!("Security: Deriving master key from CUEMAP_MASTER_PASSWORD...");
+        let salt = password_salt.unwrap_or_default();
+        Some(Arc::new(cuemap::crypto::EncryptionKey::from_passphrase(
+            passphrase, salt,
+        )))
+    } else if let Some(key_hex) = &security.master_key {
+        match hex::decode(key_hex) {
+            Ok(bytes) if bytes.len() == 32 => {
+                info!("Security: Master key loaded from config file");
+                Some(Arc::new(cuemap::crypto::EncryptionKey::new(bytes)))
+            }
+            _ => {
+                error!("Security: master_key in config must be a 32-byte hex string");
+                None
+            }
+        }
+    } else {
+        info!("Security: Encryption-at-rest disabled (no master key configured)");
+        None
+    }
+}
+
+fn resolve_context_signer(
+    security: &config::SecurityConfig,
+) -> Option<Arc<cuemap::crypto::ContextSigner>> {
+    if let Some(seed_hex) = &security.signing_private_key {
+        match crypto::ContextSigner::from_ed25519_seed_hex(seed_hex) {
+            Ok(signer) => {
+                info!("Immutable RAG: Ed25519 context signing enabled");
+                Some(Arc::new(signer))
+            }
+            Err(err) => {
+                error!("Immutable RAG: invalid Ed25519 signing private key: {}", err);
+                None
+            }
+        }
+    } else if let Some(secret) = &security.secret_key {
+        info!("Immutable RAG: legacy HMAC-SHA256 context signing enabled");
+        Some(Arc::new(crypto::ContextSigner::from_hmac_secret(
+            secret.clone().into_bytes(),
+        )))
+    } else {
+        None
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -516,62 +1817,7 @@ async fn main() {
                 handle_start_detached(args).await;
             } else {
                 // Layering Logic: Config File -> CLI Args
-                let config_path = args.config.clone().map(std::path::PathBuf::from);
-                let mut config = config::ServerConfig::load(config_path, args.profile.clone())
-                    .expect("Failed to load configuration");
-
-                // Apply CLI Overrides
-                if let Some(p) = args.port {
-                    config.server.port = p;
-                }
-                if let Some(d) = &args.data_dir {
-                    config.server.data_dir = d.clone();
-                }
-                if let Some(a) = &args.assets_dir {
-                    config.server.assets_dir = Some(a.clone());
-                }
-                if let Some(s) = args.snapshot_interval {
-                    config.persistence.snapshot_interval_seconds = s;
-                }
-                if let Some(t) = args.agent_throttle {
-                    config.agent.throttle_ms = t;
-                }
-                if let Some(w) = &args.agent_dir {
-                    config.agent.watch_dir = Some(w.clone());
-                    config.agent.enabled = true;
-                }
-
-                // Boolean flags (only enable restriction/feature if flag is present, or if config says so)
-                // For "disable" flags: if CLI says disable, force disable.
-                if args.disable_bg_jobs {
-                    config.jobs.background_processing = false;
-                }
-                if args.disable_snapshots {
-                    config.persistence.enabled = false;
-                }
-                if args.disk_content {
-                    config.server.store_content_on_disk = true;
-                }
-
-                // Cloud overrides
-                if let Some(p) = &args.cloud_backup {
-                    config.persistence.cloud.provider = p.clone();
-                }
-                if let Some(b) = &args.cloud_bucket {
-                    config.persistence.cloud.bucket = b.clone();
-                }
-                if let Some(r) = &args.cloud_region {
-                    config.persistence.cloud.region = r.clone();
-                }
-                if let Some(e) = &args.cloud_endpoint {
-                    config.persistence.cloud.endpoint = Some(e.clone());
-                }
-                if let Some(p) = &args.cloud_prefix {
-                    config.persistence.cloud.prefix = p.clone();
-                }
-                if args.cloud_auto_backup {
-                    config.persistence.cloud.auto_backup = true;
-                }
+                let config = load_start_config(&args).expect("Failed to load configuration");
 
                 run_server(config, args.load_static, args.child_process).await;
             }
@@ -580,7 +1826,6 @@ async fn main() {
         Commands::Ingest(args) => handle_ingest(args).await,
         Commands::Recall(args) => handle_recall(args).await,
         Commands::Lexicon(args) => handle_lexicon(args).await,
-        Commands::Cuepack(args) => handle_cuepack(args),
         Commands::Memories(args) => handle_memories(args).await,
         Commands::Alias(args) => handle_alias(args).await,
         Commands::Projects(args) => handle_projects(args).await,
@@ -592,6 +1837,16 @@ async fn main() {
 }
 
 async fn run_server(config: config::ServerConfig, load_static: Option<String>, _is_child: bool) {
+    let pid_path = config::get_base_dir().join("server.pid");
+    run_server_with_pid_path(config, load_static, _is_child, pid_path).await;
+}
+
+async fn run_server_with_pid_path(
+    config: config::ServerConfig,
+    load_static: Option<String>,
+    _is_child: bool,
+    pid_path: PathBuf,
+) {
     // Extract commonly used configs
     let server_config = &config.server;
     let auth_config_struct = &config.security;
@@ -608,11 +1863,13 @@ async fn run_server(config: config::ServerConfig, load_static: Option<String>, _
     // Build layers
     let stdout_layer = fmt::layer().with_writer(std::io::stdout);
 
-    Registry::default().with(filter).with(stdout_layer).init();
+    let _ = Registry::default()
+        .with(filter)
+        .with(stdout_layer)
+        .try_init();
 
     // Write PID file for the server
     let pid = std::process::id();
-    let pid_path = config::get_base_dir().join("server.pid");
     if let Err(e) = std::fs::write(&pid_path, pid.to_string()) {
         warn!("Failed to write PID file: {}", e);
     }
@@ -643,106 +1900,43 @@ async fn run_server(config: config::ServerConfig, load_static: Option<String>, _
         }
     }
 
-    use cuemap::crypto::EncryptionKey;
-
     // Build the router with appropriate engine state
     info!("Multi-tenant mode enabled");
 
-    let snapshots_dir = if let Some(ref static_dir) = load_static {
-        static_dir.clone()
-    } else {
-        PathBuf::from(&server_config.data_dir)
-            .join("snapshots")
-            .to_string_lossy()
-            .to_string()
-    };
+    let snapshots_dir = select_snapshots_dir(&server_config.data_dir, load_static.as_deref());
 
     let mut mt_engine = multi_tenant::MultiTenantEngine::with_config(
         config.clone(),
         PathBuf::from(&snapshots_dir),
     );
 
-    let mut cuepack_dirs = config
-        .cuepacks
-        .dirs
-        .iter()
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
-    cuepack_dirs.push(config::get_base_dir().join("cuepacks"));
-    let cuepack_registry = Arc::new(if config.cuepacks.enabled {
-        cuemap::cuepacks::CuePackRegistry::load(config.cuepacks.default_packs_enabled, &cuepack_dirs)
-    } else {
-        cuemap::cuepacks::CuePackRegistry::load(false, &[])
-    });
-    for error in cuepack_registry.load_errors() {
-        warn!("CuePack load error: {}", error);
-    }
-    info!("Loaded {} CuePacks", cuepack_registry.infos().len());
-
     // Master Key Discovery Hierarchy
-    let master_key = if let Ok(key_hex) = std::env::var("CUEMAP_MASTER_KEY") {
-        // 1. Env Var (Hex) - Highest priority for automation
-        match hex::decode(&key_hex) {
-            Ok(bytes) if bytes.len() == 32 => {
-                info!("Security: Master key loaded from CUEMAP_MASTER_KEY (Hex)");
-                Some(Arc::new(EncryptionKey::new(bytes)))
-            }
-            _ => {
-                error!("Security: CUEMAP_MASTER_KEY must be a 32-byte hex string");
-                None
-            }
-        }
-    } else if let Ok(pass) = std::env::var("CUEMAP_MASTER_PASSWORD") {
-        // 2. Env Var (Passphrase) - Secondary automation path
-        info!("Security: Deriving master key from CUEMAP_MASTER_PASSWORD...");
-        let salt = get_or_create_salt();
-        Some(Arc::new(EncryptionKey::from_passphrase(&pass, &salt)))
-    } else if let Some(key_hex) = &auth_config_struct.master_key {
-        // 3. Config File (Hex)
-        match hex::decode(key_hex) {
-            Ok(bytes) if bytes.len() == 32 => {
-                info!("Security: Master key loaded from config file");
-                Some(Arc::new(EncryptionKey::new(bytes)))
-            }
-            _ => {
-                error!("Security: master_key in config must be a 32-byte hex string");
-                None
-            }
-        }
-    } else {
-        info!("Security: Encryption-at-rest disabled (no master key configured)");
-        None
-    };
+    let env_master_key = std::env::var("CUEMAP_MASTER_KEY").ok();
+    let env_password = std::env::var("CUEMAP_MASTER_PASSWORD").ok();
+    let password_salt = env_password.as_ref().map(|_| get_or_create_salt());
+    let master_key = resolve_master_key(
+        auth_config_struct,
+        env_master_key.as_deref(),
+        env_password.as_deref(),
+        password_salt.as_deref(),
+    );
 
     if let Some(key) = master_key {
         mt_engine.set_master_key(Some(key));
     }
 
-    let context_signer = if let Some(seed_hex) = &auth_config_struct.signing_private_key {
-        match crypto::ContextSigner::from_ed25519_seed_hex(seed_hex) {
-            Ok(signer) => {
-                info!("Immutable RAG: Ed25519 context signing enabled");
-                Some(Arc::new(signer))
-            }
-            Err(err) => {
-                error!("Immutable RAG: invalid Ed25519 signing private key: {}", err);
-                None
-            }
-        }
-    } else if let Some(secret) = &auth_config_struct.secret_key {
-        info!("Immutable RAG: legacy HMAC-SHA256 context signing enabled");
-        Some(Arc::new(crypto::ContextSigner::from_hmac_secret(
-            secret.clone().into_bytes(),
-        )))
-    } else {
-        None
-    };
+    let context_signer = resolve_context_signer(auth_config_struct);
 
     let mt_engine = Arc::new(mt_engine);
 
     // Auto-load all available snapshots
     info!("Loading snapshots from: {}", snapshots_dir);
-    let _ = mt_engine.load_all(); // Ignoring errors for brevity
+    for (project_id, result) in mt_engine.load_all() {
+        match result {
+            Ok(()) => info!(project_id = %project_id, "Loaded project snapshot"),
+            Err(error) => error!(project_id = %project_id, error = %error, "Failed to load project snapshot"),
+        }
+    }
 
     // Setup shutdown handler
     if !is_static {
@@ -833,7 +2027,6 @@ async fn run_server(config: config::ServerConfig, load_static: Option<String>, _
             cloud_backup,
             context_signer,
             agent_manager.clone(),
-            cuepack_registry,
         ))
         .layer(CorsLayer::permissive());
 
@@ -909,41 +2102,44 @@ async fn setup_multi_tenant_shutdown_handler(mt_engine: Arc<multi_tenant::MultiT
 
 // ========== CLI Client Handlers ==========
 
+fn read_default_project(config_path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(config_path).ok()?;
+    let config = serde_json::from_str::<serde_json::Value>(&content).ok()?;
+    config
+        .get("default_project")
+        .and_then(|value| value.as_str().map(str::to_string))
+}
+
+fn write_default_project(config_path: &Path, project_id: &str) -> Result<(), String> {
+    let config = serde_json::json!({
+        "default_project": project_id
+    });
+    let content = serde_json::to_string_pretty(&config).map_err(|err| err.to_string())?;
+    std::fs::write(config_path, content).map_err(|err| err.to_string())
+}
+
 fn get_default_project() -> Option<String> {
     let config_path = config::get_base_dir().join("config.json");
-    if let Ok(content) = std::fs::read_to_string(config_path) {
-        if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
-            return config
-                .get("default_project")
-                .and_then(|v| v.as_str().map(|s| s.to_string()));
-        }
-    }
-    None
+    read_default_project(&config_path)
 }
 
 fn handle_set_project(project_id: String) {
     let config_path = config::get_base_dir().join("config.json");
-    let config = serde_json::json!({
-        "default_project": project_id
-    });
-    if let Ok(content) = serde_json::to_string_pretty(&config) {
-        if std::fs::write(config_path, content).is_ok() {
-            println!("✓ Default project set to: {}", project_id);
-        } else {
-            eprintln!("✗ Failed to write config file");
-        }
+    match write_default_project(&config_path, &project_id) {
+        Ok(()) => println!("✓ Default project set to: {}", project_id),
+        Err(_) => eprintln!("✗ Failed to write config file"),
     }
 }
 
-fn get_or_create_salt() -> Vec<u8> {
+fn load_or_create_salt(base_dir: &Path, env_override: Option<&str>) -> Vec<u8> {
     // 1. Check environment variable override (escape hatch / migration)
-    if let Ok(salt_str) = std::env::var("CUEMAP_KDF_SALT") {
+    if let Some(salt_str) = env_override {
         info!("Security: Using KDF salt from environment (CUEMAP_KDF_SALT)");
-        return salt_str.into_bytes();
+        return salt_str.as_bytes().to_vec();
     }
 
     // 2. Check local config file
-    let salt_path = config::get_base_dir().join("salt");
+    let salt_path = base_dir.join("salt");
     if salt_path.exists() {
         if let Ok(salt) = std::fs::read(&salt_path) {
             if salt.len() >= 16 {
@@ -971,14 +2167,17 @@ fn get_or_create_salt() -> Vec<u8> {
     salt
 }
 
+fn get_or_create_salt() -> Vec<u8> {
+    let env_override = std::env::var("CUEMAP_KDF_SALT").ok();
+    load_or_create_salt(&config::get_base_dir(), env_override.as_deref())
+}
+
 async fn handle_add(args: AddArgs) {
     let project = args
         .project
         .or_else(get_default_project)
         .expect("Project ID required (use --project or set-project)");
     let client = reqwest::Client::new();
-    let cuepacks = selected_cuepacks(args.cuepacks, args.disable_default_cuepacks);
-
     let payload = api::AddMemoryRequest {
         content: args.content,
         source_key: None,
@@ -986,8 +2185,8 @@ async fn handle_add(args: AddArgs) {
         metadata: args
             .metadata
             .map(|m| serde_json::from_str(&m).unwrap_or_default()),
+        embedding: None,
         cues: args.cues,
-        cuepacks,
         disable_temporal_chunking: args.disable_temporal_chunking,
         async_ingest: args.async_ingest,
         minimal_response: false,
@@ -1066,13 +2265,13 @@ async fn handle_ingest(args: IngestArgs) {
                 Err(e) => eprintln!("✗ Failed: {}", e),
             }
         }
-        IngestType::File { path, project } => {
+        IngestType::File { path, project, url } => {
             let project = project
                 .or_else(get_default_project)
                 .expect("Project ID required");
             if let Ok(content) = std::fs::read_to_string(&path) {
                 let res = client
-                    .post("http://localhost:8080/ingest/content")
+                    .post(format!("{}/ingest/content", url))
                     .header("X-Project-ID", project)
                     .json(&serde_json::json!({ "content": content, "filename": path }))
                     .send()
@@ -1091,12 +2290,13 @@ async fn handle_ingest(args: IngestArgs) {
             project,
             depth,
             same_domain_only,
+            server_url,
         } => {
             let project = project
                 .or_else(get_default_project)
                 .expect("Project ID required");
             let res = client
-                .post("http://localhost:8080/ingest/url")
+                .post(format!("{}/ingest/url", server_url))
                 .header("X-Project-ID", project)
                 .json(&api::IngestUrlRequest {
                     url,
@@ -1120,7 +2320,6 @@ async fn handle_recall(args: RecallArgs) {
         .or_else(get_default_project)
         .expect("Project ID required");
     let client = reqwest::Client::new();
-    let cuepacks = selected_cuepacks(args.cuepacks.clone(), args.disable_default_cuepacks);
     let parent_fusion = match args.parent_fusion.as_str() {
         "auto" => api::ParentFusionMode::Auto,
         "force" => api::ParentFusionMode::Force,
@@ -1148,7 +2347,6 @@ async fn handle_recall(args: RecallArgs) {
             min_intersection: args.min_intersection,
             disable_alias_expansion: !args.enable_alias_expansion,
             expansion_depth: args.expansion_depth,
-            cuepacks: cuepacks.clone(),
         };
         let res = client
             .post(format!("{}/recall/grounded", args.url))
@@ -1208,6 +2406,12 @@ async fn handle_recall(args: RecallArgs) {
         let payload = api::RecallRequest {
             cues: args.cues,
             query_text: Some(args.query),
+            query_embedding: None,
+            semantic_mode: match args.semantic_mode.as_str() {
+                "lexical" => cuemap::semantic::SemanticRecallMode::Lexical,
+                "semantic" => cuemap::semantic::SemanticRecallMode::Semantic,
+                _ => cuemap::semantic::SemanticRecallMode::Hybrid,
+            },
             query_time: args.query_time,
             limit: args.limit,
             auto_reinforce: !args.no_auto_reinforce,
@@ -1219,7 +2423,6 @@ async fn handle_recall(args: RecallArgs) {
             disable_alias_expansion: !args.enable_alias_expansion,
             depth: args.depth,
             expansion_depth: args.expansion_depth,
-            cuepacks,
             parent_fusion,
             parent_fusion_limit: args.parent_fusion_limit,
             parent_fusion_min_chunks: args.parent_fusion_min_chunks,
@@ -1276,12 +2479,12 @@ async fn handle_lexicon(args: LexiconArgs) {
     let client = reqwest::Client::new();
 
     match args.cmd {
-        LexiconCmd::Inspect { cue, project } => {
+        LexiconCmd::Inspect { cue, project, url } => {
             let project_id = project
                 .or_else(get_default_project)
                 .expect("Project ID required");
             let res = client
-                .get(format!("http://localhost:8080/lexicon/inspect/{}", cue))
+                .get(format!("{}/lexicon/inspect/{}", url, cue))
                 .header("X-Project-ID", project_id)
                 .send()
                 .await;
@@ -1292,78 +2495,6 @@ async fn handle_lexicon(args: LexiconArgs) {
                     println!("Associated Memories: {}", body.outgoing.len());
                 }
                 _ => eprintln!("✗ Inspect failed"),
-            }
-        }
-    }
-}
-
-fn selected_cuepacks(cuepacks: Option<Vec<String>>, disable_defaults: bool) -> Option<Vec<String>> {
-    if disable_defaults {
-        Some(vec!["off".to_string()])
-    } else {
-        cuepacks
-    }
-}
-
-fn local_cuepack_registry() -> cuemap::cuepacks::CuePackRegistry {
-    cuemap::cuepacks::CuePackRegistry::load_from_default_locations(true)
-}
-
-fn handle_cuepack(args: CuePackArgs) {
-    match args.cmd {
-        CuePackCmd::List => {
-            let registry = local_cuepack_registry();
-            println!("\n--- CUEPACKS ---");
-            for info in registry.infos() {
-                let default_marker = if info.enabled_by_default {
-                    "default"
-                } else {
-                    "opt-in"
-                };
-                println!(
-                    "- {} {} [{}] memory_rules={} query_rules={} source={}",
-                    info.name,
-                    info.version,
-                    default_marker,
-                    info.memory_rules,
-                    info.query_rules,
-                    info.source
-                );
-            }
-            for error in registry.load_errors() {
-                eprintln!("! {}", error);
-            }
-        }
-        CuePackCmd::Inspect { name } => {
-            let registry = local_cuepack_registry();
-            let Some(info) = registry
-                .infos()
-                .into_iter()
-                .find(|info| info.name == name)
-            else {
-                eprintln!("✗ CuePack not found: {}", name);
-                return;
-            };
-            println!("\n--- CUEPACK: {} ---", info.name);
-            println!("Version: {}", info.version);
-            println!("Default: {}", info.enabled_by_default);
-            println!("Source: {}", info.source);
-            println!("Memory rules: {}", info.memory_rules);
-            println!("Query rules: {}", info.query_rules);
-            if let Some(description) = info.description {
-                println!("{}", description);
-            }
-        }
-        CuePackCmd::Validate { path } => {
-            match cuemap::cuepacks::CuePackRegistry::validate_file(Path::new(&path)) {
-                Ok(info) => {
-                    println!("✓ CuePack is valid: {} {}", info.name, info.version);
-                    println!(
-                        "memory_rules={} query_rules={}",
-                        info.memory_rules, info.query_rules
-                    );
-                }
-                Err(err) => eprintln!("✗ {}", err),
             }
         }
     }
@@ -1687,6 +2818,65 @@ async fn handle_logs(args: LogsArgs) {
     }
 }
 
+async fn wait_for_readiness(
+    log_path: &Path,
+    start_pos: u64,
+    sentinel: &str,
+    timeout: Duration,
+) -> std::io::Result<bool> {
+    let mut file = File::open(log_path)?;
+    let _ = file.seek(SeekFrom::Start(start_pos));
+    let mut reader = BufReader::new(file);
+    let start_time = std::time::Instant::now();
+    let mut line = String::new();
+
+    while start_time.elapsed() < timeout {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Ok(_) => {
+                print!("{}", line);
+                if line.contains(sentinel) {
+                    return Ok(true);
+                }
+            }
+            Err(_) => return Ok(false),
+        }
+    }
+
+    Ok(false)
+}
+
+async fn spawn_detached_process(
+    exe: &Path,
+    child_args: &[String],
+    log_path: &Path,
+    sentinel: &str,
+    timeout: Duration,
+) -> std::io::Result<bool> {
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    let stdout_file = log_file.try_clone()?;
+    let stderr_file = log_file.try_clone()?;
+    let start_pos = log_file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+
+    let child = std::process::Command::new(exe)
+        .args(child_args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(stdout_file))
+        .stderr(std::process::Stdio::from(stderr_file))
+        .spawn()?;
+
+    println!("✓ Background server spawning (PID: {})...", child.id());
+    println!("✓ Waiting for readiness sentinel in {}...", log_path.display());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_readiness(log_path, start_pos, sentinel, timeout).await
+}
+
 async fn handle_start_detached(args: StartArgs) {
     let mut child_args: Vec<String> = std::env::args()
         .filter(|a| a != "--detach" && a != "-d")
@@ -1703,87 +2893,42 @@ async fn handle_start_detached(args: StartArgs) {
         path.to_string_lossy().to_string()
     });
 
-    // Open log file for redirection
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .expect("Failed to open log file");
-
-    // Clone file handles for stdout and stderr
-    let stdout_file = log_file
-        .try_clone()
-        .expect("Failed to clone log file handle");
-    let stderr_file = log_file
-        .try_clone()
-        .expect("Failed to clone log file handle");
-
-    // Capture current size to start reading from
-    let start_pos = log_file.metadata().map(|m| m.len()).unwrap_or(0);
-
-    // Spawn the child
-    let _child = std::process::Command::new(&exe)
-        .args(&child_args[1..])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::from(stdout_file))
-        .stderr(std::process::Stdio::from(stderr_file))
-        .spawn()
-        .expect("Failed to spawn background server");
-
-    println!("✓ Background server spawning (PID: {})...", _child.id());
-    println!("✓ Waiting for readiness sentinel in {}...", log_path);
-
     // Readiness sentinel we are looking for: "Unstable sorting for speed"
     let sentinel = "Unstable sorting for speed";
-    let start_time = std::time::Instant::now();
     let timeout = Duration::from_secs(30);
 
-    // Wait for logs to appear
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    if let Ok(mut file) = File::open(&log_path) {
-        let _ = file.seek(SeekFrom::Start(start_pos)); // Start tailing from the spawn time
-        let mut reader = BufReader::new(file);
-        let mut line = String::new();
-        let mut found = false;
-
-        while start_time.elapsed() < timeout {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) => {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                Ok(_) => {
-                    print!("{}", line);
-                    if line.contains(sentinel) {
-                        found = true;
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-
-        if found {
+    match spawn_detached_process(
+        &exe,
+        &child_args[1..],
+        Path::new(&log_path),
+        sentinel,
+        timeout,
+    )
+    .await
+    {
+        Ok(true) => {
             println!("\n✓ CueMap server is now running in the background.");
             println!("  - View logs:   cuemap logs --follow");
             println!("  - Stop server: cuemap stop");
-        } else {
+        }
+        Ok(false) => {
             eprintln!(
                 "\n✗ Timeout waiting for server readiness. Check logs at: {}",
                 log_path
             );
         }
-    } else {
-        eprintln!(
+        Err(_) => eprintln!(
             "\n✗ Could not open log file to verify startup: {}",
             log_path
-        );
+        ),
     }
 }
 
 async fn handle_stop(_args: StopArgs) {
-    let pid_path = config::get_base_dir().join("server.pid");
+    handle_stop_at(config::get_base_dir().join("server.pid")).await;
+}
+
+async fn handle_stop_at(pid_path: PathBuf) {
     if !pid_path.exists() {
         eprintln!("✗ No server.pid found. Server might not be running or wasn't started with this version.");
         return;

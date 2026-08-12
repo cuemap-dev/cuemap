@@ -6,6 +6,7 @@ use crate::engine::CueMapEngine;
 use crate::normalization::NormalizationConfig;
 use crate::persistence::PersistenceManager;
 use crate::projects::ProjectContext;
+use crate::semantic::SemanticEncoder;
 use crate::structures::{LexiconStats, MainStats};
 use crate::taxonomy::Taxonomy;
 use ahash::RandomState;
@@ -15,7 +16,7 @@ use std::collections::HashMap;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub type ProjectId = String;
@@ -67,6 +68,7 @@ pub struct MultiTenantEngine {
     master_key: Option<Arc<EncryptionKey>>,
     tuning: Arc<TuningConfig>,
     config: crate::config::ServerConfig,
+    semantic_encoder: Arc<OnceLock<Result<Option<Arc<dyn SemanticEncoder>>, String>>>,
 }
 
 impl MultiTenantEngine {
@@ -92,24 +94,43 @@ impl MultiTenantEngine {
             master_key: None,
             tuning: Arc::new(tuning),
             config: crate::config::ServerConfig::default(),
+            semantic_encoder: Arc::new(OnceLock::new()),
         }
     }
 
     pub fn with_config(
-        config: crate::config::ServerConfig,
+        mut config: crate::config::ServerConfig,
         snapshots_dir: PathBuf,
     ) -> Self {
         if let Err(e) = fs::create_dir_all(&snapshots_dir) {
             eprintln!("Warning: Failed to create snapshots directory: {}", e);
         }
 
-        Self {
+        config.semantic = config.semantic.resolved();
+
+        let engine = Self {
             projects: Arc::new(DashMap::with_hasher(RandomState::new())),
             snapshots_dir,
             master_key: None,
             tuning: Arc::new(config.tuning.clone()),
             config,
+            semantic_encoder: Arc::new(OnceLock::new()),
+        };
+        if engine.config.semantic.encoder_enabled {
+            if let Err(error) = engine.configured_semantic_encoder() {
+                tracing::warn!(
+                    error = %error,
+                    "Semantic encoder unavailable; continuing without automatic text embeddings"
+                );
+            }
         }
+        engine
+    }
+
+    fn configured_semantic_encoder(&self) -> Result<Option<Arc<dyn SemanticEncoder>>, String> {
+        self.semantic_encoder
+            .get_or_init(|| crate::semantic::load_configured_encoder(&self.config.semantic))
+            .clone()
     }
 
     pub fn set_master_key(&mut self, key: Option<Arc<EncryptionKey>>) {
@@ -125,12 +146,24 @@ impl MultiTenantEngine {
             Ok(ctx.clone())
         } else {
             // Create new project with default config
-            let mut ctx_obj = ProjectContext::new(
+            let semantic_encoder = match self.configured_semantic_encoder() {
+                Ok(encoder) => encoder,
+                Err(error) => {
+                    tracing::warn!(
+                        project_id = %project_id,
+                        error = %error,
+                        "Semantic encoder unavailable; continuing without automatic text embeddings"
+                    );
+                    None
+                }
+            };
+            let mut ctx_obj = ProjectContext::new_with_encoder(
                 NormalizationConfig::default(),
                 Taxonomy::default(),
                 self.tuning.clone(),
                 self.config.clone(),
                 project_id.clone(),
+                semantic_encoder,
             );
 
             // Set master key on engines
@@ -268,6 +301,16 @@ impl MultiTenantEngine {
         );
         main_engine.set_master_key(self.master_key.clone());
         main_engine.set_tuning_config(self.tuning.as_ref().clone());
+        match self.configured_semantic_encoder() {
+            Ok(semantic_encoder) => main_engine.set_semantic_encoder(semantic_encoder),
+            Err(error) => {
+                tracing::warn!(
+                    project_id = %project_id,
+                    error = %error,
+                    "Semantic encoder unavailable for loaded project; continuing without automatic text embeddings"
+                );
+            }
+        }
 
         // Load aliases engine (optional - may not exist for older snapshots)
         let mut aliases_engine = if aliases_path.exists() {
@@ -282,6 +325,7 @@ impl MultiTenantEngine {
                     tracing::debug!("Loaded aliases for project '{}'", project_id);
                     let mut local_config = self.config.clone();
                     local_config.server.store_content_on_disk = false;
+                    local_config.semantic = crate::semantic::SemanticConfig::default();
                     let engine = CueMapEngine::from_state(
                         memories,
                         source_key_to_id,
@@ -317,6 +361,7 @@ impl MultiTenantEngine {
                     tracing::debug!("Loaded lexicon for project '{}'", project_id);
                     let mut local_config = self.config.clone();
                     local_config.server.store_content_on_disk = false;
+                    local_config.semantic = crate::semantic::SemanticConfig::default();
                     let engine = CueMapEngine::from_state(
                         memories,
                         source_key_to_id,

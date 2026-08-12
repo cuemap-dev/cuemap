@@ -420,7 +420,6 @@ class CueMapNLBenchmark:
                     "disable_cuebridge_artifacts": True,
                     "depth": 1,
                     "expansion_depth": 1,
-                    "cuepacks": [],
                     "parent_fusion": "off",
                     "ordered_reconstruction": "off",
                     "evidence_coverage": "off",

@@ -1,5 +1,8 @@
 # CueMap Rust Engine
 
+[![CI](https://github.com/cuemap-dev/cuemap/actions/workflows/coverage.yml/badge.svg?branch=v0.7.2)](https://github.com/cuemap-dev/cuemap/actions/workflows/coverage.yml)
+[![Coverage](https://codecov.io/github/cuemap-dev/cuemap/branch/v0.7.2/graph/badge.svg?flag=rust-engine)](https://app.codecov.io/github/cuemap-dev/cuemap)
+
 **High-performance temporal-associative memory store** designed for dynamic contextual retrieval.
 
 ## Overview
@@ -7,14 +10,14 @@
 CueMap implements a **Continuous Gradient Algorithm** optimized for associative data structures:
 
 1.  **Intersection (Context Filter)**: Triangulates relevant memories by overlapping cues
-2.  **CuePack-Guided Intent Routing**: Uses compiled deterministic rules to add structural facets and weighted intent cues without runtime model calls.
+2.  **Structural Extraction**: Emits deterministic cues for observable evidence such as dates, numbers, lists, source metadata, and surface entities.
 3.  **Recency & Salience (Signal Dynamics)**: Balances fresh data with salient, high-signal events prioritized by an adaptive impact scoring module.
 4.  **Reinforcement (Access-based Learning)**: Frequently accessed memories gain signal strength, remaining highly accessible even as they age.
-5.  **Deterministic Facets & Intent Routing**: Extracts synchronous source, evidence, temporal, type, and entity facets, then uses sparse intent cues and reranking during recall.
+5.  **Sparse Recall**: Uses normalized lexical cues, structural facets, recency, salience, and bounded deterministic reranking.
 
-As of v0.7.0, CueMap's core path is deterministic and embedding-free. GloVe/Ollama cue generation, WordNet/POS expansion, semantic bridges, pattern completion, external lexicon graphs, context expansion/speculation endpoints, and autonomous consolidation have been removed from the core engine.
+As of v0.7.2, CueMap's default core path is deterministic and ontology-free. GloVe/Ollama cue generation, WordNet/POS expansion, semantic bridges, pattern completion, external lexicon graphs, context expansion/speculation endpoints, and autonomous consolidation have been removed from the default engine path. v0.7.2 bundles a qint8 `all-MiniLM-L3-v2` vector layer for semantic reranking, intent classification, and query embeddings; the `edge` profile selects a q4 build of the same model. The encoder can still be disabled for constrained builds or deployments.
 
-v0.7.0 also uses numeric per-project memory IDs everywhere. If callers need deterministic upsert/dedupe identity, pass `source_key`; memory IDs remain compact runtime addresses.
+v0.7.2 also uses numeric per-project memory IDs everywhere. If callers need deterministic upsert/dedupe identity, pass `source_key`; memory IDs remain compact runtime addresses.
 
 Built with Rust for maximum performance and reliability.
 
@@ -36,8 +39,8 @@ CueMap treats the nlprule tokenizer as a runtime asset, not a build artifact. Se
 ### Docker
 
 ```bash
-docker build -t cuemap/engine:0.7.1 .
-docker run -p 8080:8080 -v "$(pwd)/local_snapshot_dir:/app/data" cuemap/engine:0.7.1
+docker build -t cuemap/engine:0.7.2 .
+docker run -p 8080:8080 -v "$(pwd)/local_snapshot_dir:/app/data" cuemap/engine:0.7.2
 ```
 
 The container runs as the unprivileged `cuemap` user. Ensure a bind-mounted data directory is writable by UID/GID `10001`, or use a Docker-managed volume. Runtime defaults can be overridden with `CUEMAP_PORT`, `CUEMAP_DATA_DIR`, `CUEMAP_SNAPSHOT_INTERVAL_SECONDS`, `TOKENIZER_PATH`, and `RUST_LOG`.
@@ -85,7 +88,6 @@ cuemap <COMMAND> [OPTIONS]
 #### Deterministic Semantics
 - **`lexicon`**: Inspect lexicon entries and wire/unwire cues.
 - **`alias`**: Manage explicit deterministic aliases.
-- **`cuepack`**: List, inspect, and validate deterministic semantic packs.
 
 Hint: Use `cuemap --help` to see available commands and options.
 
@@ -189,8 +191,9 @@ Snapshots are automatically managed:
 - **Created**: Periodically and on graceful shutdown (SIGINT/Ctrl+C) when persistence is enabled.
 - **Loaded**: On server startup
 - **Disabled**: `--disable-snapshots` turns off periodic and shutdown snapshot saves.
-- **Location**: `~/.cuemap/data/snapshots/` by default, or `<--data-dir>/snapshots` when `--data-dir` is set.
-- **Format**: Bincode binary
+- **Location**: `~/.cuemap/data/snapshots/` by default, or `<--data-dir>/snapshots` when `--data-dir` is set. Older installs may also be discovered under the legacy sibling `snapshots/` directory.
+- **Format**: zstd-compressed JSON inside `.bin` files. This preserves arbitrary metadata reliably while keeping snapshots compact; older uncompressed bincode snapshots remain readable when their metadata can be decoded.
+- **Migration note**: Some pre-v0.7.2 bincode snapshots that contain dynamic JSON metadata cannot be decoded by bincode's `deserialize_any` limitation. Those projects are reported at startup and must be reingested or exported from a compatible older binary before upgrading.
 - **Files**: `{project-id}.bin`, `{project-id}_lexicon.bin`, `{project-id}_aliases.bin`
 
 ### Cloud Backup
@@ -324,11 +327,11 @@ To optimize storage efficiency, especially for large textual memories, CueMap em
 
 ## Performance
 
-### Benchmark Results (v0.7.0)
+### Benchmark Results (v0.7.2)
 
 Tests performed on **Real-World Data** (Wikipedia Articles), processing full natural language sentences with the complete NLP pipeline.
 
-**Hardware:** MacBook Pro M-series, 64GB RAM, single node. These are local v0.7 benchmark numbers from the numeric-ID engine.
+**Hardware:** MacBook Pro M-series, 64GB RAM, single node. The final v0.7.2 release table is being refreshed with semantic reranking disabled so it remains comparable with the sparse-core baseline. The checked-in v0.7 baseline below is retained until the remaining BEAM 10M and performance runs complete.
 
 #### Benchmark Methodology
 
@@ -339,7 +342,7 @@ Benchmark setup:
 - Deduplicates sampled snippets and consumes them without replacement, so 100K and 1M write runs do not reuse the same text.
 - Writes use HTTP `POST /memories` with `minimal_response=true` and no explicit cues, forcing CueMap to run deterministic cue/facet extraction and indexing.
 - Reads generate keyword-style natural-language queries from retained ingested snippets.
-- Recall numbers use the script's lean recall mode: `auto_reinforce=false`, salience disabled, alias expansion disabled, CueBridge artifacts disabled, `depth=1`, `expansion_depth=1`, and parent/order/evidence reconstruction disabled. This isolates the core sparse recall path.
+- Recall numbers use the script's lean recall mode: `auto_reinforce=false`, salience disabled, alias expansion disabled, semantic reranking disabled, CueBridge artifacts disabled, `depth=1`, `expansion_depth=1`, and parent/order/evidence reconstruction disabled. This isolates the core sparse recall path.
 - `--trace-timing` records engine timing breakdowns but is not required for throughput measurements.
 
 Example run:
@@ -376,9 +379,48 @@ Write latency remains mostly flat with project size; the dominant cost is per-me
 | **1,000,000** | 2.70 ms | 2.06 ms | 5.10 ms |
 
 **Key Metrics**:
-- **Low-latency recall:** 1M-memory natural-language recall stays around 2.7ms average with about 5.1ms p99 in the current v0.7 run.
+- **Low-latency recall:** The 1M-memory v0.7 baseline measured 2.7ms average with 5.1ms p99; replace these values with the final semantic-reranker-disabled v0.7.2 run before publishing.
 - **Numeric ID memory reduction:** 1M in-memory footprint dropped from about 5.25GB to about 1.93GB after the v0.7 numeric memory-ID refactor.
-- **Deterministic hot path:** recall uses in-memory sparse indexes and does not call embeddings, LLMs, network services, or disk scans.
+- **Controlled hot path:** the release benchmark disables the local semantic encoder, LLMs, network services, and disk scans; normal v0.7.2 hybrid recall can use the bundled local encoder for bounded reranking.
+
+## Test Coverage
+
+Coverage is measured in CI with LLVM source-based instrumentation through [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) and uploaded to Codecov. The badge above reports the `rust-engine` flag for the v0.7.2 release branch.
+
+To connect Codecov for `cuemap-dev/cuemap`:
+
+1. Sign in to [Codecov](https://app.codecov.io/) with GitHub and add/select the `cuemap` repository.
+2. If Codecov requires token authentication, copy the repository upload token from the repository's Codecov configuration.
+3. In GitHub, open **Settings → Secrets and variables → Actions**, create a repository secret named `CODECOV_TOKEN`, and paste only the token value.
+4. Push `.github/workflows/coverage.yml` or run the workflow from **Actions → Rust Coverage → Run workflow**.
+
+For a public repository, Codecov may allow tokenless uploads if that organization setting is enabled; in that case the workflow can run without the secret. Never commit or paste the token into source files or chat.
+
+Repository slug note: this checkout currently reports `cuemap-dev/engine.git` as its Git remote, while the badge and setup above target `cuemap-dev/cuemap`. Keep those slugs aligned with the repository that will run this workflow; if the Rust engine is published as `engine`, change the badge, Codecov link, and project selection accordingly.
+
+The local all-feature baseline measured on 2026-08-12 was:
+
+| Metric | Coverage |
+| --- | ---: |
+| Lines | 83.10% |
+| Regions | 82.47% |
+| Functions | 84.21% |
+
+The critical `src/engine.rs` path now measures **94.10% lines**, **93.79% regions**, and **90.91% functions** when the library and dedicated engine integration suite are measured together. This focused gate covers storage lifecycle, semantic retrieval/reranking, structured scoring, source-order expansion, temporal chunking, decay, consolidation, and both MainStats and LexiconStats engines.
+
+The server-health persistence slice is also gated independently: `src/projects.rs` measures **95.30% lines**, **94.67% regions**, and **95.83% functions**, while `src/persistence.rs` measures **90.40% lines**, **87.30% regions**, and **88.24% functions** across the library and project tests.
+
+This is the current engineering baseline, not the release target; the Rust engine release target is 90%+.
+
+That baseline runs the Rust library and CLI handler tests plus the registered integration suites with the bundled qint8/q4 MiniLM encoder enabled. CLI startup/handler coverage is now 90.13% lines, 90.12% regions, and 80.83% functions; the HTTP/API surface is now 83.32% lines, 83.62% regions, and 87.16% functions. Intent classification, structural facets, persistence, ingestion, filesystem watching, and the core engine are substantially better covered. The release target remains 90%+ overall line coverage.
+
+Run the same report locally with:
+
+```bash
+rustup component add llvm-tools-preview
+cargo install cargo-llvm-cov --locked
+cargo llvm-cov --all-features --workspace --summary-only
+```
 
 ## Architecture
 
@@ -402,7 +444,9 @@ Write latency remains mostly flat with project size; the dominant cost is per-me
 
 ### Deterministic Cue Extraction
 
-CueMap extracts cues synchronously from content and metadata using deterministic tokenization, normalization, facets, aliases, and CuePack rules. The recall path does not call embeddings, LLMs, WordNet, external APIs, or runtime graph expansion.
+CueMap extracts cues synchronously from content and metadata using deterministic tokenization, normalization, structural facets, and explicit aliases. The lexical candidate path is deterministic; the default v0.7.2 hybrid path may then use the bundled local qint8 MiniLM-L3 encoder for bounded semantic and intent reranking. No LLM or external API is required.
+
+Structural facets describe observable form—such as dates, times, quantities, ranges, identifiers, lists, URLs, email addresses, quoted spans, code/document markers, scripts, file names, and file paths—and do not claim to understand domain meaning. Query planning adds a small bounded set of English grammatical/query-shape heuristics for perspective, answer shape, collection, summary, ordering, and reference-time resolution. Locale-specific implementations can be added later under separate language packs rather than expanding the core with domain ontology rules.
 
 ```bash
 # 1. Start CueMap
@@ -417,6 +461,80 @@ curl -X POST http://localhost:8080/memories \
   }'
 # Deterministic extraction adds normalized lexical cues plus structural/facet cues.
 ```
+
+### Local Semantic Retrieval
+
+The engine also accepts caller-provided vectors at ingestion and query time. This is useful when an application already owns an embedding provider or wants to avoid automatic encoding:
+
+```json
+{
+  "content": "The payments service is down due to a timeout.",
+  "embedding": [0.12, -0.04, 0.88]
+}
+```
+
+```json
+{
+  "query_text": "Why did payments fail?",
+  "query_embedding": [0.10, -0.02, 0.91],
+  "limit": 8
+}
+```
+
+Enable or tune it with the `[semantic]` server configuration section. The default build selects the bundled qint8 `all-MiniLM-L3-v2` weights and enables local text embeddings. Set `encoder_enabled = false`, `profile = "off"`, or `CUEMAP_SEMANTIC_ENCODER_ENABLED=false` to disable automatic encoding. The encoder-free build remains available with `cargo build --no-default-features`. The `edge` profile selects the bundled q4 L3 model while lowering ANN fanout and the vector memory budget:
+
+```toml
+[semantic]
+profile = "edge"       # off, edge, balanced, or quality
+dimensions = 384        # both bundled MiniLM variants emit 384 dimensions
+storage = "int8"        # auto, f32, f16, or int8
+index = "auto"           # auto, exact, or ann
+max_memory_mb = 32
+model_id = "all-MiniLM-L3-v2"
+model_version = "bundled-q4-minilm-l3"
+```
+
+Profiles choose device-oriented defaults for dimensions, compact storage, ANN fanout, and a conservative memory budget. Any explicitly set dimension/storage/index/budget overrides the profile. CueMap never downloads a model at runtime. The default build embeds the MiniLM ONNX graph and tokenizer; empty model paths use those bundled assets, while explicit paths provide local overrides:
+
+```toml
+[semantic]
+profile = "quality"
+dimensions = 384
+storage = "int8"
+index = "auto"
+encoder_enabled = true
+model_id = "all-MiniLM-L3-v2"
+model_version = "bundled-qint8-minilm-l3"
+model_path = ""           # empty = bundled model
+tokenizer_path = ""       # empty = bundled tokenizer
+max_tokens = 128          # bundled L3 default
+encoder_threads = 0        # runtime/platform default
+coreml_enabled = true
+semantic_rerank_weight = 0.60  # hybrid only; 0 = lexical, 1 = semantic ordering
+semantic_rerank_candidate_limit = 200  # lexical candidates scored semantically in hybrid
+query_embedding_cache_capacity = 256  # repeated query embeddings retained in memory
+intent_rerank_enabled = true
+intent_rerank_weight = 0.65
+intent_no_recall_penalty = 0.20
+intent_rerank_max_delta = 64
+```
+
+Build the default path with `cargo build --release`; `--no-default-features` produces an encoder-free build. No model download or network call is made by CueMap while serving. Both the qint8 default and q4 edge MiniLM-L3 bundles emit 384-dimensional vectors with a 128-word-piece window. An explicit local model path can override either bundled asset. On Apple targets, `coreml_enabled = true` requests the CoreML execution provider from the CoreML-enabled ONNX Runtime; set it to false to use CPU execution. The index uses in-memory random-hyperplane ANN buckets and falls back to exact candidate discovery for small indexes. A query can use lexical, semantic, or hybrid signals via `semantic_mode`; hybrid performs lexical discovery, keeps the configured lexical rerank window, and applies local semantic and intent reranking before the final result limit, while semantic mode uses vector candidate discovery without lexical cues. Repeated query text embeddings use a bounded in-memory cache when enabled. `/ingest/content` accepts an `embeddings` array with one vector per produced chunk.
+
+For launch scripts, the same encoder fields can be supplied through `CUEMAP_SEMANTIC_*` environment variables, including `CUEMAP_SEMANTIC_PROFILE`, `CUEMAP_SEMANTIC_ENCODER_ENABLED`, `CUEMAP_SEMANTIC_MODEL_PATH`, `CUEMAP_SEMANTIC_TOKENIZER_PATH`, `CUEMAP_SEMANTIC_DIMENSIONS`, `CUEMAP_SEMANTIC_STORAGE`, `CUEMAP_SEMANTIC_INDEX`, `CUEMAP_SEMANTIC_ENCODER_THREADS`, `CUEMAP_SEMANTIC_COREML_ENABLED`, `CUEMAP_SEMANTIC_RERANK_WEIGHT`, `CUEMAP_SEMANTIC_RERANK_CANDIDATE_LIMIT`, `CUEMAP_SEMANTIC_QUERY_CACHE_CAPACITY`, `CUEMAP_SEMANTIC_INTENT_RERANK_ENABLED`, `CUEMAP_SEMANTIC_INTENT_RERANK_WEIGHT`, `CUEMAP_SEMANTIC_INTENT_NO_RECALL_PENALTY`, and `CUEMAP_SEMANTIC_INTENT_RERANK_MAX_DELTA`. Set the encoder flag to `false` to disable automatic text embedding, or set the cache capacity to `0` to disable query embedding caching.
+
+### Local Intent Classification
+
+`POST /intent/classify` uses the configured local encoder to classify either query intent or durable-memory intent. A model-specific 8-class linear head maps the frozen MiniLM embedding directly to relative ranking scores; production classification contains no semantic word lists, phrase matching, or category overrides. Recall eligibility follows the learned category, with a syntax-only fallback for low-margin question-shaped or short incomplete queries; durable-memory eligibility always follows the learned category. The qint8 and q4 heads are trained separately because quantization changes the embedding space. A custom semantic model version has no intent classifier unless a compatible head is bundled, preventing weights trained for one encoder from silently being applied to another. The response includes the primary and top intents, confidence weight, `recall_eligible`, `recall_action`, `memory_eligible`, and model/taxonomy versions:
+
+```bash
+curl -X POST http://localhost:8080/intent/classify \
+  -H "X-Project-ID: default" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"What did we decide about retries?","target":"query"}'
+```
+
+Newly ingested memories are classified in the background when background jobs and the encoder are enabled. `/jobs/status` reports `intent_completed`, `intent_total`, `intent_failed`, coverage counts, and `intent_ready`; consumers should not treat ingestion as fully ready until the intent work is terminal and `intent_ready` is true.
 
 ## API Reference
 
@@ -443,7 +561,7 @@ curl -X POST http://localhost:8080/memories \
   }'
 ```
 
-`source_key` makes ingestion idempotent: adding the same source again updates its existing memory. `event_time` is the original event time as Unix seconds and defaults to ingestion time. Importers may instead provide `metadata.source_timestamp` as Unix seconds or RFC 3339; an explicit `event_time` takes precedence.
+`source_key` makes ingestion idempotent: adding the same source again updates its existing memory. `event_time` is the original event time as Unix seconds and defaults to ingestion time. Importers may instead provide `metadata.source_timestamp` as Unix seconds or RFC 3339; an explicit `event_time` takes precedence. `embedding` accepts a precomputed vector for one memory; raw-content ingestion uses `embeddings` with exactly one vector per produced chunk.
 
 ### Recall Memories
 
@@ -592,27 +710,6 @@ Remove a specific token from the lexicon.
 ```bash
 curl -X DELETE "http://localhost:8080/lexicon/entry/cue:stripe"
 ```
-
-### CuePacks
-
-CuePacks are deterministic semantic packages. They are the maintainable place for domain vocabulary, semantic phrase families, facet rules, query-intent rules, aliases, and policy metadata. CuePacks are compiled at startup or request setup; recall does not call a network service, run embeddings, scan raw memory content, or read pack files from disk.
-
-Bundled defaults are enabled unless disabled. Place custom packs in `~/.cuemap/cuepacks/` as TOML files and inspect them with:
-
-```bash
-cuemap cuepack list
-cuemap cuepack inspect memory-general
-cuemap cuepack validate ./my-domain-pack.toml
-```
-
-Select packs per request:
-
-```bash
-cuemap recall -p my_project --cuepacks memory-general "which transit app did I use?"
-cuemap recall -p my_project --disable-default-cuepacks "core-only recall"
-```
-
-API requests accept a separate `cuepacks` field. Use `["off"]` for core-only behavior, omit the field for bundled defaults, or pass explicit pack names.
 
 ### CueBridge Artifacts
 
@@ -805,7 +902,7 @@ graph TB
     
     subgraph "Intelligence"
         NL[NL Tokenizer<br/>Lemmatization + RAKE]
-        PACKS[CuePacks<br/>Facet + Intent Rules]
+        STRUCT[Structural Facets<br/>Evidence + Metadata]
     end
     
     subgraph "Persistence"
@@ -824,7 +921,6 @@ graph TB
     AXUM --> SESSION
     
     QUEUE --> LEX
-    AXUM --> PACKS
     
     MAIN <-.-> PERSIST
     LEX <-.-> PERSIST
@@ -976,23 +1072,22 @@ The agent transforms your local filesystem into a deterministic structural knowl
     *   **Documents**: PDF (text extraction), Word (DOCX), Excel (XLSX).
     *   **Data**: CSV (row-aware), JSON (key-aware), YAML, XML.
 *   **Tree-sitter Powered Chunking**: Smartly splits code into functions, classes, and modules while preserving context.
-*   **Deterministic Knowledge Extraction**: Uses tree-sitter structure, document parsers, metadata facets, token normalization, and CuePack rules; no runtime model call is required.
+*   **Deterministic Knowledge Extraction**: Uses tree-sitter structure, document parsers, metadata facets, and token normalization; no runtime model call is required.
 *   **Idempotent Updates**: Uses content-aware hashing (`file:<path>:<hash>`) to prevent memory duplication and ensure stale memories are pruned.
 *   **Background Verification Loop**: Continuously verifies that memories in the engine still exist on disk, pruning stale references automatically.
 
 ### 2. Deterministic Natural Language Engine
 
-CueMap bridges unstructured text to sparse deterministic recall without vector search, runtime models, or background semantic expansion.
+CueMap bridges unstructured text to sparse deterministic recall without vector search, runtime models, or background semantic expansion by default. Optional vector retrieval can add externally computed semantic candidates without changing the structural extraction path.
 
 #### How It Works
 
 At add-time, CueMap extracts cues synchronously from real structure:
 
 - normalized lexical cues
-- entity, quote, model-like, and quantity-object cues
+- surface entity, quote, model-like, and structural evidence cues
 - evidence facets such as numbers, money, dates, durations, and lists
 - source facets from metadata such as role, channel, session, and order
-- CuePack-derived deterministic facet and intent cues
 
 At query-time, CueMap uses the same deterministic normalization path, then applies only bounded in-memory expansions:
 
@@ -1003,9 +1098,8 @@ At query-time, CueMap uses the same deterministic normalization path, then appli
 
 #### Semantic Boundary
 
-CueMap Core does not try to infer broad semantic relationships from local co-occurrence. That keeps recall fast, deterministic, and inspectable. Semantic gap closure belongs in explicit artifacts:
+CueMap Core does not try to infer broad semantic relationships from local co-occurrence or ontology rules. That keeps the default recall fast, deterministic, and inspectable. Semantic gap closure can come from externally precomputed vectors or explicit artifacts:
 
-- **CuePacks**: deterministic domain rules, facets, aliases, and query intent policies.
 - **Manual Lexicon Wiring**: explicit token-to-canonical cue connections for project owners.
 - **CueBridge Artifacts**: offline-compiled GapPack/AliasPack files generated by CueBridge Local or Cloud and loaded into CueMap.
 

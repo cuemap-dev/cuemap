@@ -1,6 +1,24 @@
 use reqwest::Client;
 use scraper::{Html, Selector};
 
+fn parse_ddg_lite_results(html: &str, limit: usize) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let document = Html::parse_document(html);
+    // DDG Lite structure: the anchor tag itself has class 'result-link'.
+    let link_selector = Selector::parse(".result-link").expect("static selector is valid");
+
+    document
+        .select(&link_selector)
+        .filter_map(|element| element.value().attr("href"))
+        .filter(|href| href.starts_with("http") && !href.contains("duckduckgo.com"))
+        .take(limit)
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Search DuckDuckGo Lite and return top N result URLs
 pub async fn search_ddg_lite(query: &str, limit: usize) -> Result<Vec<String>, String> {
     let client = Client::builder()
@@ -38,31 +56,27 @@ pub async fn search_ddg_lite(query: &str, limit: usize) -> Result<Vec<String>, S
         tracing::warn!("DDG Lite returned short response : {}", html);
     }
 
-    let document = Html::parse_document(&html);
+    Ok(parse_ddg_lite_results(&html, limit))
+}
 
-    // DDG Lite structure: The anchor tag itself has class 'result-link'
-    let link_selector = Selector::parse(".result-link").unwrap();
+#[cfg(test)]
+mod tests {
+    use super::parse_ddg_lite_results;
 
-    let mut results = Vec::new();
+    #[test]
+    fn parses_external_links_filters_search_links_and_honors_limit() {
+        let html = r#"
+            <a class="result-link" href="https://example.com/one">one</a>
+            <a class="result-link" href="https://duckduckgo.com/about">internal</a>
+            <a class="result-link" href="/l/?uddg=https%3A%2F%2Fredirect.example%2Ftwo">redirect</a>
+            <a class="result-link" href="https://example.com/three">three</a>
+        "#;
 
-    for element in document.select(&link_selector) {
-        if results.len() >= limit {
-            break;
-        }
-
-        if let Some(href) = element.value().attr("href") {
-            // DDG Lite links need decoding or sometimes are direct
-            // They look like: /l/?kh=-1&uddg=https%3A%2F%2Fexample.com%2F...
-            // or sometimes direct links depending on user agent?
-            // Actually usually plain links in Lite version but let's check.
-
-            let clean_url = href.to_string();
-            // Basic filtering of internal DDG links
-            if clean_url.starts_with("http") && !clean_url.contains("duckduckgo.com") {
-                results.push(clean_url);
-            }
-        }
+        assert_eq!(
+            parse_ddg_lite_results(html, 10),
+            vec!["https://example.com/one", "https://example.com/three"]
+        );
+        assert_eq!(parse_ddg_lite_results(html, 1), vec!["https://example.com/one"]);
+        assert!(parse_ddg_lite_results(html, 0).is_empty());
     }
-
-    Ok(results)
 }

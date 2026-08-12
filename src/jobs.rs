@@ -1,4 +1,5 @@
 use crate::config::*;
+use crate::intent::IntentTarget;
 use crate::metrics::MetricsCollector;
 use crate::multi_tenant::MultiTenantEngine;
 use crate::projects::ProjectContext;
@@ -64,6 +65,7 @@ pub enum Job {
         file_path: String,
         structural_cues: Vec<String>,
         metadata: Option<HashMap<String, serde_json::Value>>,
+        embedding: Option<Vec<f32>>,
         category: crate::agent::chunker::ChunkCategory,
     },
     VerifyFile {
@@ -88,6 +90,10 @@ pub enum Job {
         project_id: String,
         memory_ref: MemoryRef,
     },
+    ClassifyMemory {
+        project_id: String,
+        memory_id: MemoryId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +108,12 @@ pub struct JobProgress {
     pub phase: String,
     pub writes_completed: usize,
     pub writes_total: usize,
+    #[serde(default)]
+    pub intent_completed: usize,
+    #[serde(default)]
+    pub intent_total: usize,
+    #[serde(default)]
+    pub intent_failed: usize,
 }
 
 /// Tracks a bulk ingestion session with buffered jobs
@@ -110,6 +122,9 @@ pub struct IngestionSession {
     pub phase: std::sync::atomic::AtomicU8, // 0=Writing, 1=Processing, 2=Done
     pub writes_completed: std::sync::atomic::AtomicUsize,
     pub writes_total: std::sync::atomic::AtomicUsize,
+    pub intent_completed: std::sync::atomic::AtomicUsize,
+    pub intent_total: std::sync::atomic::AtomicUsize,
+    pub intent_failed: std::sync::atomic::AtomicUsize,
     last_write: tokio::sync::Mutex<std::time::Instant>,
 }
 
@@ -120,6 +135,9 @@ impl IngestionSession {
             phase: std::sync::atomic::AtomicU8::new(0),
             writes_completed: std::sync::atomic::AtomicUsize::new(0),
             writes_total: std::sync::atomic::AtomicUsize::new(0),
+            intent_completed: std::sync::atomic::AtomicUsize::new(0),
+            intent_total: std::sync::atomic::AtomicUsize::new(0),
+            intent_failed: std::sync::atomic::AtomicUsize::new(0),
             last_write: tokio::sync::Mutex::new(std::time::Instant::now()),
         }
     }
@@ -133,17 +151,34 @@ impl IngestionSession {
     }
 
     pub fn get_progress(&self) -> JobProgress {
-        let phase = match self.get_phase() {
-            IngestionPhase::Writing => "writing",
-            IngestionPhase::Processing => "processing",
-            IngestionPhase::Done => "done",
+        let writes_completed = self
+            .writes_completed
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let writes_total = self.writes_total.load(std::sync::atomic::Ordering::Relaxed);
+        let intent_completed = self
+            .intent_completed
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let intent_total = self.intent_total.load(std::sync::atomic::Ordering::Relaxed);
+        let intent_failed = self
+            .intent_failed
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let intent_finished = intent_completed.saturating_add(intent_failed);
+        let phase = if writes_total == 0 && intent_total == 0 {
+            "idle"
+        } else if writes_completed < writes_total {
+            "writing"
+        } else if intent_finished < intent_total {
+            "processing"
+        } else {
+            "done"
         };
         JobProgress {
             phase: phase.to_string(),
-            writes_completed: self
-                .writes_completed
-                .load(std::sync::atomic::Ordering::Relaxed),
-            writes_total: self.writes_total.load(std::sync::atomic::Ordering::Relaxed),
+            writes_completed,
+            writes_total,
+            intent_completed,
+            intent_total,
+            intent_failed,
         }
     }
 
@@ -165,6 +200,21 @@ impl IngestionSession {
         // Reactivate session if it was done or processing
         self.phase.store(0, std::sync::atomic::Ordering::Relaxed);
         self.writes_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn expect_intent(&self) {
+        self.intent_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn intent_complete(&self) {
+        self.intent_completed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn intent_failed(&self) {
+        self.intent_failed
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -244,6 +294,9 @@ impl SessionManager {
             phase: "idle".to_string(), // Default
             writes_completed: 0,
             writes_total: 0,
+            intent_completed: 0,
+            intent_total: 0,
+            intent_failed: 0,
         };
 
         let mut active_count = 0;
@@ -253,6 +306,9 @@ impl SessionManager {
 
             global.writes_completed += p.writes_completed;
             global.writes_total += p.writes_total;
+            global.intent_completed += p.intent_completed;
+            global.intent_total += p.intent_total;
+            global.intent_failed += p.intent_failed;
 
             if p.phase != "idle" && p.phase != "done" {
                 active_count += 1;
@@ -392,6 +448,7 @@ impl JobQueue {
         let metrics_clone = metrics.clone();
         let background_processing = jobs_config.background_processing;
         let jobs_config_for_worker = jobs_config.clone();
+        let tx_worker = tx.clone();
 
         tokio::spawn(async move {
             while let Some(job) = rx.recv().await {
@@ -407,6 +464,8 @@ impl JobQueue {
                         &provider_clone,
                         &metrics_clone,
                         &jobs_config_for_worker,
+                        &session_manager_clone,
+                        &tx_worker,
                     )
                     .await;
                 }
@@ -470,7 +529,23 @@ impl JobQueue {
 
     /// Enqueue a job immediately (for non-buffered jobs like Reinforce)
     pub async fn enqueue(&self, job: Job) {
+        if !self.background_processing && matches!(job, Job::ClassifyMemory { .. }) {
+            return;
+        }
+        let classify_project_id = if let Job::ClassifyMemory { project_id, .. } = &job {
+            self.session_manager
+                .get_or_create(project_id)
+                .expect_intent();
+            Some(project_id.clone())
+        } else {
+            None
+        };
         if let Err(e) = self.sender.send(job).await {
+            if let Some(project_id) = classify_project_id {
+                self.session_manager
+                    .get_or_create(&project_id)
+                    .intent_failed();
+            }
             warn!("Failed to enqueue job: {}", e);
         }
     }
@@ -496,10 +571,15 @@ impl JobQueue {
             let session = entry.value();
             let progress = session.get_progress();
             // Count jobs that haven't completed yet
-            let pending = progress
+            let pending_writes = progress
                 .writes_total
                 .saturating_sub(progress.writes_completed);
-            count += pending;
+            let pending_intents = progress.intent_total.saturating_sub(
+                progress
+                    .intent_completed
+                    .saturating_add(progress.intent_failed),
+            );
+            count += pending_writes.saturating_add(pending_intents);
         }
         count
     }
@@ -587,11 +667,300 @@ fn choose_canonical(a: &str, b: &str) -> (String, String) {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::multi_tenant::MultiTenantEngine;
+
+    #[test]
+    fn memory_refs_and_canonical_helpers_are_deterministic() {
+        let id = MemoryRef::Id(42);
+        let source = MemoryRef::SourceKey("doc#1".to_string());
+        assert_eq!(id.to_string(), "42");
+        assert_eq!(source.to_string(), "source_key:doc#1");
+        assert_eq!(
+            cue_tokens("User:Name-test").into_iter().collect::<Vec<_>>(),
+            vec!["user".to_string(), "name".to_string(), "test".to_string()]
+        );
+        assert!(lexical_gate("user:name", "name-alias"));
+        assert!(lexical_gate("prefix", "prefix-long"));
+        assert!(!lexical_gate("aa", "bb"));
+        assert!(is_canonical_format("kind:value"));
+        assert!(!is_canonical_format("kind:"));
+        assert_eq!(choose_canonical("alias", "kind:value"), ("kind:value".into(), "alias".into()));
+        assert_eq!(choose_canonical("z", "a"), ("a".into(), "z".into()));
+    }
+
+    #[tokio::test]
+    async fn ingestion_session_tracks_progress_and_flush_state() {
+        let session = IngestionSession::new("project".to_string());
+        assert_eq!(session.get_phase(), IngestionPhase::Writing);
+        assert_eq!(session.get_progress().phase, "idle");
+        assert!(!session.should_auto_flush().await);
+
+        session.expect_write();
+        session.expect_intent();
+        session.intent_complete();
+        session.intent_failed();
+        session.write_complete();
+        let progress = session.get_progress();
+        assert_eq!(progress.phase, "done");
+        assert_eq!(progress.writes_completed, 1);
+        assert_eq!(progress.writes_total, 1);
+        assert_eq!(progress.intent_completed, 1);
+        assert_eq!(progress.intent_failed, 1);
+
+        session
+            .buffer_job(Job::ProposeAliases {
+                project_id: "project".to_string(),
+            })
+            .await;
+        assert!(!session.is_stale());
+    }
+
+    #[tokio::test]
+    async fn session_manager_aggregates_projects_and_flushes() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider: Arc<dyn ProjectProvider> = Arc::new(MultiTenantEngine::with_snapshots_dir(
+            dir.path(),
+            TuningConfig::default(),
+        ));
+        let manager = SessionManager::new(provider, None, JobsConfig::default());
+        assert!(manager.get("missing").is_none());
+        let first = manager.get_or_create("one");
+        assert!(Arc::ptr_eq(&first, &manager.get_or_create("one")));
+        first.expect_write();
+        let second = manager.get_or_create("two");
+        second.expect_write();
+        second.write_complete();
+        let progress = manager.get_global_progress();
+        assert_eq!(progress.writes_total, 2);
+        assert_eq!(progress.writes_completed, 1);
+        assert_eq!(progress.phase, "processing (1 projects)");
+
+        manager.flush_session("one").await;
+        assert_eq!(first.get_phase(), IngestionPhase::Done);
+    }
+
+    #[tokio::test]
+    async fn process_job_handles_ingestion_classification_and_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = ServerConfig::default();
+        config.semantic.encoder_enabled = false;
+        let engine = Arc::new(MultiTenantEngine::with_config(
+            config,
+            dir.path().to_path_buf(),
+        ));
+        let provider: Arc<dyn ProjectProvider> = engine.clone();
+        let metrics = Arc::new(MetricsCollector::new());
+        let metrics_opt = Some(metrics.clone());
+        let jobs_config = JobsConfig::default();
+        let sessions = Arc::new(SessionManager::new(
+            provider.clone(),
+            metrics_opt.clone(),
+            jobs_config.clone(),
+        ));
+        let (sender, _receiver) = mpsc::channel(8);
+
+        let context = engine.get_or_create_project("jobs-project".to_string()).unwrap();
+        let memory_id = context.main.add_memory_with_source_key(
+            "fn main() {}".to_string(),
+            vec!["path:src/main.rs".to_string(), "source:agent".to_string()],
+            None,
+            MainStats::default(),
+            false,
+            Some("src/main.rs:1-1".to_string()),
+        );
+        process_job(
+            Job::ClassifyMemory {
+                project_id: "jobs-project".to_string(),
+                memory_id,
+            },
+            &provider,
+            &metrics_opt,
+            &jobs_config,
+            &sessions,
+            &sender,
+        )
+        .await;
+
+        let session = sessions.get("jobs-project").unwrap();
+        let progress = session.get_progress();
+        // The test engine deliberately disables the optional encoder, so the
+        // worker records the unavailable-classifier failure deterministically.
+        assert_eq!(progress.intent_failed, 1);
+        process_job(
+            Job::VerifyFile {
+                project_id: "jobs-project".to_string(),
+                file_path: "src/main.rs".to_string(),
+                valid_source_keys: Vec::new(),
+            },
+            &provider,
+            &metrics_opt,
+            &jobs_config,
+            &sessions,
+            &sender,
+        )
+        .await;
+        assert!(context.main.get_memory(memory_id).is_none());
+
+        let replacement = context.main.add_memory_with_source_key(
+            "delete me".to_string(),
+            vec!["cleanup".to_string()],
+            None,
+            MainStats::default(),
+            false,
+            Some("cleanup-key".to_string()),
+        );
+        process_job(
+            Job::DeleteMemory {
+                project_id: "jobs-project".to_string(),
+                memory_ref: MemoryRef::SourceKey("cleanup-key".to_string()),
+            },
+            &provider,
+            &metrics_opt,
+            &jobs_config,
+            &sessions,
+            &sender,
+        )
+        .await;
+        assert!(context.main.get_memory(replacement).is_none());
+
+        process_job(
+            Job::DeleteMemory {
+                project_id: "jobs-project".to_string(),
+                memory_ref: MemoryRef::SourceKey("missing-key".to_string()),
+            },
+            &provider,
+            &metrics_opt,
+            &jobs_config,
+            &sessions,
+            &sender,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn process_job_handles_alias_reinforcement_lexicon_and_heatmap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = ServerConfig::default();
+        config.semantic.encoder_enabled = false;
+        let engine = Arc::new(MultiTenantEngine::with_config(
+            config,
+            dir.path().to_path_buf(),
+        ));
+        let provider: Arc<dyn ProjectProvider> = engine.clone();
+        let metrics = Arc::new(MetricsCollector::new());
+        let metrics_opt = Some(metrics);
+        let jobs_config = JobsConfig::default();
+        let sessions = Arc::new(SessionManager::new(
+            provider.clone(),
+            metrics_opt.clone(),
+            jobs_config.clone(),
+        ));
+        let (sender, _receiver) = mpsc::channel(8);
+        let context = engine.get_or_create_project("jobs-analysis".to_string()).unwrap();
+
+        let mut memory_ids = Vec::new();
+        for index in 0..3 {
+            memory_ids.push(context.main.add_memory(
+                format!("feature report {index}"),
+                vec!["feature".to_string(), "feature_flag".to_string()],
+                None,
+                MainStats::default(),
+                false,
+            ));
+        }
+
+        process_job(
+            Job::ProposeAliases {
+                project_id: "jobs-analysis".to_string(),
+            },
+            &provider,
+            &metrics_opt,
+            &jobs_config,
+            &sessions,
+            &sender,
+        )
+        .await;
+        assert!(context.aliases.total_memories() >= 1);
+
+        process_job(
+            Job::ReinforceMemories {
+                project_id: "jobs-analysis".to_string(),
+                memory_ids: memory_ids.clone(),
+                cues: vec!["feature".to_string()],
+            },
+            &provider,
+            &metrics_opt,
+            &jobs_config,
+            &sessions,
+            &sender,
+        )
+        .await;
+
+        let lexicon_id = context.lexicon.upsert_memory_with_source_key(
+            "lexicon-key".to_string(),
+            "feature alias".to_string(),
+            vec!["feature".to_string()],
+            None,
+            Some(crate::structures::LexiconStats::default()),
+            false,
+            true,
+        );
+        process_job(
+            Job::ReinforceLexicon {
+                project_id: "jobs-analysis".to_string(),
+                memory_ids: vec![lexicon_id],
+                cues: vec!["feature".to_string()],
+            },
+            &provider,
+            &metrics_opt,
+            &jobs_config,
+            &sessions,
+            &sender,
+        )
+        .await;
+
+        process_job(
+            Job::UpdateMarketHeatmap {
+                project_id: "jobs-analysis".to_string(),
+            },
+            &provider,
+            &metrics_opt,
+            &jobs_config,
+            &sessions,
+            &sender,
+        )
+        .await;
+
+        let missing_session_before = sessions.get("missing-project");
+        assert!(missing_session_before.is_none());
+        process_job(
+            Job::ClassifyMemory {
+                project_id: "missing-project".to_string(),
+                memory_id: 42,
+            },
+            &provider,
+            &metrics_opt,
+            &jobs_config,
+            &sessions,
+            &sender,
+        )
+        .await;
+        // MultiTenantEngine creates projects on demand, so this path records a
+        // failed classification for the newly created empty project.
+        assert_eq!(sessions.get("missing-project").unwrap().get_progress().intent_failed, 1);
+    }
+}
+
 async fn process_job(
     job: Job,
     provider: &Arc<dyn ProjectProvider>,
     metrics: &Option<Arc<MetricsCollector>>,
     _jobs_config: &JobsConfig,
+    session_manager: &Arc<SessionManager>,
+    sender: &mpsc::Sender<Job>,
 ) {
     match job {
         Job::ProposeAliases { project_id } => {
@@ -771,6 +1140,7 @@ async fn process_job(
             file_path,
             structural_cues,
             metadata,
+            embedding,
             category,
         } => {
             if let Some(ctx) = provider.get_project(&project_id) {
@@ -780,8 +1150,9 @@ async fn process_job(
                 let file_path_clone = file_path.clone();
                 let structural_cues_clone = structural_cues.clone();
                 let metadata_clone = metadata.clone();
+                let embedding_clone = embedding.clone();
 
-                tokio::task::spawn_blocking(move || {
+                let memory_id = tokio::task::spawn_blocking(move || {
                     debug!(
                         "Agent: Fast extraction starting for {} (category: {:?})",
                         source_key_clone, category
@@ -809,7 +1180,9 @@ async fn process_job(
                     resolved_cues.push(format!("category:{:?}", category).to_lowercase());
 
                     // 3. Upsert memory (Lean cues only)
-                    let memory_id = ctx_clone.main.upsert_memory_with_source_key(
+                    let memory_id = ctx_clone
+                        .main
+                        .upsert_memory_with_source_key_and_options_and_vector(
                         source_key_clone.clone(),
                         content_clone,
                         resolved_cues.clone(),
@@ -817,6 +1190,9 @@ async fn process_job(
                         Some(MainStats::default()),
                         false,
                         true,
+                        true,
+                        None,
+                        embedding_clone,
                     );
 
                     debug!(
@@ -826,9 +1202,48 @@ async fn process_job(
                         category,
                         resolved_cues.len()
                     );
+                    memory_id
                 })
                 .await
                 .unwrap();
+
+                if memory_id != crate::structures::INVALID_MEMORY_ID {
+                    session_manager
+                        .get_or_create(&project_id)
+                        .expect_intent();
+                    let classification_job = Job::ClassifyMemory {
+                        project_id: project_id.clone(),
+                        memory_id,
+                    };
+                    match sender.try_send(classification_job) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(job)) => {
+                            // This runs inside the queue's only consumer. Awaiting a send
+                            // to the same full bounded queue here would deadlock ingestion.
+                            let follow_up_sender = sender.clone();
+                            let follow_up_sessions = Arc::clone(session_manager);
+                            let follow_up_project_id = project_id.clone();
+                            tokio::spawn(async move {
+                                if let Err(error) = follow_up_sender.send(job).await {
+                                    follow_up_sessions
+                                        .get_or_create(&follow_up_project_id)
+                                        .intent_failed();
+                                    warn!(
+                                        memory_id,
+                                        error = %error,
+                                        "Failed to enqueue deferred memory intent classification"
+                                    );
+                                }
+                            });
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            session_manager
+                                .get_or_create(&project_id)
+                                .intent_failed();
+                            warn!(memory_id, "Failed to enqueue memory intent classification: queue closed");
+                        }
+                    }
+                }
 
                 // Record ingestion metric
                 if let Some(m) = metrics {
@@ -849,9 +1264,16 @@ async fn process_job(
                 // 3. Delete them
 
                 let path_cue = format!("path:{}", file_path);
-                if let Some(ordered_set) = ctx.main.get_cue_index().get(&path_cue) {
+                // Copy the IDs out before mutating the engine. Holding a
+                // DashMap guard while deleting memories can deadlock when the
+                // deletion touches the same shard.
+                let current_memories = ctx
+                    .main
+                    .get_cue_index()
+                    .get(&path_cue)
+                    .map(|ordered_set| ordered_set.get_recent_owned(None));
+                if let Some(current_memories) = current_memories {
                     // Get all memory IDs associated with this file
-                    let current_memories = ordered_set.get_recent_owned(None);
                     let valid_set: HashSet<String> = valid_source_keys.into_iter().collect();
 
                     let mut deleted_count = 0;
@@ -877,6 +1299,51 @@ async fn process_job(
                     } else {
                         debug!("Agent: Verified {}. No stale memories found.", file_path);
                     }
+                }
+            }
+        }
+        Job::ClassifyMemory {
+            project_id,
+            memory_id,
+        } => {
+            let result = if let Some(ctx) = provider.get_project(&project_id) {
+                let ctx_clone = ctx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let memory = ctx_clone
+                        .main
+                        .get_memory(memory_id)
+                        .ok_or_else(|| "memory no longer exists".to_string())?;
+                    let content = ctx_clone.main.read_memory_content(&memory)?;
+                    let classification = if let Some(vector) = memory.semantic_vector.as_ref() {
+                        let embedding = vector.normalized_values();
+                        ctx_clone.main.classify_intent_with_embedding(
+                            &content,
+                            IntentTarget::Memory,
+                            &embedding,
+                        )?
+                    } else {
+                        ctx_clone.main.classify_intent(&content, IntentTarget::Memory)?
+                    };
+                    if !ctx_clone
+                        .main
+                        .attach_intent_classification(memory_id, classification)
+                    {
+                        return Err("memory disappeared while attaching intent".to_string());
+                    }
+                    Ok::<(), String>(())
+                })
+                .await
+                .unwrap_or_else(|error| Err(format!("intent worker failed: {error}")))
+            } else {
+                Err("project no longer exists".to_string())
+            };
+
+            let session = session_manager.get_or_create(&project_id);
+            match result {
+                Ok(()) => session.intent_complete(),
+                Err(error) => {
+                    session.intent_failed();
+                    warn!(project_id, memory_id, error = %error, "Memory intent classification failed");
                 }
             }
         }

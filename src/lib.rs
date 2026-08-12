@@ -4,10 +4,10 @@ pub mod auth;
 pub mod config;
 pub mod crypto;
 pub mod cuebridge;
-pub mod cuepacks;
 pub mod engine;
 pub mod facets;
 pub mod grounding;
+pub mod intent;
 pub mod jobs;
 pub mod metrics;
 pub mod multi_tenant;
@@ -17,3 +17,6 @@ pub mod persistence;
 pub mod projects;
 pub mod structures;
 pub mod taxonomy;
+pub mod semantic;
+#[cfg(feature = "semantic-encoder")]
+pub mod semantic_encoder;

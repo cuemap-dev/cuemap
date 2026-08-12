@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::{self, EncryptionKey};
+use crate::intent::IntentClassification;
+use crate::semantic::StoredSemanticVector;
 use ahash::RandomState;
 
 // =============================================================================
@@ -178,6 +180,15 @@ pub struct Memory<T> {
     pub disk_backed: bool,
     #[serde(default)]
     pub scoring_features: MemoryScoringFeatures,
+    /// Optional externally precomputed semantic representation. It is kept
+    /// alongside the memory so the in-memory ANN index can be rebuilt after a
+    /// snapshot restore.
+    #[serde(default)]
+    pub semantic_vector: Option<StoredSemanticVector>,
+    /// Optional versioned intent classification used by CueKey gating and
+    /// confidence-weighted hybrid reranking.
+    #[serde(default)]
+    pub intent_classification: Option<IntentClassification>,
     /// Type-specific stats payload
     pub stats: T,
 }
@@ -203,6 +214,8 @@ impl<T: Default> Memory<T> {
             metadata: metadata.unwrap_or_default(),
             disk_backed: false,
             scoring_features: MemoryScoringFeatures::default(),
+            semantic_vector: None,
+            intent_classification: None,
             stats: T::default(),
         }
     }

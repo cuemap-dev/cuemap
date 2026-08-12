@@ -109,6 +109,28 @@ fn test_snapshot_roundtrip() {
 }
 
 #[test]
+fn test_load_all_restores_every_project_snapshot() {
+    let dir = tempdir().unwrap();
+    let project_id = "load-all-project".to_string();
+    let first = MultiTenantEngine::with_snapshots_dir(dir.path(), TuningConfig::default());
+    let context = first.get_or_create_project(project_id.clone()).unwrap();
+    context.main.add_memory(
+        "load all content".to_string(),
+        vec!["load-all".to_string()],
+        None,
+        MainStats::default(),
+        true,
+    );
+    first.save_project(&project_id).unwrap();
+
+    let second = MultiTenantEngine::with_snapshots_dir(dir.path(), TuningConfig::default());
+    let results = second.load_all();
+    assert!(matches!(results.get(&project_id), Some(Ok(()))));
+    let restored = second.get_project(&project_id).expect("project should be restored");
+    assert_eq!(restored.main.total_memories(), 1);
+}
+
+#[test]
 fn test_delete_project() {
     let dir = tempdir().unwrap();
     let engine = MultiTenantEngine::with_snapshots_dir(

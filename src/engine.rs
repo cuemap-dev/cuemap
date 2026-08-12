@@ -1,17 +1,24 @@
 use crate::config::TuningConfig;
 use crate::crypto::EncryptionKey;
+use crate::intent::{
+    intent_compatibility, IntentClassification, IntentClassifier, IntentTarget,
+    INTENT_TAXONOMY_VERSION,
+};
+use crate::semantic::{LinearReranker, SemanticEncoder, SemanticIndex, StoredSemanticVector};
 use crate::structures::{
     LexiconStats, MainStats, Memory, MemoryId, MemoryScoringFeatures, MemoryStats, OrderedSet,
     INVALID_MEMORY_ID,
 };
 use ahash::RandomState;
 use dashmap::DashMap;
+use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use std::any::TypeId;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::num::NonZeroUsize;
 
 const MEMORY_SCORING_FEATURES_VERSION: u8 = 1;
 const FAMILY_PERSON: u64 = 1 << 0;
@@ -69,6 +76,8 @@ pub struct RecallTimingBreakdown {
     pub scanned_posting_count: usize,
     pub adaptive_scan_limit: usize,
     pub max_posting_len: usize,
+    pub semantic_rerank_candidate_limit: usize,
+    pub semantic_rerank_candidate_count: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -118,6 +127,9 @@ pub struct ScoredMemoryCandidate {
     pub match_count: f64,
     pub rerank_bonus: f64,
     pub generic_penalty: f64,
+    pub semantic_similarity: f32,
+    pub intent_compatibility: f64,
+    pub intent_rerank_bonus: f64,
 }
 
 struct QueryScoringCue<'a> {
@@ -493,6 +505,19 @@ where
     /// Global occurrences of each cue (for IDF weighting)
     pub cue_global_counts: Arc<DashMap<String, u64, RandomState>>,
 
+    /// Optional vector index. The index is rebuilt from persisted vectors and
+    /// remains empty unless semantic retrieval is explicitly enabled.
+    semantic_index: Arc<RwLock<SemanticIndex>>,
+    /// Optional local text encoder. It is loaded only when the binary includes
+    /// the encoder feature and the project explicitly enables it in config.
+    semantic_encoder: Arc<RwLock<Option<Arc<dyn SemanticEncoder>>>>,
+    /// Intent classifier built from the configured local encoder and the
+    /// versioned CueKey taxonomy.
+    intent_classifier: Arc<RwLock<Option<Arc<IntentClassifier>>>>,
+    /// Bounded cache for repeated query text embeddings. The lock is held
+    /// only while accessing the cache, never while running the encoder.
+    query_embedding_cache: Arc<Mutex<LruCache<String, Vec<f32>>>>,
+
     // Storage context
     pub config: crate::config::ServerConfig,
     pub project_id: String,
@@ -522,6 +547,14 @@ where
             master_key: None,
             tuning: Arc::new(TuningConfig::default()),
             cue_global_counts: Arc::new(DashMap::with_hasher(RandomState::new())),
+            semantic_index: Arc::new(RwLock::new(SemanticIndex::new(
+                crate::semantic::SemanticConfig::default(),
+            ))),
+            semantic_encoder: Arc::new(RwLock::new(None)),
+            intent_classifier: Arc::new(RwLock::new(None)),
+            query_embedding_cache: Self::new_query_embedding_cache(
+                &crate::semantic::SemanticConfig::default(),
+            ),
             config: crate::config::ServerConfig::default(),
             project_id: "default".to_string(),
         }
@@ -547,6 +580,211 @@ where
         self.tuning = Arc::new(tuning);
     }
 
+    pub fn set_semantic_config(&mut self, config: crate::semantic::SemanticConfig) {
+        let config = config.resolved();
+        self.config.semantic = config.clone();
+        self.query_embedding_cache = Self::new_query_embedding_cache(&config);
+        let mut index = SemanticIndex::new(config);
+        index.rebuild(self.memories.iter().filter_map(|entry| {
+            entry
+                .semantic_vector
+                .as_ref()
+                .map(|vector| (entry.id, vector.clone()))
+        }));
+        self.semantic_index = Arc::new(RwLock::new(index));
+    }
+
+    pub fn set_semantic_encoder(&mut self, encoder: Option<Arc<dyn SemanticEncoder>>) {
+        let classifier = encoder.as_ref().and_then(|encoder| {
+            match IntentClassifier::new(
+                encoder.clone(),
+                self.config.semantic.model_version.clone(),
+            ) {
+                Ok(classifier) => Some(Arc::new(classifier)),
+                Err(error) => {
+                    tracing::warn!(error = %error, "Intent classifier unavailable");
+                    None
+                }
+            }
+        });
+        self.semantic_encoder = Arc::new(RwLock::new(encoder));
+        self.intent_classifier = Arc::new(RwLock::new(classifier));
+        if let Ok(mut cache) = self.query_embedding_cache.lock() {
+            cache.clear();
+        }
+    }
+
+    pub fn configure_semantic_encoder(&mut self) -> Result<(), String> {
+        let encoder = crate::semantic::load_configured_encoder(&self.config.semantic)?;
+        self.set_semantic_encoder(encoder);
+        Ok(())
+    }
+
+    fn new_query_embedding_cache(
+        config: &crate::semantic::SemanticConfig,
+    ) -> Arc<Mutex<LruCache<String, Vec<f32>>>> {
+        let capacity = NonZeroUsize::new(config.resolved().query_embedding_cache_capacity.max(1))
+            .expect("query embedding cache capacity is always non-zero");
+        Arc::new(Mutex::new(LruCache::new(capacity)))
+    }
+
+    /// Encode text with the bundled local encoder when enabled. Callers can
+    /// still provide an embedding directly for a single memory/query, and
+    /// can disable automatic encoding through `SemanticConfig`.
+    pub fn encode_semantic_text(&self, text: &str) -> Option<Vec<f32>> {
+        let config = self.config.semantic.resolved();
+        if !config.enabled || !config.encoder_enabled {
+            return None;
+        }
+        let cache_enabled = config.query_embedding_cache_capacity > 0;
+        if cache_enabled {
+            if let Ok(mut cache) = self.query_embedding_cache.lock() {
+                if let Some(vector) = cache.get(text) {
+                    return Some(vector.clone());
+                }
+            }
+        }
+        let encoder = self.semantic_encoder.read().ok()?.clone()?;
+        let vector = match encoder.encode(text) {
+            Ok(vector) => vector,
+            Err(error) => {
+                tracing::debug!(error = %error, "Semantic text encoding skipped");
+                return None;
+            }
+        };
+        if vector.len() != encoder.dimensions() {
+            tracing::debug!(
+                expected = encoder.dimensions(),
+                received = vector.len(),
+                "Semantic text encoder returned incompatible dimensions"
+            );
+            return None;
+        }
+        if cache_enabled {
+            if let Ok(mut cache) = self.query_embedding_cache.lock() {
+                cache.put(text.to_owned(), vector.clone());
+            }
+        }
+        Some(vector)
+    }
+
+    pub fn classify_intent(
+        &self,
+        text: &str,
+        target: IntentTarget,
+    ) -> Result<IntentClassification, String> {
+        let classifier = self
+            .intent_classifier
+            .read()
+            .map_err(|_| "intent classifier lock poisoned".to_string())?
+            .clone()
+            .ok_or_else(|| "intent classifier unavailable".to_string())?;
+        classifier.classify(text, target)
+    }
+
+    pub fn classify_intent_with_embedding(
+        &self,
+        text: &str,
+        target: IntentTarget,
+        embedding: &[f32],
+    ) -> Result<IntentClassification, String> {
+        let classifier = self
+            .intent_classifier
+            .read()
+            .map_err(|_| "intent classifier lock poisoned".to_string())?
+            .clone()
+            .ok_or_else(|| "intent classifier unavailable".to_string())?;
+        classifier.classify_with_embedding(text, embedding, target)
+    }
+
+    pub fn attach_intent_classification(
+        &self,
+        memory_id: MemoryId,
+        classification: IntentClassification,
+    ) -> bool {
+        if let Some(mut memory) = self.memories.get_mut(&memory_id) {
+            memory.intent_classification = Some(classification);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Return `(total, annotated, missing_current_version, stale_version)` for
+    /// memory intent metadata. A stale annotation is treated as missing for
+    /// readiness because changing the model or taxonomy invalidates its score.
+    pub fn intent_coverage(&self) -> (usize, usize, usize, usize) {
+        let expected_model_version = self.config.semantic.model_version.as_str();
+        let mut total = 0;
+        let mut annotated = 0;
+        let mut current = 0;
+        let mut stale = 0;
+
+        for entry in self.memories.iter() {
+            total += 1;
+            match entry.intent_classification.as_ref() {
+                Some(classification) => {
+                    annotated += 1;
+                    if classification.taxonomy_version == INTENT_TAXONOMY_VERSION
+                        && classification.model_version == expected_model_version
+                    {
+                        current += 1;
+                    } else {
+                        stale += 1;
+                    }
+                }
+                None => {}
+            }
+        }
+
+        (total, annotated, total.saturating_sub(current), stale)
+    }
+
+    pub fn semantic_index_stats(&self) -> (bool, usize, Option<usize>) {
+        self.semantic_index
+            .read()
+            .map(|index| {
+                (
+                    index.config().enabled,
+                    index.len(),
+                    index.dimensions(),
+                )
+            })
+            .unwrap_or((false, 0, None))
+    }
+
+    fn prepare_semantic_vector(&self, vector: Option<Vec<f32>>) -> Option<StoredSemanticVector> {
+        let vector = vector?;
+        let config = self.config.semantic.resolved();
+        if !config.enabled {
+            return None;
+        }
+        if config.dimensions != 0 && vector.len() != config.dimensions {
+            tracing::debug!(
+                expected = config.dimensions,
+                received = vector.len(),
+                "Skipping semantic vector with incompatible dimensions"
+            );
+            return None;
+        }
+        let memory_count = self.memory_count.load(Ordering::Relaxed).saturating_add(1);
+        if !config.within_memory_budget_for_dimensions(vector.len(), memory_count) {
+            tracing::debug!(
+                memory_count,
+                max_memory_mb = config.max_memory_mb,
+                "Skipping semantic vector because the configured memory budget is full"
+            );
+            return None;
+        }
+        match StoredSemanticVector::from_f32(&vector, config.storage) {
+            Ok(vector) => Some(vector),
+            Err(error) => {
+                tracing::debug!(error = %error, "Skipping invalid semantic vector");
+                None
+            }
+        }
+    }
+
     pub fn get_master_key(&self) -> Option<Arc<EncryptionKey>> {
         self.master_key.clone()
     }
@@ -557,9 +795,10 @@ where
         cue_index: DashMap<String, OrderedSet, RandomState>,
         next_memory_id: MemoryId,
         loaded_global_counts: Option<DashMap<String, u64, RandomState>>,
-        config: crate::config::ServerConfig,
+        mut config: crate::config::ServerConfig,
         project_id: String,
     ) -> Self {
+        config.semantic = config.semantic.resolved();
         let cue_global_counts = loaded_global_counts
             .map(Arc::new)
             .unwrap_or_else(|| Arc::new(DashMap::with_hasher(RandomState::new())));
@@ -578,9 +817,23 @@ where
             next_memory_id: Arc::new(AtomicU32::new(next_memory_id.max(1))),
             master_key: None,
             tuning: Arc::new(TuningConfig::default()),
+            semantic_index: Arc::new(RwLock::new(SemanticIndex::new(
+                config.semantic.clone(),
+            ))),
+            semantic_encoder: Arc::new(RwLock::new(None)),
+            intent_classifier: Arc::new(RwLock::new(None)),
+            query_embedding_cache: Self::new_query_embedding_cache(&config.semantic),
             config: config.clone(),
             project_id: project_id.clone(),
         };
+        if let Ok(mut index) = engine.semantic_index.write() {
+            index.rebuild(engine.memories.iter().filter_map(|entry| {
+                entry
+                    .semantic_vector
+                    .as_ref()
+                    .map(|vector| (entry.id, vector.clone()))
+            }));
+        }
         engine.rebuild_source_order_index();
 
         // Migration logic: Sync RAM/Disk state with config
@@ -943,8 +1196,6 @@ where
         content: &str,
         metadata: Option<&HashMap<String, serde_json::Value>>,
         cues: Vec<String>,
-        cuepacks: &crate::cuepacks::CuePackRegistry,
-        cuepack_selection: Option<&[String]>,
     ) -> Vec<String> {
         if TypeId::of::<T>() != TypeId::of::<MainStats>() {
             return cues;
@@ -952,13 +1203,7 @@ where
 
         let mut enriched = cues;
         let mut seen: HashSet<String> = enriched.iter().map(|cue| cue.to_lowercase()).collect();
-        for facet in crate::facets::extract_memory_facets_with_cuepacks(
-            content,
-            metadata,
-            &enriched,
-            cuepacks,
-            cuepack_selection,
-        ) {
+        for facet in crate::facets::extract_memory_facets(content, metadata, &enriched) {
             if seen.insert(facet.to_lowercase()) {
                 enriched.push(facet);
             }
@@ -974,106 +1219,117 @@ where
         stats: T,
         disable_temporal_chunking: bool,
     ) -> MemoryId {
-        self.add_memory_with_cuepacks(
+        self.add_memory_with_source_key_and_event_time(
             content,
             cues,
             metadata,
             stats,
             disable_temporal_chunking,
-            crate::cuepacks::default_registry(),
+            None,
             None,
         )
     }
 
-    pub fn add_memory_with_cuepacks(
+    pub fn add_memory_with_source_key(
         &self,
         content: String,
         cues: Vec<String>,
         metadata: Option<HashMap<String, serde_json::Value>>,
         stats: T,
         disable_temporal_chunking: bool,
-        cuepacks: &crate::cuepacks::CuePackRegistry,
-        cuepack_selection: Option<&[String]>,
-    ) -> MemoryId {
-        self.add_memory_with_cuepacks_and_source_key(
-            content,
-            cues,
-            metadata,
-            stats,
-            disable_temporal_chunking,
-            cuepacks,
-            cuepack_selection,
-            None,
-        )
-    }
-
-    pub fn add_memory_with_cuepacks_and_source_key(
-        &self,
-        content: String,
-        cues: Vec<String>,
-        metadata: Option<HashMap<String, serde_json::Value>>,
-        stats: T,
-        disable_temporal_chunking: bool,
-        cuepacks: &crate::cuepacks::CuePackRegistry,
-        cuepack_selection: Option<&[String]>,
         source_key: Option<String>,
     ) -> MemoryId {
-        self.add_memory_with_cuepacks_source_key_and_event_time(
+        self.add_memory_with_source_key_and_event_time(
             content,
             cues,
             metadata,
             stats,
             disable_temporal_chunking,
-            cuepacks,
-            cuepack_selection,
             source_key,
             None,
         )
     }
 
-    pub fn add_memory_with_cuepacks_and_event_time(
+    pub fn add_memory_with_event_time(
         &self,
         content: String,
         cues: Vec<String>,
         metadata: Option<HashMap<String, serde_json::Value>>,
         stats: T,
         disable_temporal_chunking: bool,
-        cuepacks: &crate::cuepacks::CuePackRegistry,
-        cuepack_selection: Option<&[String]>,
         event_time: Option<f64>,
     ) -> MemoryId {
-        self.add_memory_with_cuepacks_source_key_and_event_time(
+        self.add_memory_with_source_key_and_event_time(
             content,
             cues,
             metadata,
             stats,
             disable_temporal_chunking,
-            cuepacks,
-            cuepack_selection,
             None,
             event_time,
         )
     }
 
-    fn add_memory_with_cuepacks_source_key_and_event_time(
+    pub fn add_memory_with_event_time_and_vector(
         &self,
         content: String,
         cues: Vec<String>,
         metadata: Option<HashMap<String, serde_json::Value>>,
         stats: T,
         disable_temporal_chunking: bool,
-        cuepacks: &crate::cuepacks::CuePackRegistry,
-        cuepack_selection: Option<&[String]>,
+        event_time: Option<f64>,
+        semantic_vector: Option<Vec<f32>>,
+    ) -> MemoryId {
+        self.add_memory_with_source_key_and_event_time_and_vector(
+            content,
+            cues,
+            metadata,
+            stats,
+            disable_temporal_chunking,
+            None,
+            event_time,
+            semantic_vector,
+        )
+    }
+
+    fn add_memory_with_source_key_and_event_time(
+        &self,
+        content: String,
+        cues: Vec<String>,
+        metadata: Option<HashMap<String, serde_json::Value>>,
+        stats: T,
+        disable_temporal_chunking: bool,
         source_key: Option<String>,
         event_time: Option<f64>,
     ) -> MemoryId {
-        let cues = self.with_synchronous_facets(
-            &content,
-            metadata.as_ref(),
+        self.add_memory_with_source_key_and_event_time_and_vector(
+            content,
             cues,
-            cuepacks,
-            cuepack_selection,
-        );
+            metadata,
+            stats,
+            disable_temporal_chunking,
+            source_key,
+            event_time,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_memory_with_source_key_and_event_time_and_vector(
+        &self,
+        content: String,
+        cues: Vec<String>,
+        metadata: Option<HashMap<String, serde_json::Value>>,
+        stats: T,
+        disable_temporal_chunking: bool,
+        source_key: Option<String>,
+        event_time: Option<f64>,
+        semantic_vector: Option<Vec<f32>>,
+    ) -> MemoryId {
+        let semantic_vector = semantic_vector
+            .or_else(|| self.encode_semantic_text(&content));
+        let semantic_vector = self.prepare_semantic_vector(semantic_vector);
+        let cues = self.with_synchronous_facets(&content, metadata.as_ref(), cues);
 
         // Create payload (Compressed or Encrypted)
         let payload = match Memory::<T>::create_payload(&content, self.master_key.as_deref()) {
@@ -1090,6 +1346,7 @@ where
         let mut memory = Memory::new(payload, metadata);
         memory.id = memory_id;
         memory.source_key = source_key.clone();
+        memory.semantic_vector = semantic_vector.clone();
         if let Some(event_time) = event_time {
             memory.created_at = event_time;
         }
@@ -1154,6 +1411,17 @@ where
             self.source_key_to_id.insert(source_key, memory_id);
         }
         self.index_memory_cues(memory_id, &indexed_cues);
+        if let Some(vector) = semantic_vector.as_ref() {
+            if let Ok(mut index) = self.semantic_index.write() {
+                if let Err(error) = index.insert(memory_id, vector) {
+                    tracing::debug!(
+                        memory_id,
+                        error = %error,
+                        "Skipping invalid semantic vector"
+                    );
+                }
+            }
+        }
         if let Some((session, order)) = source_order_link {
             self.add_source_order_entry(session, order, memory_id);
         }
@@ -1199,6 +1467,9 @@ where
     pub fn delete_memory(&self, memory_id: MemoryId) -> bool {
         if let Some((_, memory)) = self.memories.remove(&memory_id) {
             self.memory_count.fetch_sub(1, Ordering::Relaxed);
+            if let Ok(mut index) = self.semantic_index.write() {
+                index.remove(memory_id);
+            }
             self.remove_source_order_entry(memory_id);
             if let Some(source_key) = memory.source_key {
                 self.source_key_to_id.remove(&source_key);
@@ -1281,8 +1552,6 @@ where
             reinforce,
             overwrite_cues,
             true,
-            crate::cuepacks::default_registry(),
-            None,
             None,
         )
     }
@@ -1298,19 +1567,45 @@ where
         reinforce: bool,
         overwrite_cues: bool,
         disable_temporal_chunking: bool,
-        cuepacks: &crate::cuepacks::CuePackRegistry,
-        cuepack_selection: Option<&[String]>,
         event_time: Option<f64>,
     ) -> MemoryId {
-        let cues = self.with_synchronous_facets(
-            &content,
-            metadata.as_ref(),
+        self.upsert_memory_with_source_key_and_options_and_vector(
+            source_key,
+            content,
             cues,
-            cuepacks,
-            cuepack_selection,
-        );
+            metadata,
+            stats,
+            reinforce,
+            overwrite_cues,
+            disable_temporal_chunking,
+            event_time,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_memory_with_source_key_and_options_and_vector(
+        &self,
+        source_key: String,
+        content: String,
+        cues: Vec<String>,
+        metadata: Option<HashMap<String, serde_json::Value>>,
+        stats: Option<T>,
+        reinforce: bool,
+        overwrite_cues: bool,
+        disable_temporal_chunking: bool,
+        event_time: Option<f64>,
+        semantic_vector: Option<Vec<f32>>,
+    ) -> MemoryId {
+        let semantic_vector = semantic_vector
+            .or_else(|| self.encode_semantic_text(&content));
+        let semantic_vector = self.prepare_semantic_vector(semantic_vector);
+        let cues = self.with_synchronous_facets(&content, metadata.as_ref(), cues);
 
         if let Some(existing_id) = self.source_key_to_id.get(&source_key).map(|entry| *entry) {
+            if let Ok(mut index) = self.semantic_index.write() {
+                index.remove(existing_id);
+            }
             self.remove_source_order_entry(existing_id);
             {
                 if let Some(mut memory) = self.memories.get_mut(&existing_id) {
@@ -1348,6 +1643,7 @@ where
                     if let Some(event_time) = event_time {
                         memory.created_at = event_time;
                     }
+                    memory.semantic_vector = semantic_vector.clone();
                     memory.source_key = Some(source_key.clone());
                     // We need to drop lock before attach/overwrite ops to avoid deadlocks
                     // (though attach_cues re-acquires check, better safe)
@@ -1383,6 +1679,17 @@ where
                     self.add_source_order_entry(session, order, existing_id);
                 }
             }
+            if let Some(vector) = semantic_vector.as_ref() {
+                if let Ok(mut index) = self.semantic_index.write() {
+                    if let Err(error) = index.insert(existing_id, vector) {
+                        tracing::debug!(
+                            memory_id = existing_id,
+                            error = %error,
+                            "Skipping invalid semantic vector"
+                        );
+                    }
+                }
+            }
             return existing_id;
         }
 
@@ -1401,6 +1708,7 @@ where
         let mut memory = Memory::new(payload, metadata);
         memory.id = memory_id;
         memory.source_key = Some(source_key.clone());
+        memory.semantic_vector = semantic_vector.clone();
         if let Some(event_time) = event_time {
             memory.created_at = event_time;
         }
@@ -1457,6 +1765,17 @@ where
         }
         self.source_key_to_id.insert(source_key, memory_id);
         self.index_memory_cues(memory_id, &indexed_cues);
+        if let Some(vector) = semantic_vector.as_ref() {
+            if let Ok(mut index) = self.semantic_index.write() {
+                if let Err(error) = index.insert(memory_id, vector) {
+                    tracing::debug!(
+                        memory_id,
+                        error = %error,
+                        "Skipping invalid semantic vector"
+                    );
+                }
+            }
+        }
         if let Some((session, order)) = source_order_link {
             self.add_source_order_entry(session, order, memory_id);
         }
@@ -1786,6 +2105,7 @@ where
             disable_salience_bias,
             heatmap,
             mandatory_cues,
+            None,
             false,
         )
         .0
@@ -1813,6 +2133,188 @@ where
             disable_salience_bias,
             heatmap,
             mandatory_cues,
+            None,
+            true,
+        )
+    }
+
+    pub fn recall_weighted_with_query_embedding(
+        &self,
+        query_cues: Vec<(String, f64)>,
+        limit: usize,
+        auto_reinforce: bool,
+        min_intersection: Option<usize>,
+        expansion_depth: usize,
+        explain: bool,
+        disable_salience_bias: bool,
+        heatmap: Option<&HashMap<String, f32>>,
+        mandatory_cues: Option<&Vec<String>>,
+        query_embedding: Option<&[f32]>,
+    ) -> Vec<RecallResult> {
+        self.recall_weighted_profiled(
+            query_cues,
+            limit,
+            auto_reinforce,
+            min_intersection,
+            expansion_depth,
+            explain,
+            disable_salience_bias,
+            heatmap,
+            mandatory_cues,
+            query_embedding,
+            false,
+        )
+        .0
+    }
+
+    /// Runs semantic scoring only over the lexical candidates produced by the
+    /// same request. This is the bounded hybrid path: it does not query the
+    /// semantic index or add semantic-only candidates.
+    pub fn recall_weighted_with_query_embedding_rerank_only(
+        &self,
+        query_cues: Vec<(String, f64)>,
+        limit: usize,
+        auto_reinforce: bool,
+        min_intersection: Option<usize>,
+        expansion_depth: usize,
+        explain: bool,
+        disable_salience_bias: bool,
+        heatmap: Option<&HashMap<String, f32>>,
+        mandatory_cues: Option<&Vec<String>>,
+        query_embedding: Option<&[f32]>,
+    ) -> Vec<RecallResult> {
+        self.recall_weighted_with_query_embedding_rerank_only_and_intent(
+            query_cues,
+            limit,
+            auto_reinforce,
+            min_intersection,
+            expansion_depth,
+            explain,
+            disable_salience_bias,
+            heatmap,
+            mandatory_cues,
+            query_embedding,
+            None,
+        )
+    }
+
+    pub fn recall_weighted_with_query_embedding_rerank_only_and_intent(
+        &self,
+        query_cues: Vec<(String, f64)>,
+        limit: usize,
+        auto_reinforce: bool,
+        min_intersection: Option<usize>,
+        expansion_depth: usize,
+        explain: bool,
+        disable_salience_bias: bool,
+        heatmap: Option<&HashMap<String, f32>>,
+        mandatory_cues: Option<&Vec<String>>,
+        query_embedding: Option<&[f32]>,
+        query_intent: Option<&IntentClassification>,
+    ) -> Vec<RecallResult> {
+        self.recall_weighted_profiled_with_options(
+            query_cues,
+            limit,
+            auto_reinforce,
+            min_intersection,
+            expansion_depth,
+            explain,
+            disable_salience_bias,
+            heatmap,
+            mandatory_cues,
+            query_embedding,
+            query_intent,
+            false,
+            true,
+        )
+        .0
+    }
+
+    pub fn recall_weighted_with_query_embedding_with_timing(
+        &self,
+        query_cues: Vec<(String, f64)>,
+        limit: usize,
+        auto_reinforce: bool,
+        min_intersection: Option<usize>,
+        expansion_depth: usize,
+        explain: bool,
+        disable_salience_bias: bool,
+        heatmap: Option<&HashMap<String, f32>>,
+        mandatory_cues: Option<&Vec<String>>,
+        query_embedding: Option<&[f32]>,
+    ) -> (Vec<RecallResult>, RecallTimingBreakdown) {
+        self.recall_weighted_profiled(
+            query_cues,
+            limit,
+            auto_reinforce,
+            min_intersection,
+            expansion_depth,
+            explain,
+            disable_salience_bias,
+            heatmap,
+            mandatory_cues,
+            query_embedding,
+            true,
+        )
+    }
+
+    /// Timing variant of the bounded hybrid path. Semantic scoring is
+    /// restricted to the lexical result set and cannot introduce new IDs.
+    pub fn recall_weighted_with_query_embedding_rerank_only_with_timing(
+        &self,
+        query_cues: Vec<(String, f64)>,
+        limit: usize,
+        auto_reinforce: bool,
+        min_intersection: Option<usize>,
+        expansion_depth: usize,
+        explain: bool,
+        disable_salience_bias: bool,
+        heatmap: Option<&HashMap<String, f32>>,
+        mandatory_cues: Option<&Vec<String>>,
+        query_embedding: Option<&[f32]>,
+    ) -> (Vec<RecallResult>, RecallTimingBreakdown) {
+        self.recall_weighted_with_query_embedding_rerank_only_with_intent_with_timing(
+            query_cues,
+            limit,
+            auto_reinforce,
+            min_intersection,
+            expansion_depth,
+            explain,
+            disable_salience_bias,
+            heatmap,
+            mandatory_cues,
+            query_embedding,
+            None,
+        )
+    }
+
+    pub fn recall_weighted_with_query_embedding_rerank_only_with_intent_with_timing(
+        &self,
+        query_cues: Vec<(String, f64)>,
+        limit: usize,
+        auto_reinforce: bool,
+        min_intersection: Option<usize>,
+        expansion_depth: usize,
+        explain: bool,
+        disable_salience_bias: bool,
+        heatmap: Option<&HashMap<String, f32>>,
+        mandatory_cues: Option<&Vec<String>>,
+        query_embedding: Option<&[f32]>,
+        query_intent: Option<&IntentClassification>,
+    ) -> (Vec<RecallResult>, RecallTimingBreakdown) {
+        self.recall_weighted_profiled_with_options(
+            query_cues,
+            limit,
+            auto_reinforce,
+            min_intersection,
+            expansion_depth,
+            explain,
+            disable_salience_bias,
+            heatmap,
+            mandatory_cues,
+            query_embedding,
+            query_intent,
+            true,
             true,
         )
     }
@@ -1828,11 +2330,45 @@ where
         disable_salience_bias: bool,
         heatmap: Option<&HashMap<String, f32>>,
         mandatory_cues: Option<&Vec<String>>,
+        query_embedding: Option<&[f32]>,
         collect_detailed_timing: bool,
+    ) -> (Vec<RecallResult>, RecallTimingBreakdown) {
+        self.recall_weighted_profiled_with_options(
+            query_cues,
+            limit,
+            auto_reinforce,
+            min_intersection,
+            expansion_depth,
+            explain,
+            disable_salience_bias,
+            heatmap,
+            mandatory_cues,
+            query_embedding,
+            None,
+            collect_detailed_timing,
+            false,
+        )
+    }
+
+    fn recall_weighted_profiled_with_options(
+        &self,
+        query_cues: Vec<(String, f64)>,
+        limit: usize,
+        auto_reinforce: bool,
+        min_intersection: Option<usize>,
+        expansion_depth: usize,
+        explain: bool,
+        disable_salience_bias: bool,
+        heatmap: Option<&HashMap<String, f32>>,
+        mandatory_cues: Option<&Vec<String>>,
+        query_embedding: Option<&[f32]>,
+        query_intent: Option<&IntentClassification>,
+        collect_detailed_timing: bool,
+        semantic_rerank_only: bool,
     ) -> (Vec<RecallResult>, RecallTimingBreakdown) {
         let total_start = Instant::now();
         let mut timing = RecallTimingBreakdown::default();
-        if query_cues.is_empty() {
+        if query_cues.is_empty() && query_embedding.is_none() {
             timing.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
             return (Vec::new(), timing);
         }
@@ -1847,7 +2383,7 @@ where
         timing.normalize_filter_ms = phase_start.elapsed().as_secs_f64() * 1000.0;
         timing.initial_active_cue_count = active_cues.len();
 
-        if active_cues.is_empty() {
+        if active_cues.is_empty() && query_embedding.is_none() {
             timing.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
             return (Vec::new(), timing);
         }
@@ -1879,6 +2415,43 @@ where
         timing.scanned_posting_count = search_timing.scanned_posting_count;
         timing.adaptive_scan_limit = search_timing.adaptive_scan_limit;
         timing.max_posting_len = search_timing.max_posting_len;
+
+        if semantic_rerank_only {
+            let config = self.config.semantic.resolved();
+            let rerank_limit = config.semantic_rerank_candidate_limit.max(limit);
+            results.sort_unstable_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            results.truncate(rerank_limit);
+            timing.semantic_rerank_candidate_limit = rerank_limit;
+            timing.semantic_rerank_candidate_count = results.len();
+        }
+
+        // Apply intent before semantic fusion so the semantic pass operates on
+        // the intent-aware lexical slate. The intent bonus is kept separately
+        // and reintroduced by rerank_existing_semantic_candidates after
+        // semantic normalization, so normalization cannot wash it out.
+        if let Some(query_intent) = query_intent {
+            self.apply_intent_reranker(&mut results, query_intent);
+        }
+
+        if let Some(query_embedding) = query_embedding {
+            let semantic_start = Instant::now();
+            let (new_candidates, semantic_candidates) = if semantic_rerank_only {
+                (
+                    0,
+                    self.rerank_existing_semantic_candidates(&mut results, query_embedding),
+                )
+            } else {
+                self.merge_semantic_candidates(&mut results, query_embedding, limit)
+            };
+            timing.candidate_generation_ms += semantic_start.elapsed().as_secs_f64() * 1000.0;
+            timing.candidate_count += new_candidates;
+            timing.scored_candidate_count += semantic_candidates;
+            self.apply_semantic_reranker(&mut results, query_embedding);
+        }
 
         // Filter by minimum intersection if specified (on primary cues only?)
         // For now, simple retention.
@@ -1924,8 +2497,11 @@ where
                         "recency_score": candidate.recency_score,
                         "reinforcement_score": candidate.reinforcement_score,
                         "salience_score": candidate.salience_score,
+                        "semantic_similarity": candidate.semantic_similarity,
                         "rerank_bonus": candidate.rerank_bonus,
                         "generic_penalty": candidate.generic_penalty,
+                        "intent_compatibility": candidate.intent_compatibility,
+                        "intent_rerank_bonus": candidate.intent_rerank_bonus,
                     }))
                 } else {
                     None
@@ -2052,6 +2628,270 @@ where
         timing.returned_count = final_results.len();
         timing.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
         (final_results, timing)
+    }
+
+    fn rerank_existing_semantic_candidates(
+        &self,
+        results: &mut [ScoredMemoryCandidate],
+        query_embedding: &[f32],
+    ) -> usize {
+        let config = self.config.semantic.resolved();
+        let normalized_query = match StoredSemanticVector::normalized_query(query_embedding) {
+            Ok(query) => query,
+            Err(error) => {
+                tracing::debug!(error = %error, "Semantic reranking skipped");
+                return 0;
+            }
+        };
+
+        let mut scored = Vec::new();
+        for (index, candidate) in results.iter_mut().enumerate() {
+            let Some(memory) = self.memories.get(&candidate.memory_id) else {
+                continue;
+            };
+            let Some(vector) = memory.semantic_vector.as_ref() else {
+                continue;
+            };
+            let Ok(similarity) = vector.cosine_similarity_normalized(&normalized_query) else {
+                continue;
+            };
+
+            candidate.semantic_similarity = similarity;
+            scored.push((index, similarity));
+        }
+
+        if scored.len() < 2 {
+            return scored.len();
+        }
+
+        // Intent is applied before this method, so recover the original
+        // lexical score from the separately tracked intent delta. Semantic
+        // normalization must compare lexical evidence on its own, then add
+        // the strong intent prior back to the fused result.
+        let lexical_min = results
+            .iter()
+            .map(|candidate| candidate.score - candidate.intent_rerank_bonus)
+            .fold(f64::INFINITY, f64::min);
+        let lexical_max = results
+            .iter()
+            .map(|candidate| candidate.score - candidate.intent_rerank_bonus)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let lexical_range = lexical_max - lexical_min;
+        let semantic_min = scored
+            .iter()
+            .map(|(_, similarity)| *similarity)
+            .fold(f32::INFINITY, f32::min);
+        let semantic_max = scored
+            .iter()
+            .map(|(_, similarity)| *similarity)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let semantic_range = semantic_max - semantic_min;
+        let semantic_weight = config.semantic_rerank_weight.clamp(0.0, 1.0);
+
+        if !lexical_range.is_finite() || lexical_range <= f64::EPSILON
+            || !semantic_range.is_finite()
+            || semantic_range <= f32::EPSILON
+            || semantic_weight <= f64::EPSILON
+        {
+            return scored.len();
+        }
+
+        let lexical_weight = 1.0 - semantic_weight;
+        for (index, similarity) in scored.iter().copied() {
+            let candidate = &mut results[index];
+            let lexical_score = candidate.score - candidate.intent_rerank_bonus;
+            let lexical_quality = ((lexical_score - lexical_min) / lexical_range).clamp(0.0, 1.0);
+            let semantic_quality =
+                ((similarity - semantic_min) / semantic_range).clamp(0.0, 1.0) as f64;
+            let fused_quality =
+                lexical_quality * lexical_weight + semantic_quality * semantic_weight;
+            let fused_score = lexical_min + fused_quality * lexical_range;
+            let final_score = fused_score + candidate.intent_rerank_bonus;
+            let delta = final_score - candidate.score;
+            candidate.score = final_score;
+            candidate.rerank_bonus += delta;
+        }
+
+        scored.len()
+    }
+
+    fn merge_semantic_candidates(
+        &self,
+        results: &mut Vec<ScoredMemoryCandidate>,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> (usize, usize) {
+        let config = self.config.semantic.resolved();
+        let candidate_limit = config.candidate_limit.max(limit);
+        let normalized_query = match StoredSemanticVector::normalized_query(query_embedding) {
+            Ok(query) => query,
+            Err(error) => {
+                tracing::debug!(error = %error, "Semantic query skipped");
+                return (0, 0);
+            }
+        };
+        let candidate_ids = match self.semantic_index.read() {
+            Ok(index) => match index.query_candidate_ids(query_embedding, candidate_limit) {
+                Ok(candidate_ids) => candidate_ids,
+                Err(error) => {
+                    tracing::debug!(error = %error, "Semantic query skipped");
+                    return (0, 0);
+                }
+            },
+            Err(_) => return (0, 0),
+        };
+        let mut semantic_candidates = candidate_ids
+            .into_iter()
+            .filter_map(|memory_id| {
+                let memory = self.memories.get(&memory_id)?;
+                let vector = memory.semantic_vector.as_ref()?;
+                let similarity = vector.cosine_similarity_normalized(&normalized_query).ok()?;
+                Some((memory_id, similarity))
+            })
+            .collect::<Vec<_>>();
+        semantic_candidates.sort_unstable_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        semantic_candidates.truncate(candidate_limit);
+
+        let mut existing = results
+            .iter()
+            .map(|candidate| candidate.memory_id)
+            .collect::<HashSet<_>>();
+        let mut new_count = 0;
+
+        for (memory_id, similarity) in semantic_candidates.iter().copied() {
+            if let Some(candidate) = results
+                .iter_mut()
+                .find(|candidate| candidate.memory_id == memory_id)
+            {
+                candidate.semantic_similarity = similarity;
+                candidate.score +=
+                    similarity as f64 * config.semantic_score_multiplier;
+                continue;
+            }
+
+            if !existing.insert(memory_id) {
+                continue;
+            }
+            let Some(memory) = self.memories.get(&memory_id) else {
+                continue;
+            };
+            let reinforcement_score = if memory.stats.get_reinforcement_count() > 0 {
+                (memory.stats.get_reinforcement_count() as f64).log10()
+            } else {
+                0.0
+            };
+            results.push(ScoredMemoryCandidate {
+                memory_id,
+                score: similarity as f64 * config.semantic_score_multiplier,
+                match_integrity: similarity.max(0.0) as f64,
+                intersection_count: 0,
+                recency_score: 0.0,
+                reinforcement_score,
+                salience_score: 0.0,
+                created_at: memory.created_at,
+                intersection_weighted: 0.0,
+                match_count: 0.0,
+                rerank_bonus: 0.0,
+                generic_penalty: 1.0,
+                semantic_similarity: similarity,
+                intent_compatibility: 0.0,
+                intent_rerank_bonus: 0.0,
+            });
+            new_count += 1;
+        }
+
+        (new_count, semantic_candidates.len())
+    }
+
+    fn apply_semantic_reranker(
+        &self,
+        results: &mut [ScoredMemoryCandidate],
+        _query_embedding: &[f32],
+    ) {
+        let config = &self.config.semantic;
+        if !config.reranker_enabled || config.reranker_weights.is_empty() {
+            return;
+        }
+        let model = LinearReranker::from_config(config);
+        for candidate in results {
+            let features = [
+                (candidate.score / self.tuning.intersection_score_multiplier)
+                    .clamp(-10.0, 10.0) as f32,
+                candidate.semantic_similarity,
+                candidate.match_integrity.clamp(0.0, 1.0) as f32,
+                (candidate.intersection_count as f32 / 8.0).min(1.0),
+                candidate.recency_score.clamp(0.0, 1.0) as f32,
+                (candidate.salience_score / 10.0).clamp(0.0, 1.0) as f32,
+            ];
+            let delta = model.score(&features) as f64 * config.reranker_scale;
+            candidate.rerank_bonus += delta;
+            candidate.score += delta;
+        }
+    }
+
+    fn apply_intent_reranker(
+        &self,
+        results: &mut [ScoredMemoryCandidate],
+        query_intent: &IntentClassification,
+    ) {
+        let config = self.config.semantic.resolved();
+        if !config.intent_rerank_enabled
+            || !query_intent.is_recall_intent()
+            || results.len() < 2
+        {
+            return;
+        }
+        let lexical_min = results
+            .iter()
+            .map(|candidate| candidate.score - candidate.intent_rerank_bonus)
+            .fold(f64::INFINITY, f64::min);
+        let lexical_max = results
+            .iter()
+            .map(|candidate| candidate.score - candidate.intent_rerank_bonus)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let lexical_range = lexical_max - lexical_min;
+        if !lexical_range.is_finite() || lexical_range <= f64::EPSILON {
+            return;
+        }
+
+        let query_weight = f64::from(query_intent.confidence_weight);
+        for candidate in results {
+            let Some(memory) = self.memories.get(&candidate.memory_id) else {
+                continue;
+            };
+            let Some(memory_intent) = memory.intent_classification.as_ref() else {
+                continue;
+            };
+            if memory_intent.taxonomy_version != crate::intent::INTENT_TAXONOMY_VERSION
+                || memory_intent.model_version != config.model_version
+            {
+                continue;
+            }
+            let compatibility = intent_compatibility(query_intent, memory_intent);
+            let memory_weight = f64::from(memory_intent.confidence_weight);
+            let positive = compatibility
+                * query_weight
+                * memory_weight
+                * config.intent_rerank_weight;
+            let no_recall_penalty = if memory_intent.memory_eligible {
+                0.0
+            } else {
+                // Suppression should be strong only when both sides are
+                // decisive. A low-margin query must not apply a categorical
+                // penalty to every action/chitchat memory.
+                query_weight * memory_weight * config.intent_no_recall_penalty
+            };
+            let delta = ((positive - no_recall_penalty) * lexical_range)
+                .clamp(-config.intent_rerank_max_delta, config.intent_rerank_max_delta);
+            candidate.intent_compatibility = compatibility;
+            candidate.intent_rerank_bonus = delta;
+            candidate.score += delta;
+            candidate.rerank_bonus += delta;
+        }
     }
 
     fn consolidated_search(
@@ -2531,6 +3371,9 @@ where
                     match_count,
                     rerank_bonus,
                     generic_penalty,
+                    semantic_similarity: 0.0,
+                    intent_compatibility: 0.0,
+                    intent_rerank_bonus: 0.0,
                 });
                 if let Some(start) = detail_start.as_mut() {
                     timing.finalize_ms += start.elapsed().as_secs_f64() * 1000.0;
@@ -3002,5 +3845,625 @@ impl CueMapEngine<LexiconStats> {
         trending.truncate(limit);
 
         trending
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::semantic::SemanticConfig;
+    use std::collections::BTreeMap;
+
+    fn classification(
+        primary_intent: &str,
+        confidence_weight: f32,
+        memory_eligible: bool,
+    ) -> IntentClassification {
+        let mut scores = BTreeMap::new();
+        for label in crate::intent::INTENT_LABELS {
+            scores.insert(label.to_string(), if label == primary_intent { 1.0 } else { 0.0 });
+        }
+        IntentClassification {
+            primary_intent: primary_intent.to_string(),
+            scores,
+            top_intents: vec![primary_intent.to_string()],
+            top_score: 1.0,
+            margin: 1.0,
+            confidence_weight,
+            recall_eligible: memory_eligible,
+            recall_action: if memory_eligible {
+                "recall".to_string()
+            } else {
+                "no_recall".to_string()
+            },
+            memory_eligible,
+            model_version: SemanticConfig::default().model_version,
+            taxonomy_version: INTENT_TAXONOMY_VERSION.to_string(),
+        }
+    }
+
+    fn candidate(memory_id: MemoryId, score: f64) -> ScoredMemoryCandidate {
+        ScoredMemoryCandidate {
+            memory_id,
+            score,
+            match_integrity: 1.0,
+            intersection_count: 1,
+            recency_score: 0.0,
+            reinforcement_score: 0.0,
+            salience_score: 0.0,
+            created_at: 0.0,
+            intersection_weighted: score,
+            match_count: 1.0,
+            rerank_bonus: 0.0,
+            generic_penalty: 1.0,
+            semantic_similarity: 0.0,
+            intent_compatibility: 0.0,
+            intent_rerank_bonus: 0.0,
+        }
+    }
+
+    #[test]
+    fn intent_rerank_penalty_is_confidence_scaled_and_bounded() {
+        let mut engine = CueMapEngine::<MainStats>::new();
+        let mut config = SemanticConfig::default();
+        config.intent_rerank_weight = 1.0;
+        config.intent_no_recall_penalty = 1.0;
+        config.intent_rerank_max_delta = 32.0;
+        engine.set_semantic_config(config);
+
+        let memory_id = engine.add_memory(
+            "Run the deployment command".to_string(),
+            vec!["deployment".to_string()],
+            None,
+            MainStats::default(),
+            true,
+        );
+        engine.attach_intent_classification(
+            memory_id,
+            classification("action_or_command", 1.0, false),
+        );
+
+        let query = classification("event_or_plan", 1.0, true);
+        let mut results = vec![candidate(memory_id, 1000.0), candidate(INVALID_MEMORY_ID, 0.0)];
+        engine.apply_intent_reranker(&mut results, &query);
+        assert_eq!(results[0].intent_rerank_bonus, -32.0);
+
+        let uncertain_query = classification("event_or_plan", 0.1, true);
+        let mut results = vec![candidate(memory_id, 100.0), candidate(INVALID_MEMORY_ID, 0.0)];
+        engine.apply_intent_reranker(&mut results, &uncertain_query);
+        assert!(results[0].intent_rerank_bonus > -32.0);
+    }
+
+    #[test]
+    fn intent_bonus_survives_semantic_normalization() {
+        let mut engine = CueMapEngine::<MainStats>::new();
+        let mut config = SemanticConfig::default();
+        config.enabled = true;
+        config.dimensions = 3;
+        config.storage = crate::semantic::SemanticStorage::F32;
+        config.index = crate::semantic::SemanticIndexMode::Exact;
+        config.semantic_rerank_weight = 0.60;
+        config.intent_rerank_weight = 1.0;
+        config.intent_rerank_max_delta = 64.0;
+        engine.set_semantic_config(config);
+
+        let matching_id = engine.add_memory_with_event_time_and_vector(
+            "A preference memory".to_string(),
+            vec!["preference".to_string()],
+            None,
+            MainStats::default(),
+            true,
+            None,
+            Some(vec![1.0, 0.0, 0.0]),
+        );
+        let unrelated_id = engine.add_memory_with_event_time_and_vector(
+            "An unrelated event memory".to_string(),
+            vec!["event".to_string()],
+            None,
+            MainStats::default(),
+            true,
+            None,
+            Some(vec![0.0, 1.0, 0.0]),
+        );
+        engine.attach_intent_classification(
+            matching_id,
+            classification("preference", 1.0, true),
+        );
+        engine.attach_intent_classification(
+            unrelated_id,
+            classification("event_or_plan", 1.0, true),
+        );
+
+        let query = classification("preference", 1.0, true);
+        let mut results = vec![
+            candidate(matching_id, 1000.0),
+            candidate(unrelated_id, 0.0),
+        ];
+        engine.apply_intent_reranker(&mut results, &query);
+        assert_eq!(results[0].intent_rerank_bonus, 64.0);
+
+        let semantic_count =
+            engine.rerank_existing_semantic_candidates(&mut results, &[1.0, 0.0, 0.0]);
+
+        assert_eq!(semantic_count, 2);
+        assert_eq!(results[0].score, 1064.0);
+        assert_eq!(results[0].intent_rerank_bonus, 64.0);
+        assert_eq!(results[0].semantic_similarity, 1.0);
+    }
+
+    #[test]
+    fn structured_helpers_cover_facet_families_and_fallbacks() {
+        let generated = [
+            "source_role:user", "source_channel:chat", "source_type:note",
+            "source_session:s1", "source_time:morning", "source_date:2024",
+            "source_week:1", "source_month:1", "has:age", "completion_count:2",
+            "completed_action:ship", "instruction:do", "instruction_trigger:now",
+            "instruction_action:run", "preference:tea", "preference_value:green",
+            "preference_topic:drink", "preference_contrast:coffee", "temporal:today",
+            "co_residence:home", "entity:person", "person_title:dr", "person_role_phrase:lead",
+            "person_ref:kaan", "quantity_object:items", "quantity_unit:kg",
+            "quantity_unit_object:bag", "quantity_count:2", "inventory_object:book",
+            "inventory_count:3", "purchase:item", "companion:friend", "age:42",
+            "education:college", "travel:trip", "media:book", "reading:novel",
+            "transport_mode:train", "transport_event:arrival", "activity_domain:work",
+            "topic:rust", "attribute:fast", "family_relation:sibling", "family_scope:home",
+            "family_count:2", "sibling_kind:brother", "type:preference",
+        ];
+        for cue in generated {
+            assert!(is_generated_memory_facet(cue), "{cue} should be generated");
+            assert!(cue_structured_family_mask(cue) != 0);
+        }
+        for cue in ["type:preference", "media:book", "travel:trip", "topic:rust", "purchase:item"] {
+            assert!(is_semantic_generated_facet(cue));
+        }
+        assert!(!is_generated_memory_facet("plain lexical cue"));
+        assert!(!is_semantic_generated_facet("plain lexical cue"));
+        assert_eq!(cue_structured_family_mask("plain lexical cue"), 0);
+        assert_eq!(rerank_multiplier_for_prefix("source_time"), 12.0);
+        assert_eq!(rerank_multiplier_for_prefix("unknown"), 4.0);
+
+        let cues = generated.iter().map(|cue| cue.to_string()).collect::<Vec<_>>();
+        let features = compute_memory_scoring_features(&cues);
+        assert_eq!(features.version, MEMORY_SCORING_FEATURES_VERSION);
+        assert!(features.has_summary_type == false);
+        assert_eq!(features.scored_cue_len, 1);
+        assert!(features.structured_family_mask & FAMILY_PERSON != 0);
+        assert!(features.structured_family_mask & FAMILY_SOURCE_TIME != 0);
+
+        let profile_cues = [
+            ("plain".to_string(), 1.0),
+            ("person_role_phrase:lead".to_string(), 1.0),
+            ("quantity_object:items".to_string(), 1.0),
+            ("inventory_object:book".to_string(), 1.0),
+            ("travel:trip".to_string(), 1.0),
+            ("age:42".to_string(), 1.0),
+            ("education:college".to_string(), 1.0),
+            ("family_count:2".to_string(), 3.0),
+            ("source_role:user".to_string(), 3.0),
+            ("source_time:morning".to_string(), 1.0),
+            ("type:update".to_string(), 1.0),
+            ("type:preference".to_string(), 3.0),
+        ];
+        let profile = build_query_scoring_profile(&profile_cues);
+        assert!(profile.lexical_query_seen);
+        assert!(profile.strong_lexical_query_seen);
+        assert!(profile.strong_structured_query_seen);
+        assert!(profile.structured_query_seen);
+        assert!(profile.person_structured_query_seen);
+        assert!(profile.quantity_structured_query_seen);
+        assert!(profile.inventory_structured_query_seen);
+        assert!(profile.travel_structured_query_seen);
+        assert!(profile.age_structured_query_seen);
+        assert!(profile.education_structured_query_seen);
+        assert!(profile.family_structured_query_seen);
+        assert!(profile.family_count_structured_query_seen);
+        assert!(profile.source_role_structured_query_seen);
+        assert!(profile.source_time_structured_query_seen);
+        assert!(profile.update_structured_query_seen);
+
+        let mut stale = Memory::<MainStats>::new(Vec::new(), None);
+        stale.cues = vec!["plain".to_string()];
+        let fresh = memory_scoring_features(&stale);
+        assert_eq!(fresh.scored_cue_len, 1);
+        stale.scoring_features.version = MEMORY_SCORING_FEATURES_VERSION;
+        stale.scoring_features.scored_cue_len = 9;
+        assert_eq!(memory_scoring_features(&stale).scored_cue_len, 9);
+    }
+
+    #[test]
+    fn metadata_and_source_order_parsers_cover_types_and_invalid_values() {
+        let mut metadata = HashMap::new();
+        metadata.insert("number".to_string(), serde_json::json!(7));
+        metadata.insert("flag".to_string(), serde_json::json!(true));
+        metadata.insert("blank".to_string(), serde_json::json!("  "));
+        assert_eq!(CueMapEngine::<MainStats>::metadata_string_value(&metadata, &["blank", "number"]), Some("7".to_string()));
+        assert_eq!(CueMapEngine::<MainStats>::metadata_string_value(&metadata, &["flag"]), Some("true".to_string()));
+        assert_eq!(CueMapEngine::<MainStats>::metadata_string_value(&metadata, &["missing"]), None);
+
+        assert_eq!(CueMapEngine::<MainStats>::normalize_source_order_value(" Hello, World! "), Some("hello_world".to_string()));
+        assert_eq!(CueMapEngine::<MainStats>::normalize_source_order_value("---"), None);
+        metadata.insert("session_id".to_string(), serde_json::json!(" Session A "));
+        metadata.insert("source_turn_index".to_string(), serde_json::json!("12"));
+        assert_eq!(CueMapEngine::<MainStats>::source_order_session_from(&metadata, &[]), Some("session_a".to_string()));
+        assert_eq!(CueMapEngine::<MainStats>::source_order_value_from(&metadata, &[]), Some(12));
+
+        let mut numeric = HashMap::new();
+        numeric.insert("source_order".to_string(), serde_json::json!(9));
+        assert_eq!(CueMapEngine::<MainStats>::source_order_value_from(&numeric, &[]), Some(9));
+        let cues = vec!["source_session:Fallback Session".to_string(), "turn_index:4".to_string()];
+        assert_eq!(CueMapEngine::<MainStats>::source_order_session_from(&HashMap::new(), &cues), Some("fallback_session".to_string()));
+        assert_eq!(CueMapEngine::<MainStats>::source_order_value_from(&HashMap::new(), &cues), Some(4));
+        assert_eq!(CueMapEngine::<MainStats>::source_order_value_from(&HashMap::new(), &["turn_index:nope".to_string()]), None);
+
+        let engine = CueMapEngine::<MainStats>::new();
+        assert!(engine.ordered_entries_for_session("!!!", 10).is_empty());
+        assert!(engine.source_order_window("!!!", 0, 2).is_empty());
+    }
+
+    #[test]
+    fn constructors_semantic_setup_and_encoding_error_paths_are_safe() {
+        struct UnitEncoder;
+        impl SemanticEncoder for UnitEncoder {
+            fn dimensions(&self) -> usize { 3 }
+            fn encode(&self, text: &str) -> Result<Vec<f32>, String> {
+                if text == "bad" { return Err("bad input".to_string()); }
+                Ok(vec![1.0, 0.0, 0.0])
+            }
+        }
+        let key = crate::crypto::EncryptionKey::new(vec![7; 32]);
+        let keyed = CueMapEngine::<MainStats>::with_key(Some(key.clone()));
+        assert_eq!(keyed.get_master_key().unwrap().as_bytes(), &[7; 32]);
+        let unkeyed = CueMapEngine::<MainStats>::with_key(None);
+        assert!(unkeyed.get_master_key().is_none());
+
+        let mut engine = CueMapEngine::<MainStats>::new();
+        assert!(engine.encode_semantic_text("disabled").is_none());
+        let mut config = SemanticConfig::default();
+        config.enabled = true;
+        config.encoder_enabled = true;
+        config.dimensions = 3;
+        engine.set_semantic_config(config);
+        assert!(engine.encode_semantic_text("no encoder").is_none());
+        assert!(matches!(engine.classify_intent("anything", IntentTarget::Memory), Err(error) if error == "intent classifier unavailable"));
+        engine.set_semantic_encoder(Some(Arc::new(UnitEncoder)));
+        assert!(engine.encode_semantic_text("works").is_some());
+        assert!(engine.encode_semantic_text("bad").is_none());
+        let _ = engine.classify_intent("anything", IntentTarget::Memory);
+        let _ = engine.classify_intent_with_embedding("anything", IntentTarget::Memory, &[1.0, 0.0, 0.0]);
+        assert!(engine.configure_semantic_encoder().is_ok());
+
+        let mut bad = SemanticConfig::default();
+        bad.enabled = true;
+        bad.dimensions = 3;
+        bad.storage = crate::semantic::SemanticStorage::F32;
+        engine.set_semantic_config(bad);
+        let id = engine.add_memory_with_event_time_and_vector("bad vector".to_string(), vec!["v".to_string()], None, MainStats::default(), true, Some(42.0), Some(vec![1.0, 2.0]));
+        assert_ne!(id, INVALID_MEMORY_ID);
+        assert!(engine.get_memory(id).unwrap().semantic_vector.is_none());
+        assert_eq!(engine.semantic_index_stats(), (true, 0, None));
+    }
+
+    #[test]
+    fn recall_edge_paths_and_maintenance_helpers_are_covered() {
+        let engine = CueMapEngine::<MainStats>::new();
+        assert!(engine.recall(Vec::new(), 10, false, None).is_empty());
+        assert!(engine.recall_intersection(Vec::new(), 10).is_empty());
+        assert!(engine.recall_intersection(vec![("missing".to_string(), 1.0)], 10).is_empty());
+        assert!(engine.recall_fast(Vec::new(), 10).is_empty());
+        assert!(engine.recall_weighted(Vec::new(), 10, false, None, 1, false, false, None, None).is_empty());
+        assert!(engine.recall_weighted_with_query_embedding(Vec::new(), 10, false, None, 1, false, false, None, None, Some(&[1.0, 0.0])).is_empty());
+
+        let id = engine.add_memory("alpha beta".to_string(), vec!["alpha".to_string(), "type:update".to_string()], None, MainStats::default(), true);
+        assert_eq!(engine.get_cue_frequency(" ALPHA "), 1);
+        assert!(engine.recall_intersection(vec![("alpha".to_string(), 2.0), ("missing".to_string(), 1.0)], 2).len() == 1);
+        assert_eq!(engine.recall_fast(vec!["alpha".to_string(), "".to_string()], 1).len(), 1);
+        let mandatory = vec!["not-present".to_string()];
+        assert!(engine.recall_weighted(vec![("alpha".to_string(), 1.0)], 10, false, None, 1, true, false, None, Some(&mandatory)).is_empty());
+        let mut heatmap = HashMap::new();
+        heatmap.insert("alpha".to_string(), 2.0);
+        let (results, timing) = engine.recall_weighted_with_timing(vec![("alpha".to_string(), 1.0)], 2, true, Some(1), 1, true, false, Some(&heatmap), None);
+        assert_eq!(results.len(), 1);
+        assert!(timing.total_ms >= 0.0);
+        assert!(engine.attach_cues(INVALID_MEMORY_ID, vec!["x".to_string()]) == false);
+        engine.remove_cues_from_index(id, &[" alpha ".to_string(), "missing".to_string(), "".to_string()]);
+        assert_eq!(engine.get_cue_frequency("alpha"), 0);
+    }
+
+    #[test]
+    fn mainstats_and_lexicon_specialized_paths_are_exercised() {
+        let engine = CueMapEngine::<MainStats>::new();
+        let id = engine.add_memory("hot memory".to_string(), vec!["hot".to_string()], None, MainStats { intrinsic_salience: 0.2, dynamic_salience: 0.0, last_boosted_at: 0, reinforcement_count: 0 }, true);
+        engine.reinforce_dynamic(id, 4.0);
+        let mut heatmap = HashMap::new();
+        heatmap.insert("hot".to_string(), 2.5);
+        let scored = engine.score_with_decay_and_market(vec![id, INVALID_MEMORY_ID], &heatmap);
+        assert_eq!(scored.len(), 1);
+        assert!(scored[0].score > 2.5);
+        assert!(scored[0].explain.is_some());
+        engine.decay_salience(0.5);
+        assert!(!engine.get_trending_cues(10).is_empty());
+        assert_eq!(engine.prune_low_salience(100.0), 1);
+
+        let dict = CueMapEngine::<LexiconStats>::new();
+        let dict_id = dict.add_memory("word".to_string(), vec!["word".to_string()], None, LexiconStats::default(), true);
+        dict.reinforce_tiered(dict_id, 3);
+        let trending = dict.get_trending_items(10);
+        assert_eq!(trending, vec![(dict_id, 3.0)]);
+        assert!(dict.get_trending_items(0).is_empty());
+    }
+
+    #[test]
+    fn from_state_rebuilds_indexes_and_disk_migration_roundtrips() {
+        let source = CueMapEngine::<MainStats>::new();
+        let id = source.add_memory("persisted".to_string(), vec!["persist".to_string()], None, MainStats::default(), true);
+        let mut config = crate::config::ServerConfig::default();
+        config.server.data_dir = std::env::temp_dir().join(format!("cuemap-engine-{}", std::process::id())).to_string_lossy().to_string();
+        config.server.store_content_on_disk = true;
+        let disk = CueMapEngine::from_state((**source.get_memories()).clone(), (**source.get_source_key_to_id()).clone(), (**source.get_cue_index()).clone(), source.next_memory_id(), None, config.clone(), "disk-test".to_string());
+        let memory = disk.get_memory(id).unwrap();
+        assert!(memory.disk_backed);
+        assert_eq!(disk.read_memory_content(&memory).unwrap(), "persisted");
+        let mut ram_config = config;
+        ram_config.server.store_content_on_disk = false;
+        let restored = CueMapEngine::from_state((**disk.get_memories()).clone(), (**disk.get_source_key_to_id()).clone(), (**disk.get_cue_index()).clone(), disk.next_memory_id(), None, ram_config, "disk-test".to_string());
+        let restored_memory = restored.get_memory(id).unwrap();
+        assert!(!restored_memory.disk_backed);
+        assert_eq!(restored.read_memory_content(&restored_memory).unwrap(), "persisted");
+        assert_eq!(restored.get_cue_frequency("persist"), 1);
+        let _ = std::fs::remove_dir_all(restored.get_disk_content_dir().parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn temporal_chunking_disk_storage_and_source_aliases_work() {
+        let mut engine = CueMapEngine::<MainStats>::new();
+        let mut config = engine.config.clone();
+        config.server.data_dir = std::env::temp_dir().join(format!("cuemap-engine-direct-{}", std::process::id())).to_string_lossy().to_string();
+        config.server.store_content_on_disk = true;
+        engine.config = config;
+        let first = engine.add_memory_with_event_time(
+            "first event".to_string(),
+            vec!["topic:rust".to_string()],
+            None,
+            MainStats::default(),
+            false,
+            Some(1000.0),
+        );
+        let second = engine.add_memory_with_event_time(
+            "second event".to_string(),
+            vec!["topic:rust".to_string()],
+            None,
+            MainStats::default(),
+            false,
+            Some(1100.0),
+        );
+        let first_memory = engine.get_memory(first).unwrap();
+        let second_memory = engine.get_memory(second).unwrap();
+        assert!(first_memory.disk_backed && second_memory.disk_backed);
+        assert!(second_memory.cues.iter().any(|cue| cue == &format!("episode:{first}")));
+        assert_eq!(engine.read_memory_content(&second_memory).unwrap(), "second event");
+        assert_eq!(engine.get_cue_frequency("topic:rust"), 2);
+        assert_eq!(engine.source_order_for_memory(first), None);
+        let _ = std::fs::remove_dir_all(engine.get_disk_content_dir().parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn semantic_budget_and_reranker_invalid_paths_are_safe() {
+        let mut engine = CueMapEngine::<MainStats>::new();
+        let mut config = SemanticConfig::default();
+        config.enabled = true;
+        config.dimensions = 3;
+        config.max_memory_mb = 1;
+        config.storage = crate::semantic::SemanticStorage::F32;
+        config.reranker_enabled = true;
+        config.reranker_weights = vec![0.1; 6];
+        config.reranker_scale = 0.5;
+        engine.set_semantic_config(config);
+        let id = engine.add_memory_with_event_time_and_vector("vector".to_string(), vec!["vector".to_string()], None, MainStats::default(), true, None, Some(vec![1.0, 0.0, 0.0]));
+        let mut candidates = vec![candidate(id, 1.0), candidate(INVALID_MEMORY_ID, 0.0)];
+        assert_eq!(engine.rerank_existing_semantic_candidates(&mut candidates, &[]), 0);
+        assert_eq!(engine.merge_semantic_candidates(&mut candidates, &[], 2), (0, 0));
+        engine.apply_semantic_reranker(&mut candidates, &[]);
+        let invalid_query_results = engine.recall_weighted_with_query_embedding(vec![("vector".to_string(), 1.0)], 2, false, None, 1, false, false, None, None, Some(&[]));
+        assert_eq!(invalid_query_results.len(), 1);
+        assert!(engine.get_memory(id).unwrap().semantic_vector.is_some());
+
+        let mut budget_engine = CueMapEngine::<MainStats>::new();
+        let mut budget_config = SemanticConfig::default();
+        budget_config.enabled = true;
+        budget_config.dimensions = 1_000_000;
+        budget_config.max_memory_mb = 1;
+        budget_engine.set_semantic_config(budget_config);
+        let huge = budget_engine.add_memory_with_event_time_and_vector("budget".to_string(), vec!["budget".to_string()], None, MainStats::default(), true, None, Some(vec![0.0; 1_000_000]));
+        assert!(budget_engine.get_memory(huge).unwrap().semantic_vector.is_none());
+    }
+
+    #[test]
+    fn intent_coverage_tracks_current_and_stale_annotations() {
+        let engine = CueMapEngine::<MainStats>::new();
+        let current_id = engine.add_memory("current".to_string(), vec!["current".to_string()], None, MainStats::default(), true);
+        let stale_id = engine.add_memory("stale".to_string(), vec!["stale".to_string()], None, MainStats::default(), true);
+        engine.attach_intent_classification(current_id, classification("preference", 1.0, true));
+        let mut stale = classification("event_or_plan", 1.0, true);
+        stale.model_version = "old-model".to_string();
+        engine.attach_intent_classification(stale_id, stale);
+        assert_eq!(engine.intent_coverage(), (2, 2, 1, 1));
+        assert!(engine.attach_intent_classification(INVALID_MEMORY_ID, classification("preference", 1.0, true)) == false);
+    }
+
+    #[test]
+    fn parent_expansion_symbols_and_consolidation_are_exercised() {
+        let engine = CueMapEngine::<MainStats>::new();
+        let mut parent = HashMap::new();
+        parent.insert("parent:doc".to_string(), serde_json::json!(true));
+        let _first = engine.add_memory("chunk one".to_string(), vec!["parent:doc".to_string(), "chunk_idx:0".to_string(), "needle".to_string()], None, MainStats::default(), true);
+        let _middle = engine.add_memory("chunk two".to_string(), vec!["parent:doc".to_string(), "chunk_idx:1".to_string(), "needle".to_string()], None, MainStats::default(), true);
+        let _third = engine.add_memory("chunk three".to_string(), vec!["parent:doc".to_string(), "chunk_idx:2".to_string(), "needle".to_string()], None, MainStats::default(), true);
+        let expanded = engine.recall_weighted(vec![("needle".to_string(), 1.0)], 1, false, None, 2, false, false, None, None);
+        assert!(expanded.iter().any(|result| result.content.contains("chunk two") && result.content.contains("chunk three")));
+
+        engine.add_memory("fn".to_string(), vec!["defines_function:run".to_string(), "calls_method:save".to_string(), "defines_function:".to_string()], Some(parent), MainStats::default(), true);
+        let symbols = engine.get_all_symbols();
+        assert!(symbols.contains("run") && symbols.contains("save"));
+
+        let mut m1 = MainStats::default();
+        m1.intrinsic_salience = 2.0;
+        let mut m2 = MainStats::default();
+        m2.intrinsic_salience = 4.0;
+        engine.add_memory("merge one".to_string(), vec!["shared".to_string(), "one".to_string()], None, m1, true);
+        engine.add_memory("merge two".to_string(), vec!["shared".to_string(), "two".to_string()], None, m2, true);
+        let merged = engine.consolidate_memories(0.3);
+        assert!(!merged.is_empty());
+        let summary = engine.get_memory(merged[0].0).unwrap();
+        assert_eq!(summary.metadata.get("consolidated").and_then(|v| v.as_bool()), Some(true));
+        assert!(summary.cues.iter().any(|cue| cue == "type:summary"));
+    }
+
+    #[test]
+    fn id_exhaustion_and_stats_snapshot_are_safe() {
+        let engine = CueMapEngine::<MainStats>::new();
+        engine.next_memory_id.store(MemoryId::MAX, Ordering::Relaxed);
+        assert_eq!(engine.add_memory("too late".to_string(), vec!["x".to_string()], None, MainStats::default(), true), INVALID_MEMORY_ID);
+        let stats = engine.get_stats();
+        assert_eq!(stats.get("total_memories").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(stats.get("total_cues").and_then(|v| v.as_u64()), Some(0));
+    }
+
+    #[test]
+    fn public_constructor_and_recall_wrappers_are_smoke_tested() {
+        let mut engine = CueMapEngine::<MainStats>::with_tuning(crate::config::TuningConfig::default());
+        engine.set_tuning_config(crate::config::TuningConfig::default());
+        engine.set_master_key(Some(Arc::new(crate::crypto::EncryptionKey::new(vec![3; 32]))));
+        let id = engine.add_memory_with_source_key(
+            "wrapper memory".to_string(),
+            vec!["wrapper".to_string()],
+            None,
+            MainStats::default(),
+            true,
+            Some("wrapper-key".to_string()),
+        );
+        assert_ne!(id, INVALID_MEMORY_ID);
+        assert_eq!(engine.memory_id_for_source_key("wrapper-key"), Some(id));
+        assert!(engine.get_memories().contains_key(&id));
+        assert!(engine.get_source_key_to_id().contains_key("wrapper-key"));
+        assert!(engine.get_cue_index().contains_key("wrapper"));
+        assert!(engine.next_memory_id() > id);
+        let reranked = engine.recall_weighted_with_query_embedding_rerank_only(vec![("wrapper".to_string(), 1.0)], 1, false, None, 1, false, false, None, None, Some(&[1.0]));
+        assert_eq!(reranked.len(), 1);
+        let (_results, timing) = engine.recall_weighted_with_query_embedding_rerank_only_with_timing(vec![("wrapper".to_string(), 1.0)], 1, false, None, 1, false, false, None, None, Some(&[1.0]));
+        assert!(timing.total_ms >= 0.0);
+    }
+
+    #[test]
+    fn generic_engine_paths_are_instantiated_for_lexicon_and_main_stats() {
+        let mut metadata = HashMap::new();
+        metadata.insert("session_id".to_string(), serde_json::json!("lex-session"));
+        metadata.insert("source_order".to_string(), serde_json::json!(1));
+        let mut lexicon = CueMapEngine::<LexiconStats>::new();
+        let lex_id = lexicon.add_memory("lexicon word".to_string(), vec!["word".to_string()], Some(metadata), LexiconStats::default(), true);
+        let lex_mem = lexicon.get_memory(lex_id).unwrap();
+        assert_eq!(lexicon.read_memory_content(&lex_mem).unwrap(), "lexicon word");
+        assert_eq!(lexicon.recall_fast(vec!["word".to_string()], 1).len(), 1);
+        assert_eq!(lexicon.recall_intersection(vec![("word".to_string(), 1.0)], 1).len(), 1);
+        assert_eq!(lexicon.source_order_window("lex-session", 1, 2).len(), 1);
+        let _ = lexicon.set_semantic_config(SemanticConfig::default());
+        let restored = CueMapEngine::from_state((**lexicon.get_memories()).clone(), (**lexicon.get_source_key_to_id()).clone(), (**lexicon.get_cue_index()).clone(), lexicon.next_memory_id(), None, crate::config::ServerConfig::default(), "lexicon".to_string());
+        assert_eq!(restored.get_memory(lex_id).unwrap().id, lex_id);
+
+        let main = CueMapEngine::<MainStats>::new();
+        let main_id = main.add_memory("main word".to_string(), vec!["word".to_string()], None, MainStats::default(), true);
+        assert_eq!(main.recall_fast(vec!["word".to_string()], 1).len(), 1);
+        assert_eq!(main.recall_intersection(vec![("word".to_string(), 1.0)], 1).len(), 1);
+        let main_mem = main.get_memory(main_id).unwrap();
+        assert_eq!(main.read_memory_content(&main_mem).unwrap(), "main word");
+    }
+
+    #[test]
+    fn structured_reranking_penalty_matrix_exercises_all_families() {
+        let cases: [(&str, f64, &str); 15] = [
+            ("type:update", 1.0, "family_relation:sibling"),
+            ("family_count:2", 1.0, "family_relation:sibling"),
+            ("source_role:user", 3.0, "family_relation:sibling"),
+            ("source_time:morning", 1.0, "family_relation:sibling"),
+            ("source_time:morning", 1.0, "source_time:evening"),
+            ("type:preference", 3.0, "family_relation:sibling"),
+            ("person_role_phrase:lead", 1.0, "quantity_object:item"),
+            ("quantity_object:item", 1.0, "inventory_object:book"),
+            ("inventory_object:book", 1.0, "travel:trip"),
+            ("travel:trip", 1.0, "age:42"),
+            ("age:42", 1.0, "education:college"),
+            ("education:college", 1.0, "family_relation:sibling"),
+            ("family_relation:sibling", 1.0, "family_scope:home"),
+            ("family_scope:home", 1.0, "family_relation:sibling"),
+            ("source_time:morning", 1.0, "topic:rust"),
+        ];
+        for (query_cue, weight, candidate_structured) in cases {
+            let engine = CueMapEngine::<MainStats>::new();
+            engine.add_memory(
+                "structured seed".to_string(),
+                vec!["seed".to_string(), query_cue.to_string()],
+                None,
+                MainStats::default(),
+                true,
+            );
+            engine.add_memory(
+                "lexical candidate".to_string(),
+                vec!["lexical".to_string(), candidate_structured.to_string()],
+                None,
+                MainStats::default(),
+                true,
+            );
+            let results = engine.recall_weighted(
+                vec![("lexical".to_string(), 1.0), (query_cue.to_string(), weight)],
+                5,
+                false,
+                None,
+                1,
+                false,
+                true,
+                None,
+                None,
+            );
+            assert!(!results.is_empty(), "no result for {query_cue}");
+        }
+    }
+
+    #[test]
+    fn salience_decay_and_consolidation_truncation_paths_are_verified() {
+        let engine = CueMapEngine::<MainStats>::new();
+        let cold = engine.add_memory("cold".to_string(), vec!["cold".to_string()], None, MainStats::default(), true);
+        let warm = engine.add_memory("warm".to_string(), vec!["warm".to_string()], None, MainStats::default(), true);
+        if let Some(mut memory) = engine.get_memories().get_mut(&cold) {
+            memory.stats.dynamic_salience = 0.005;
+            memory.stats.last_boosted_at = 1;
+        }
+        if let Some(mut memory) = engine.get_memories().get_mut(&warm) {
+            memory.stats.dynamic_salience = 3.0;
+            memory.stats.last_boosted_at = 1;
+        }
+        engine.decay_salience(0.5);
+        assert_eq!(engine.get_memory(cold).unwrap().stats.dynamic_salience, 0.0);
+        assert!(engine.get_memory(warm).unwrap().stats.dynamic_salience < 3.0);
+        assert!(engine.get_trending_cues(10).is_empty());
+
+        let long = "x".repeat(700);
+        engine.add_memory(long.clone(), vec!["merge-long".to_string()], None, MainStats::default(), true);
+        engine.add_memory(long, vec!["merge-long".to_string()], None, MainStats::default(), true);
+        let merged = engine.consolidate_memories(0.5);
+        assert!(!merged.is_empty());
+        let summary = engine.get_memory(merged[0].0).unwrap();
+        assert!(engine.read_memory_content(&summary).unwrap().contains("[truncated]"));
+    }
+
+    #[test]
+    fn recall_intersection_and_fast_paths_cover_duplicates_and_matches() {
+        let engine = CueMapEngine::<MainStats>::new();
+        let id = engine.add_memory("both cues".to_string(), vec!["first".to_string(), "second".to_string()], None, MainStats::default(), true);
+        let other = engine.add_memory("first only".to_string(), vec!["first".to_string()], None, MainStats::default(), true);
+        let intersection = engine.recall_intersection(vec![("first".to_string(), 2.0), ("second".to_string(), 3.0)], 10);
+        assert_eq!(intersection[0].memory_id, id);
+        assert_eq!(intersection[0].intersection_count, 2);
+        let fast = engine.recall_fast(vec!["first".to_string(), "second".to_string(), "first".to_string()], 10);
+        assert_eq!(fast.len(), 2);
+        assert!(fast.iter().any(|result| result.memory_id == other));
     }
 }

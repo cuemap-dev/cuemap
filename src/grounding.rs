@@ -163,3 +163,93 @@ pub fn create_grounding_proof(
         excluded_top,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    fn result(id: MemoryId, content: &str, metadata: HashMap<String, serde_json::Value>) -> RecallResult {
+        RecallResult {
+            memory_id: id,
+            content: content.to_string(),
+            score: 0.9,
+            match_integrity: 0.8,
+            intersection_count: 2,
+            recency_score: 0.3,
+            reinforcement_score: 0.4,
+            salience_score: 0.5,
+            created_at: 1_700_000_000.0,
+            metadata,
+            explain: None,
+        }
+    }
+
+    #[test]
+    fn estimates_tokens_from_character_count() {
+        assert_eq!(GroundingEngine::estimate_tokens(""), 0);
+        assert_eq!(GroundingEngine::estimate_tokens("1234"), 1);
+        assert_eq!(GroundingEngine::estimate_tokens("12345"), 2);
+    }
+
+    #[test]
+    fn selects_items_with_metadata_and_formats_context() {
+        let mut metadata = HashMap::new();
+        metadata.insert("source".to_string(), json!("notes.md"));
+        metadata.insert("timestamp".to_string(), json!("2024-01-01T00:00:00Z"));
+        let (selected, excluded, block) = GroundingEngine::select_memories(
+            "query".to_string(),
+            vec!["query".to_string()],
+            vec![("query".to_string(), 1.0)],
+            vec![result(7, "1234", metadata)],
+            1,
+        );
+
+        assert_eq!(selected.len(), 1);
+        assert!(excluded.is_empty());
+        assert_eq!(selected[0].memory_id, 7);
+        assert_eq!(selected[0].source, "notes.md");
+        assert_eq!(selected[0].timestamp, "2024-01-01T00:00:00Z");
+        assert!(block.contains("[VERIFIED CONTEXT]"));
+        assert!(block.contains("notes.md"));
+        assert!(block.ends_with("[/VERIFIED CONTEXT]"));
+    }
+
+    #[test]
+    fn excludes_top_five_items_that_exceed_budget_and_falls_back_to_timestamp() {
+        let results = (1..=7)
+            .map(|id| result(id, "12345", HashMap::new()))
+            .collect();
+        let (selected, excluded, block) = GroundingEngine::select_memories(
+            "query".to_string(),
+            Vec::new(),
+            Vec::new(),
+            results,
+            2,
+        );
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(excluded.len(), 5);
+        assert!(excluded[0].reason.contains("Exceeds remaining token budget"));
+        assert!(selected[0].timestamp.starts_with("2023-11-"));
+        assert!(!block.is_empty());
+        assert!(GroundingEngine::format_context_block(&[]).is_empty());
+    }
+
+    #[test]
+    fn creates_a_serializable_grounding_proof() {
+        let proof = create_grounding_proof(
+            "trace-1".to_string(),
+            "what?".to_string(),
+            vec!["what".to_string()],
+            vec![("what".to_string(), 0.75)],
+            128,
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(proof.trace_id, "trace-1");
+        assert_eq!(proof.token_budget, 128);
+        assert_eq!(serde_json::to_value(&proof).unwrap()["query_text"], "what?");
+    }
+}

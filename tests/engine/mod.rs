@@ -1,7 +1,273 @@
 use cuemap::engine::CueMapEngine;
+use cuemap::semantic::{SemanticConfig, SemanticEncoder, SemanticStorage, StoredSemanticVector};
 use cuemap::structures::{MainStats, INVALID_MEMORY_ID};
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+struct CountingEncoder {
+    calls: Arc<AtomicUsize>,
+}
+
+impl SemanticEncoder for CountingEncoder {
+    fn dimensions(&self) -> usize {
+        3
+    }
+
+    fn encode(&self, text: &str) -> Result<Vec<f32>, String> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Ok(vec![text.len() as f32, 1.0, 0.0])
+    }
+}
+
+#[test]
+fn test_opt_in_semantic_recall_uses_vector_candidates() {
+    let mut config = SemanticConfig::default();
+    config.enabled = true;
+    config.dimensions = 3;
+    config.storage = SemanticStorage::Int8;
+    config.exact_fallback_max = 32;
+
+    let mut engine = CueMapEngine::<MainStats>::new();
+    engine.set_semantic_config(config);
+    let first = engine.add_memory_with_event_time_and_vector(
+        "A note about a quiet seaside walk".to_string(),
+        vec!["seaside".to_string()],
+        None,
+        MainStats::default(),
+        true,
+        None,
+        Some(vec![1.0, 0.0, 0.0]),
+    );
+    let second = engine.add_memory_with_event_time_and_vector(
+        "A note about a busy train station".to_string(),
+        vec!["station".to_string()],
+        None,
+        MainStats::default(),
+        true,
+        None,
+        Some(vec![0.0, 1.0, 0.0]),
+    );
+
+    let query = [0.98, 0.02, 0.0];
+    let results = engine.recall_weighted_with_query_embedding(
+        Vec::new(),
+        1,
+        false,
+        None,
+        1,
+        false,
+        true,
+        None,
+        None,
+        Some(&query),
+    );
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].memory_id, first);
+    assert_ne!(results[0].memory_id, second);
+    assert_eq!(engine.semantic_index_stats().1, 2);
+    assert!(matches!(
+        engine.get_memory(first).unwrap().semantic_vector,
+        Some(StoredSemanticVector::Int8 { .. })
+    ));
+}
+
+#[test]
+fn test_hybrid_semantic_rerank_does_not_add_candidates() {
+    let mut config = SemanticConfig::default();
+    config.enabled = true;
+    config.dimensions = 3;
+    config.storage = SemanticStorage::F32;
+
+    let mut engine = CueMapEngine::<MainStats>::new();
+    engine.set_semantic_config(config);
+    let lexical_candidate = engine.add_memory_with_event_time_and_vector(
+        "A lexical memory with a weak semantic match".to_string(),
+        vec!["lexical".to_string()],
+        None,
+        MainStats::default(),
+        true,
+        None,
+        Some(vec![0.0, 1.0, 0.0]),
+    );
+    let semantic_only_candidate = engine.add_memory_with_event_time_and_vector(
+        "A semantic-only memory with a strong semantic match".to_string(),
+        vec!["other".to_string()],
+        None,
+        MainStats::default(),
+        true,
+        None,
+        Some(vec![1.0, 0.0, 0.0]),
+    );
+
+    let results = engine.recall_weighted_with_query_embedding_rerank_only(
+        vec![("lexical".to_string(), 1.0)],
+        1,
+        false,
+        None,
+        1,
+        false,
+        true,
+        None,
+        None,
+        Some(&[1.0, 0.0, 0.0]),
+    );
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].memory_id, lexical_candidate);
+    assert_ne!(results[0].memory_id, semantic_only_candidate);
+    assert!(results[0].explain.is_none());
+}
+
+#[test]
+fn test_hybrid_semantic_rerank_fuses_normalized_scores() {
+    let mut config = SemanticConfig::default();
+    config.enabled = true;
+    config.dimensions = 3;
+    config.storage = SemanticStorage::F32;
+    config.semantic_rerank_weight = 1.0;
+
+    let mut engine = CueMapEngine::new();
+    engine.set_semantic_config(config);
+    let lexical_strong = engine.add_memory_with_event_time_and_vector(
+        "A lexical memory with an extra exact cue".to_string(),
+        vec!["lexical".to_string(), "rare".to_string()],
+        None,
+        MainStats::default(),
+        true,
+        None,
+        Some(vec![0.0, 1.0, 0.0]),
+    );
+    let semantic_strong = engine.add_memory_with_event_time_and_vector(
+        "A semantically aligned lexical memory".to_string(),
+        vec!["lexical".to_string()],
+        None,
+        MainStats::default(),
+        true,
+        None,
+        Some(vec![1.0, 0.0, 0.0]),
+    );
+
+    let results = engine.recall_weighted_with_query_embedding_rerank_only(
+        vec![("lexical".to_string(), 1.0), ("rare".to_string(), 1.0)],
+        2,
+        false,
+        None,
+        1,
+        false,
+        true,
+        None,
+        None,
+        Some(&[1.0, 0.0, 0.0]),
+    );
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].memory_id, semantic_strong);
+    assert_eq!(results[1].memory_id, lexical_strong);
+    assert!(results[0].score > results[1].score);
+}
+
+#[test]
+fn test_hybrid_semantic_rerank_window_is_applied_before_semantic_scoring() {
+    let mut config = SemanticConfig::default();
+    config.enabled = true;
+    config.dimensions = 3;
+    config.storage = SemanticStorage::F32;
+    config.semantic_rerank_weight = 1.0;
+    config.semantic_rerank_candidate_limit = 1;
+
+    let mut engine = CueMapEngine::new();
+    engine.set_semantic_config(config);
+    let lexical_strong = engine.add_memory_with_event_time_and_vector(
+        "A lexical memory with an extra exact cue".to_string(),
+        vec!["lexical".to_string(), "rare".to_string()],
+        None,
+        MainStats::default(),
+        true,
+        None,
+        Some(vec![0.0, 1.0, 0.0]),
+    );
+    let semantic_strong = engine.add_memory_with_event_time_and_vector(
+        "A semantically aligned lexical memory".to_string(),
+        vec!["lexical".to_string()],
+        None,
+        MainStats::default(),
+        true,
+        None,
+        Some(vec![1.0, 0.0, 0.0]),
+    );
+
+    let (results, timing) = engine.recall_weighted_with_query_embedding_rerank_only_with_timing(
+        vec![("lexical".to_string(), 1.0), ("rare".to_string(), 1.0)],
+        1,
+        false,
+        None,
+        1,
+        false,
+        true,
+        None,
+        None,
+        Some(&[1.0, 0.0, 0.0]),
+    );
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].memory_id, lexical_strong);
+    assert_ne!(results[0].memory_id, semantic_strong);
+    assert_eq!(timing.semantic_rerank_candidate_limit, 1);
+    assert_eq!(timing.semantic_rerank_candidate_count, 1);
+}
+
+#[test]
+fn test_query_embedding_cache_reuses_and_bounds_encoded_queries() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut config = SemanticConfig::default();
+    config.enabled = true;
+    config.encoder_enabled = true;
+    config.dimensions = 3;
+    config.query_embedding_cache_capacity = 2;
+
+    let mut engine = CueMapEngine::<MainStats>::new();
+    engine.set_semantic_config(config);
+    engine.set_semantic_encoder(Some(Arc::new(CountingEncoder {
+        calls: Arc::clone(&calls),
+    })));
+
+    assert!(engine.encode_semantic_text("same query").is_some());
+    assert!(engine.encode_semantic_text("same query").is_some());
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    assert!(engine.encode_semantic_text("second query").is_some());
+    assert!(engine.encode_semantic_text("third query").is_some());
+    assert!(engine.encode_semantic_text("same query").is_some());
+    assert_eq!(calls.load(Ordering::Relaxed), 4);
+}
+
+#[test]
+fn test_query_embedding_cache_is_cleared_when_encoder_changes() {
+    let first_calls = Arc::new(AtomicUsize::new(0));
+    let second_calls = Arc::new(AtomicUsize::new(0));
+    let mut config = SemanticConfig::default();
+    config.enabled = true;
+    config.encoder_enabled = true;
+    config.dimensions = 3;
+
+    let mut engine = CueMapEngine::<MainStats>::new();
+    engine.set_semantic_config(config);
+    engine.set_semantic_encoder(Some(Arc::new(CountingEncoder {
+        calls: Arc::clone(&first_calls),
+    })));
+    assert!(engine.encode_semantic_text("same query").is_some());
+    assert!(engine.encode_semantic_text("same query").is_some());
+    assert_eq!(first_calls.load(Ordering::Relaxed), 1);
+
+    engine.set_semantic_encoder(Some(Arc::new(CountingEncoder {
+        calls: Arc::clone(&second_calls),
+    })));
+    assert!(engine.encode_semantic_text("same query").is_some());
+    assert_eq!(second_calls.load(Ordering::Relaxed), 1);
+}
 
 #[test]
 fn test_memory_cues_storage() {
@@ -87,8 +353,6 @@ fn test_historical_source_upsert_preserves_event_time_and_is_idempotent() {
         false,
         true,
         false,
-        cuemap::cuepacks::default_registry(),
-        None,
         Some(event_time),
     );
     assert!(engine.reinforce_memory(first, vec!["deployment".to_string()]));
@@ -101,8 +365,6 @@ fn test_historical_source_upsert_preserves_event_time_and_is_idempotent() {
         false,
         true,
         false,
-        cuemap::cuepacks::default_registry(),
-        None,
         Some(event_time + 60.0),
     );
 

@@ -6,7 +6,7 @@ WORKDIR /build
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-COPY cuepacks ./cuepacks
+COPY assets ./assets
 COPY lemma_exceptions.json ./
 COPY data/tagger/tags.json ./data/tagger/tags.json
 
@@ -34,7 +34,7 @@ RUN apt-get update \
 
 FROM debian:bookworm-slim AS runtime
 
-ARG VERSION=0.7.1
+ARG VERSION=0.7.2
 ARG REVISION=""
 
 LABEL org.opencontainers.image.title="CueMap Engine" \

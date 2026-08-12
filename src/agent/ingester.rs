@@ -610,6 +610,7 @@ impl Ingester {
                     file_path: path_norm.clone(),
                     structural_cues,
                     metadata: Some(metadata),
+                    embedding: None,
                     category: chunk.category,
                 })
                 .await;
@@ -661,6 +662,18 @@ impl Ingester {
     }
 
     pub async fn delete_file_path(&mut self, path: PathBuf) -> Result<(), String> {
+        // Deletion events arrive after the file is gone, so canonicalize the
+        // parent directory as a fallback to keep the key consistent with
+        // process_file_path on symlinked temporary roots (notably macOS /var).
+        let path = fs::canonicalize(&path).or_else(|_| {
+            let parent = path
+                .parent()
+                .ok_or_else(|| std::io::Error::other("missing parent directory"))?;
+            let file_name = path
+                .file_name()
+                .ok_or_else(|| std::io::Error::other("missing file name"))?;
+            Ok::<PathBuf, std::io::Error>(fs::canonicalize(parent)?.join(file_name))
+        }).map_err(|error| format!("Failed to canonicalize deleted path {:?}: {}", path, error))?;
         let path_str = path.to_string_lossy().to_string();
         let path_norm = path_str.to_lowercase();
         debug!("Processing deletion: {}", path_str);
@@ -859,6 +872,7 @@ impl Ingester {
                     file_path: source.clone(),
                     structural_cues: chunk.structural_cues.clone(),
                     metadata: None,
+                    embedding: None,
                     category: chunk.category,
                 })
                 .await;
@@ -945,6 +959,18 @@ impl Ingester {
         source: &str,
         metadata: Option<HashMap<String, serde_json::Value>>,
     ) -> Result<Vec<String>, String> {
+        self.process_chunks_with_metadata_and_embeddings(chunks, project_id, source, metadata, None)
+            .await
+    }
+
+    pub async fn process_chunks_with_metadata_and_embeddings(
+        &mut self,
+        chunks: Vec<crate::agent::chunker::Chunk>,
+        project_id: &str,
+        source: &str,
+        metadata: Option<HashMap<String, serde_json::Value>>,
+        embeddings: Option<Vec<Vec<f32>>>,
+    ) -> Result<Vec<String>, String> {
         let mut memory_ids = Vec::new();
 
         // Track session for progress reporting
@@ -953,7 +979,7 @@ impl Ingester {
             session.expect_write();
         }
 
-        for chunk in chunks.iter() {
+        for (chunk_index, chunk) in chunks.iter().enumerate() {
             let mut chunk_hasher = Sha256::new();
             chunk_hasher.update(chunk.content.as_bytes());
             let chunk_hash = format!("{:x}", chunk_hasher.finalize());
@@ -970,6 +996,9 @@ impl Ingester {
                     file_path: source.to_string(),
                     structural_cues: chunk.structural_cues.clone(),
                     metadata: metadata.clone(),
+                    embedding: embeddings
+                        .as_ref()
+                        .and_then(|vectors| vectors.get(chunk_index).cloned()),
                     category: chunk.category,
                 })
                 .await;
@@ -1018,4 +1047,106 @@ pub struct CrawlProgress {
     pub total_chunks: usize,
     pub links_found: usize,
     pub links_skipped: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::TuningConfig;
+    use crate::jobs::JobQueue;
+    use crate::multi_tenant::MultiTenantEngine;
+
+    fn test_ingester(dir: &Path, state_file: Option<PathBuf>) -> Ingester {
+        let provider = Arc::new(MultiTenantEngine::with_snapshots_dir(
+            dir.join("snapshots"),
+            TuningConfig::default(),
+        ));
+        let queue = Arc::new(JobQueue::new(provider, None, true));
+        Ingester::new(
+            AgentConfig {
+                project_id: "ingester-tests".to_string(),
+                watch_dir: dir.to_string_lossy().to_string(),
+                throttle_ms: 0,
+                state_file,
+                included_paths: Vec::new(),
+                ignored_patterns: Vec::new(),
+                ignored_extensions: Vec::new(),
+            },
+            queue,
+        )
+    }
+
+    #[tokio::test]
+    async fn state_round_trip_and_legacy_upgrade_are_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let mut ingester = test_ingester(dir.path(), Some(state_path.clone()));
+        ingester
+            .file_hashes
+            .insert("/tmp/note.md".to_string(), "hash".to_string());
+        ingester
+            .memory_hashes
+            .insert("memory-1".to_string(), "chunk-hash".to_string());
+        ingester.path_to_memories.insert(
+            "/tmp/note.md".to_string(),
+            ["memory-1".to_string()].into_iter().collect(),
+        );
+        ingester.save_state(&state_path).unwrap();
+
+        let mut restored = test_ingester(dir.path(), Some(state_path.clone()));
+        restored.load_state(&state_path).unwrap();
+        assert_eq!(restored.get_file_hashes().get("/tmp/note.md"), Some(&"hash".to_string()));
+        assert!(restored.memory_hashes.contains_key("memory-1"));
+
+        std::fs::write(
+            &state_path,
+            serde_json::json!({
+                "schema_version": 1,
+                "file_hashes": {"/tmp/old.md": "old"},
+                "memory_hashes": {"old-memory": "old"},
+                "path_to_memories": {}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        restored.load_state(&state_path).unwrap();
+        assert!(restored.get_file_hashes().is_empty());
+        assert!(restored.memory_hashes.is_empty());
+
+        std::fs::write(&state_path, "not-json").unwrap();
+        assert!(restored.load_state(&state_path).is_err());
+    }
+
+    #[tokio::test]
+    async fn preview_scope_reports_supported_files_and_scope_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(dir.path().join("README.md"), "# readme").unwrap();
+        std::fs::write(dir.path().join("notes.log"), "ignored").unwrap();
+
+        let mut ingester = test_ingester(dir.path(), None);
+        ingester.config.included_paths = vec!["src".to_string()];
+        ingester.config.ignored_extensions = vec!["log".to_string()];
+        let preview = ingester.preview_scope().unwrap();
+        assert_eq!(preview.supported_files, 1);
+        assert_eq!(preview.entries[0].path, "src");
+        assert_eq!(preview.entries[0].kind, "directory");
+        assert_eq!(preview.entries[0].categories.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn file_processing_skips_unchanged_content_and_deletes_tracking() {
+        let dir = tempfile::tempdir().unwrap();
+        let note = dir.path().join("note.md");
+        std::fs::write(&note, "first").unwrap();
+        let mut ingester = test_ingester(dir.path(), None);
+        ingester.process_file_path(note.clone()).await.unwrap();
+        let first_hashes = ingester.file_hashes.clone();
+        ingester.process_file_path(note.clone()).await.unwrap();
+        assert_eq!(ingester.file_hashes, first_hashes);
+        ingester.delete_file_path(note.clone()).await.unwrap();
+        assert!(ingester.file_hashes.is_empty());
+        assert!(ingester.path_to_memories.is_empty());
+    }
 }

@@ -11,4 +11,15 @@ data/reports/
 data/snapshots/
 tests/data/
 snapshots/
-scripts/
+__pycache__/
+*.py[cod]
+evals/**/bin/
+vendor/onnxruntime/archives/
+vendor/onnxruntime/ios-arm64/
+vendor/onnxruntime/ios-arm64-sim/
+assets/all-MiniLM-L6-v2/
+coverage/
+lcov.info
+codecov.json
+evals/intent/
+vendor/

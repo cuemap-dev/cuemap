@@ -17,3 +17,4 @@ data/nlprule/
 data/snapshots/
 data/tagger/classes.txt
 data/tagger/weights.json
+assets/all-MiniLM-L6-v2/

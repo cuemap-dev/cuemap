@@ -2,11 +2,35 @@
 
 All notable changes to the CueMap Rust Engine will be documented in this file.
 
-## [0.7.2] - 2026-07-19
+## [0.7.2] - 2026-08-04
+
+### Added
+- **Bundled semantic reranking**: The default `semantic-encoder` build now uses qint8 `all-MiniLM-L3-v2` for memory/query embeddings and bounded hybrid reranking; no runtime model download or external service is required. The `edge` profile uses a bundled q4 build of the same model.
+- **Intent classification and reranking**: Added local query/memory intent classification, confidence-weighted hybrid reranking, persisted memory annotations, the `/intent/classify` API, and intent coverage/progress fields in `/jobs/status`.
+- **Caller-provided vectors**: Added per-memory `embedding`, per-query `query_embedding`, semantic recall modes, and one-vector-per-produced-chunk `embeddings` for `/ingest/content`.
+- **Edge semantic profile**: Added the `edge` profile for constrained devices. It selects q4 MiniLM-L3 while lowering ANN fanout and the vector memory budget.
+- **External unit-test files**: Moved all Rust unit-test modules out of `src` into `tests/unit`, preserving parent-module privacy while keeping production files focused on implementation.
+- **Coverage reporting**: Added a `cargo-llvm-cov` GitHub Actions workflow with Codecov upload and a Rust README coverage badge.
+- **CLI startup and handler coverage**: Added deterministic tests for layered profile/CLI configuration, snapshot-directory recovery, encryption-key precedence, context signing, KDF salt selection, configurable file/URL ingestion, lexicon inspection, default-project persistence, HTTP-backed add/recall/status/project/alias/memory/ingest flows, connection failures, recall modes, log rendering modes, static/live server bootstrap, detached readiness, and stop lifecycle handling.
+- **Critical-path coverage**: Added deterministic HTTP API guard/reload and semantic-recall tests, parent-fusion and projection helper tests, CueBridge gap-expansion coverage, read-only/global route guards, recursive URL ingestion and persisted web recall tests, unconfigured backup checks, persistence corruption and local-backup tests, job-processing tests, ingester state/preview/deduplication tests, watcher event tests, and offline web-search parsing tests.
+- **Engine coverage gate**: Added focused lifecycle, disk-content, temporal-chunking, semantic budget/error, structured-reranking, source-order expansion, decay/consolidation, and generic MainStats/LexiconStats tests. `src/engine.rs` now measures 94.10% lines, 93.79% regions, and 90.91% functions across the library and dedicated engine integration suite.
+- **Server-health coverage gate**: Added project-context lifecycle, cue resolution/cache, symbol routing, alias filtering, snapshot version/corruption, atomic save/load, background snapshot, and local cloud-backup tests. `src/projects.rs` now measures 95.30% lines, 94.67% regions, and 95.83% functions; `src/persistence.rs` measures 90.40% lines, 87.30% regions, and 88.24% functions in the focused library/project coverage run.
+- **Snapshot recovery**: New snapshots use zstd-compressed JSON so arbitrary `serde_json::Value` metadata survives restart; legacy bincode snapshots remain supported where decodable. Startup now reports per-project snapshot load failures and can discover the legacy sibling snapshot directory. Pre-v0.7.2 bincode snapshots containing dynamic JSON metadata may still require reingestion because bincode cannot decode `deserialize_any` values.
+
+### Changed
+- **Semantic defaults**: The quality/default profile reports `all-MiniLM-L3-v2` (`bundled-qint8-minilm-l3`) with a 128-token window; the previous bundled L6 model is no longer part of the release binary.
+- **Structural-only core semantics**: Removed CuePacks and domain-ontology facet rules from ingestion/query planning. The remaining deterministic planner emits structural evidence, metadata, grammatical perspective, answer shape, ordering, and reference-time signals.
+- **Trained embedding-only intent categories**: Removed exact-match semantic phrase/vocabulary adjustments and runtime semantic anchor lists. A tiny model-specific linear head now maps frozen MiniLM embeddings to intent scores; syntax-only query shape can only admit an uncertain recall check without relabelling the intent or changing durable-memory eligibility.
+- **Leakage-guarded intent training**: Added deterministic NumPy training for the L3-qint8 and L3-q4 intent heads.
+- **Release package hygiene**: Native builds and Cargo packages now expose only the `cuemap` server binary and exclude local diagnostics, benchmarks, evals, vendor archives, caches, and the retired L6 assets.
 
 ### Fixed
 - **Native npm Publishing**: Updated the GitHub Actions publisher to ship the checksum-verified tokenizer and package launcher on every supported platform, matching the local release packager.
+- **Container semantic build**: Added bundled model assets to the Docker build context and synchronized the image version metadata.
+- **Intent job completion**: Failed intent annotations now reach a terminal job phase while keeping `intent_ready=false`, rather than leaving ingestion permanently in `processing`.
 - **Snapshot Coverage**: Added regression coverage for periodically persisting projects created after the snapshot scheduler starts.
+- **Watcher deletion path normalization**: Deletion events now canonicalize the surviving parent path so files under macOS `/var` symlinked temporary roots remove the same tracking keys created during ingestion.
+- **VerifyFile deadlock**: Verification now releases the cue-index read guard before deleting stale memories, preventing worker hangs during file re-ingestion cleanup.
 
 ## [0.7.1] - 2026-07-17
 

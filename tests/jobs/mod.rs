@@ -34,6 +34,36 @@ fn test_recall_requests_keep_extra_passes_off_by_default() {
     assert!(grounded.auto_reinforce);
 }
 
+#[test]
+fn progress_phase_waits_for_intent_jobs_after_writes() {
+    let session = IngestionSession::new("phase_test".to_string());
+
+    assert_eq!(session.get_progress().phase, "idle");
+
+    session.expect_write();
+    assert_eq!(session.get_progress().phase, "writing");
+
+    session.write_complete();
+    session.expect_intent();
+    assert_eq!(session.get_progress().phase, "processing");
+
+    session.intent_complete();
+    assert_eq!(session.get_progress().phase, "done");
+}
+
+#[test]
+fn failed_intent_jobs_reach_a_terminal_phase() {
+    let session = IngestionSession::new("intent-failure".to_string());
+    session.expect_intent();
+    session.intent_failed();
+
+    let progress = session.get_progress();
+    assert_eq!(progress.phase, "done");
+    assert_eq!(progress.intent_completed, 0);
+    assert_eq!(progress.intent_failed, 1);
+    assert_eq!(progress.intent_total, 1);
+}
+
 #[tokio::test]
 async fn extract_and_ingest_preserves_metadata_for_ordered_recall() {
     let dir = tempdir().unwrap();
@@ -62,6 +92,7 @@ async fn extract_and_ingest_preserves_metadata_for_ordered_recall() {
             file_path: "thread-job".to_string(),
             structural_cues: vec!["source_type:chat_message".to_string()],
             metadata: Some(metadata),
+            embedding: None,
             category: cuemap::agent::chunker::ChunkCategory::Prose,
         })
         .await;
