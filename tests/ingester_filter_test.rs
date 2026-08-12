@@ -6,7 +6,7 @@ use cuemap::multi_tenant::MultiTenantEngine;
 use std::fs;
 use std::sync::Arc;
 use tempfile::tempdir;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
 
 struct MockProvider;
 impl ProjectProvider for MockProvider {
@@ -370,7 +370,7 @@ async fn repository_file_ingestion_records_explicit_source_type() {
     let context = engine.get_or_create_project(project_id.clone()).unwrap();
     let job_queue = Arc::new(JobQueue::new(engine, None, false));
     let config = AgentConfig {
-        project_id,
+        project_id: project_id.clone(),
         watch_dir: watch_path.to_string_lossy().to_string(),
         throttle_ms: 0,
         state_file: None,
@@ -378,27 +378,37 @@ async fn repository_file_ingestion_records_explicit_source_type() {
         ignored_patterns: Vec::new(),
         ignored_extensions: Vec::new(),
     };
+    let session = job_queue.session_manager.get_or_create(&project_id);
     let mut ingester = Ingester::new(config, job_queue);
     ingester.scan_all().await.unwrap();
 
-    for _ in 0..100 {
-        if let Some(memory_entry) = context.main.get_memories().iter().next() {
-            let memory = memory_entry.value();
-            assert_eq!(
-                memory
-                    .metadata
-                    .get("source_type")
-                    .and_then(|value| value.as_str()),
-                Some("repository_file")
-            );
-            assert!(memory
-                .cues
-                .iter()
-                .any(|cue| cue == "source_type:repository_file"));
-            return;
+    timeout(Duration::from_secs(30), async {
+        loop {
+            let progress = session.get_progress();
+            if progress.writes_total > 0 && progress.writes_completed >= progress.writes_total {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
         }
-        sleep(Duration::from_millis(20)).await;
-    }
+    })
+    .await
+    .expect("timed out waiting for repository ingestion to complete");
 
-    panic!("repository file was not ingested");
+    let memories = context.main.get_memories();
+    let memory_entry = memories
+        .iter()
+        .next()
+        .expect("repository file was not ingested");
+    let memory = memory_entry.value();
+    assert_eq!(
+        memory
+            .metadata
+            .get("source_type")
+            .and_then(|value| value.as_str()),
+        Some("repository_file")
+    );
+    assert!(memory
+        .cues
+        .iter()
+        .any(|cue| cue == "source_type:repository_file"));
 }
