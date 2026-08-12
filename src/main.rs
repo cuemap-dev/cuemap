@@ -513,9 +513,20 @@ mod tests {
         let _ = child.wait();
 
         let failed_path = root.path().join("failed.pid");
-        std::fs::write(&failed_path, u32::MAX.to_string()).unwrap();
+        // Keep the synthetic PID positive when converted to Unix pid_t.
+        // u32::MAX becomes -1 on Linux, where kill(-1, SIGTERM) signals every
+        // process the current user is permitted to terminate.
+        std::fs::write(&failed_path, (i32::MAX as u32).to_string()).unwrap();
         handle_stop_at(failed_path.clone()).await;
         assert!(failed_path.exists());
+
+        #[cfg(unix)]
+        {
+            let unsafe_path = root.path().join("unsafe.pid");
+            std::fs::write(&unsafe_path, u32::MAX.to_string()).unwrap();
+            handle_stop_at(unsafe_path.clone()).await;
+            assert!(unsafe_path.exists());
+        }
     }
 
     #[tokio::test]
@@ -2940,6 +2951,10 @@ async fn handle_stop_at(pid_path: PathBuf) {
     #[cfg(unix)]
     {
         use std::process::Command;
+        if pid <= 1 || pid > i32::MAX as u32 {
+            eprintln!("✗ Refusing to signal invalid server PID {}.", pid);
+            return;
+        }
         let res = Command::new("kill")
             .arg("-15") // SIGTERM
             .arg(pid.to_string())

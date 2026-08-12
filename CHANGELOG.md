@@ -25,6 +25,7 @@ All notable changes to the CueMap Rust Engine will be documented in this file.
 - **Release package hygiene**: Native builds and Cargo packages now expose only the `cuemap` server binary and exclude local diagnostics, benchmarks, evals, vendor archives, caches, and the retired L6 assets.
 
 ### Fixed
+- **CLI stop PID validation**: Reject Unix PID values that cannot be represented as a positive `pid_t`, preventing malformed or stale PID files from turning a targeted shutdown into a process-wide signal.
 - **Native npm Publishing**: Updated the GitHub Actions publisher to ship the checksum-verified tokenizer and package launcher on every supported platform, matching the local release packager.
 - **Container semantic build**: Added bundled model assets to the Docker build context and synchronized the image version metadata.
 - **Intent job completion**: Failed intent annotations now reach a terminal job phase while keeping `intent_ready=false`, rather than leaving ingestion permanently in `processing`.
