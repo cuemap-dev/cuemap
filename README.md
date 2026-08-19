@@ -400,7 +400,7 @@ Write latency remains mostly flat with project size; the dominant cost is per-me
 *Measures the time to parse a query, resolve deterministic cues, and score sparse candidate intersections.*
 
 | Dataset Scale | Avg Latency | P50 | P95 | Throughput |
-|:---|:---|:---|:---|
+|:---|:---|:---|:---|---:|
 | **10,000** | 1.05 ms | 1.01 ms | 1.60 ms | 939 ops/s |
 | **100,000** | 1.86 ms | 1.71 ms | 3.16 ms | 535 ops/s |
 | **1,000,000** | 2.63 ms | 2.06 ms | 3.72 ms | 378 ops/s |
@@ -409,45 +409,6 @@ Write latency remains mostly flat with project size; the dominant cost is per-me
 - **Low-latency recall:** The lexical v0.7.2 1M run measured 2.63ms average with 3.72ms p95; hybrid measurements remain separate because they include bundled encoder work.
 - **Numeric ID memory reduction:** 1M in-memory footprint dropped from about 5.25GB to about 1.93GB after the v0.7 numeric memory-ID refactor.
 - **Controlled hot path:** the release benchmark disables the local semantic encoder, LLMs, network services, and disk scans; normal v0.7.2 hybrid recall can use the bundled local encoder for bounded reranking.
-
-## Test Coverage
-
-Coverage is measured in CI with LLVM source-based instrumentation through [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) and uploaded to Codecov. The badge above reports the `rust-engine` flag for the v0.7.2 release branch.
-
-To connect Codecov for `cuemap-dev/cuemap`:
-
-1. Sign in to [Codecov](https://app.codecov.io/) with GitHub and add/select the `cuemap` repository.
-2. If Codecov requires token authentication, copy the repository upload token from the repository's Codecov configuration.
-3. In GitHub, open **Settings → Secrets and variables → Actions**, create a repository secret named `CODECOV_TOKEN`, and paste only the token value.
-4. Push `.github/workflows/coverage.yml` or run the workflow from **Actions → Rust Coverage → Run workflow**.
-
-For a public repository, Codecov may allow tokenless uploads if that organization setting is enabled; in that case the workflow can run without the secret. Never commit or paste the token into source files or chat.
-
-Repository slug note: this checkout currently reports `cuemap-dev/engine.git` as its Git remote, while the badge and setup above target `cuemap-dev/cuemap`. Keep those slugs aligned with the repository that will run this workflow; if the Rust engine is published as `engine`, change the badge, Codecov link, and project selection accordingly.
-
-The local all-feature baseline measured on 2026-08-12 was:
-
-| Metric | Coverage |
-| --- | ---: |
-| Lines | 83.10% |
-| Regions | 82.47% |
-| Functions | 84.21% |
-
-The critical `src/engine.rs` path now measures **94.10% lines**, **93.79% regions**, and **90.91% functions** when the library and dedicated engine integration suite are measured together. This focused gate covers storage lifecycle, semantic retrieval/reranking, structured scoring, source-order expansion, temporal chunking, decay, consolidation, and both MainStats and LexiconStats engines.
-
-The server-health persistence slice is also gated independently: `src/projects.rs` measures **95.30% lines**, **94.67% regions**, and **95.83% functions**, while `src/persistence.rs` measures **90.40% lines**, **87.30% regions**, and **88.24% functions** across the library and project tests.
-
-This is the current engineering baseline, not the release target; the Rust engine release target is 90%+.
-
-That baseline runs the Rust library and CLI handler tests plus the registered integration suites with the bundled qint8/q4 MiniLM encoder enabled. CLI startup/handler coverage is now 90.13% lines, 90.12% regions, and 80.83% functions; the HTTP/API surface is now 83.32% lines, 83.62% regions, and 87.16% functions. Intent classification, structural facets, persistence, ingestion, filesystem watching, and the core engine are substantially better covered. The release target remains 90%+ overall line coverage.
-
-Run the same report locally with:
-
-```bash
-rustup component add llvm-tools-preview
-cargo install cargo-llvm-cov --locked
-cargo llvm-cov --all-features --workspace --summary-only
-```
 
 ## Architecture
 
