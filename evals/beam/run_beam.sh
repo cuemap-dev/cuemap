@@ -3,9 +3,25 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CUEMAP_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+CUEMAP_ENGINE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CUEMAP_EVALS_DIR="${CUEMAP_EVALS_DIR:-$CUEMAP_ROOT/evals}"
 HARNESS="$CUEMAP_EVALS_DIR/test_beam_settled.py"
-export PATH="$SCRIPT_DIR/bin:$PATH"
+
+# Pin every subprocess in this evaluation to the release engine.  The
+# harness uses both HTTP and CLI fallbacks, so relying on whatever `cuemap`
+# happens to be on PATH can silently mix engine versions.
+CUEMAP_RUST_BIN="${CUEMAP_RUST_BIN:-$CUEMAP_ENGINE_ROOT/target/release/cuemap}"
+if [[ "$CUEMAP_RUST_BIN" != */* ]]; then
+  CUEMAP_RUST_BIN="$(command -v "$CUEMAP_RUST_BIN" || true)"
+fi
+if [[ -z "$CUEMAP_RUST_BIN" || ! -x "$CUEMAP_RUST_BIN" ]]; then
+  echo "CueMap release binary not found or not executable: ${CUEMAP_RUST_BIN:-<empty>}" >&2
+  echo "Build it with: cargo build --release --manifest-path $CUEMAP_ENGINE_ROOT/Cargo.toml" >&2
+  exit 1
+fi
+export CUEMAP_RUST_BIN
+CUEMAP_BIN_DIR="${CUEMAP_RUST_BIN%/*}"
+export PATH="$CUEMAP_BIN_DIR:$PATH"
 
 if [[ ! -f "$HARNESS" ]]; then
   echo "Missing BEAM harness: $HARNESS" >&2
@@ -18,6 +34,9 @@ CUEMAP_URL="${CUEMAP_URL:-http://127.0.0.1:8080}"
 LIMIT="${LIMIT:-100}"
 MODE="${MODE:-raw}"
 SEMANTIC_MODE="${SEMANTIC_MODE:-hybrid}"
+INGEST_MODE="${INGEST_MODE:-message}"
+ORDERED_RECONSTRUCTION="${ORDERED_RECONSTRUCTION:-off}"
+EVIDENCE_COVERAGE="${EVIDENCE_COVERAGE:-off}"
 OUT_DIR="${OUT_DIR:-$SCRIPT_DIR/results}"
 OUTPUT="${OUTPUT:-$OUT_DIR/beam_${CONTEXT}_${MODE}.json}"
 TRACE_TIMING="${TRACE_TIMING:-0}"
@@ -29,6 +48,17 @@ case "$SEMANTIC_MODE" in
     ;;
   *)
     echo "Unknown SEMANTIC_MODE=$SEMANTIC_MODE. Use lexical, semantic, or hybrid." >&2
+    exit 1
+    ;;
+esac
+
+case "$INGEST_MODE" in
+  message)
+    ;;
+  long-form)
+    ;;
+  *)
+    echo "Unknown INGEST_MODE=$INGEST_MODE. Use message or long-form." >&2
     exit 1
     ;;
 esac
@@ -46,12 +76,15 @@ args=(
   --context "$CONTEXT"
   --url "$CUEMAP_URL"
   --limit "$LIMIT"
-  --ingest-long-form
-  --ordered-reconstruction "${ORDERED_RECONSTRUCTION:-auto}"
-  --evidence-coverage "${EVIDENCE_COVERAGE:-off}"
+  --ordered-reconstruction "$ORDERED_RECONSTRUCTION"
+  --evidence-coverage "$EVIDENCE_COVERAGE"
   --no-auto-reinforce
   --output "$OUTPUT"
 )
+
+if [[ "$INGEST_MODE" == "long-form" ]]; then
+  args+=(--ingest-long-form)
+fi
 
 if [[ "${DELETE_PROJECTS:-1}" == "1" ]]; then
   args+=(--delete-project-after-record)
@@ -116,6 +149,9 @@ if [[ "$MODE" != "raw" ]]; then
 fi
 
 echo "Running BEAM $CONTEXT in $MODE mode with $SEMANTIC_MODE retrieval"
+echo "Ingestion mode: $INGEST_MODE"
+echo "Ordered reconstruction: $ORDERED_RECONSTRUCTION | Evidence coverage: $EVIDENCE_COVERAGE"
+echo "CueMap binary: $CUEMAP_RUST_BIN ($("$CUEMAP_RUST_BIN" --version))"
 echo "Output: $OUTPUT"
 
 run_status=0

@@ -3,8 +3,23 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CUEMAP_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+CUEMAP_ENGINE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CUEMAP_EVALS_DIR="${CUEMAP_EVALS_DIR:-$CUEMAP_ROOT/evals}"
 HARNESS="$CUEMAP_EVALS_DIR/test_longmemeval_settled.py"
+
+# Pin both the adapter and canonical harness CLI calls to the release engine.
+CUEMAP_RUST_BIN="${CUEMAP_RUST_BIN:-$CUEMAP_ENGINE_ROOT/target/release/cuemap}"
+if [[ "$CUEMAP_RUST_BIN" != */* ]]; then
+  CUEMAP_RUST_BIN="$(command -v "$CUEMAP_RUST_BIN" || true)"
+fi
+if [[ -z "$CUEMAP_RUST_BIN" || ! -x "$CUEMAP_RUST_BIN" ]]; then
+  echo "CueMap release binary not found or not executable: ${CUEMAP_RUST_BIN:-<empty>}" >&2
+  echo "Build it with: cargo build --release --manifest-path $CUEMAP_ENGINE_ROOT/Cargo.toml" >&2
+  exit 1
+fi
+export CUEMAP_RUST_BIN
+CUEMAP_BIN_DIR="${CUEMAP_RUST_BIN%/*}"
+export PATH="$CUEMAP_BIN_DIR:$PATH"
 
 if [[ ! -f "$HARNESS" ]]; then
   echo "Missing LongMemEval harness: $HARNESS" >&2
@@ -53,7 +68,6 @@ if [[ "${FAST_INGEST:-1}" == "1" ]]; then
   export CUEMAP_LONGMEMEVAL_HARNESS="$HARNESS"
   echo "Ingestion transport: direct /ingest/content (BEAM-compatible)"
 else
-  export PATH="$CUEMAP_ROOT/evals/beam/bin:$PATH"
   args=(
     python "$HARNESS"
     --url "$CUEMAP_URL"
@@ -113,6 +127,7 @@ esac
 
 echo "Running LongMemEval in $MODE mode"
 echo "Retrieval mode: $SEMANTIC_MODE"
+echo "CueMap binary: $CUEMAP_RUST_BIN ($("$CUEMAP_RUST_BIN" --version))"
 echo "Output: $OUTPUT"
 
 run_status=0

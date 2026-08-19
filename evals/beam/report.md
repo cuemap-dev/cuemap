@@ -1,28 +1,28 @@
 # BEAM: Scaling Deterministic Recall To 10M Tokens
 
-`CueMap v0.7` `BEAM 128K / 1M / 10M` `CueBridge lift` `embedding-free`
+`CueMap v0.7.2` `BEAM 128K / 1M / 10M` `CueBridge lift` `embedding-free`
 
 BEAM is the stress test for scale. CueMap uses deterministic lexical/facet recall instead of an embedding service or vector database, so this benchmark asks the central question: can that architecture stay competitive at 1M and 10M tokens?
 
-The answer in v0.7 is yes. CueMap reaches 69.9% Hit@20 at BEAM 1M and 51.7% Hit@20 at BEAM 10M, which sits inside the reported leading ranges of roughly 64-72% for 1M and 48-64% for 10M. BEAM 128K is also where the current CueBridge diagnostic run produced the most meaningful lift.
+The answer in v0.7.2 is yes. The latest raw 128K, 1M, and 10M runs reach 84.2%, 80.3%, and 67.0% Hit@20, with Hit@100 at 96.3%, 93.1%, and 83.5% respectively. All three runs use the wrapper's default **hybrid recall mode** (`SEMANTIC_MODE=hybrid`), message-level turn ingestion, evidence coverage disabled, and ordered reconstruction disabled.
 
 ## Headline
 
 | Context tier | Questions | Hit@1 | Hit@5 | Hit@10 | Hit@20 | Hit@50 | Hit@100 |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| 128K | 355 | 36.9% | 61.4% | 70.7% | 80.3% | 89.6% | 94.4% |
-| 1M | 625 | 28.6% | 50.1% | 61.8% | 69.9% | 80.3% | 86.2% |
-| 10M | 176 | 23.3% | 38.1% | 44.3% | 51.7% | 61.9% | 71.6% |
+| 128K | 355 | 49.6% | 71.8% | 77.5% | 84.2% | 90.4% | 96.3% |
+| 1M | 625 | 38.4% | 63.4% | 74.6% | 80.3% | 90.4% | 93.1% |
+| 10M | 176 | 33.5% | 50.0% | 58.5% | 67.0% | 77.8% | 83.5% |
 
-The 10M tier crosses the 50% Hit@20 target while keeping Hit@100 above 70%. That matters because it shows CueMap handles the scale jump and often puts the right memory into the candidate set with embedding-free recall.
+The 10M tier crosses the 50% Hit@20 target while keeping Hit@100 above 80%. That matters because it shows CueMap handles the scale jump and often puts the right memory into the candidate set with embedding-free recall.
 
 ## Depth Metrics
 
 | Context tier | Recall_All@20 | Recall_Frac@20 | NDCG@20 |
 |---|---:|---:|---:|
-| 128K | 46.5% | 60.0% | 44.5% |
-| 1M | 25.0% | 42.7% | 33.2% |
-| 10M | 17.0% | 28.4% | 23.3% |
+| 128K | 54.9% | 69.2% | 54.7% |
+| 1M | 34.9% | 54.4% | 41.6% |
+| 10M | 23.9% | 38.1% | 29.7% |
 
 This is where the next upside is visible. Hit@100 remains much higher than Hit@20, especially at 10M. CueMap is often finding relevant candidates, and a stronger deterministic reranker can move more of them into the top-20 answer context.
 
@@ -30,33 +30,35 @@ This is where the next upside is visible. Hit@100 remains much higher than Hit@2
 
 | Type | Hit@1 | Hit@5 | Hit@10 | Hit@20 | Hit@100 | Read |
 |---|---:|---:|---:|---:|---:|---|
-| Contradiction resolution | 72.5% | 90.0% | 92.5% | 100.0% | 100.0% | Excellent. |
-| Event ordering | 10.0% | 35.0% | 57.5% | 70.0% | 100.0% | Candidate discovery is high; ordering is the next lift. |
-| Information extraction | 35.0% | 62.5% | 67.5% | 75.0% | 92.5% | Strong base with top-rank upside. |
-| Instruction following | 35.0% | 45.0% | 45.0% | 47.5% | 72.5% | Good candidate base for instruction-aware ranking. |
-| Knowledge update | 47.5% | 72.5% | 80.0% | 95.0% | 97.5% | Strong. |
-| Multi-session reasoning | 42.5% | 65.0% | 82.5% | 92.5% | 100.0% | Good candidate discovery. |
-| Preference following | 25.6% | 59.0% | 64.1% | 74.4% | 87.2% | Strong target for semantic preference bridges. |
-| Summarization | 11.1% | 33.3% | 52.8% | 69.4% | 100.0% | Candidate discovery high, with set-coverage upside. |
-| Temporal reasoning | 50.0% | 87.5% | 92.5% | 97.5% | 100.0% | Strong. |
+| Contradiction resolution | 85.0% | 100.0% | 100.0% | 100.0% | 100.0% | Excellent. |
+| Event ordering | 17.5% | 57.5% | 67.5% | 85.0% | 97.5% | Candidate discovery is high; ordering is the next lift. |
+| Information extraction | 50.0% | 72.5% | 80.0% | 90.0% | 95.0% | Strong base with top-rank upside. |
+| Instruction following | 17.5% | 42.5% | 47.5% | 57.5% | 82.5% | Good candidate base for instruction-aware ranking. |
+| Knowledge update | 87.5% | 97.5% | 97.5% | 97.5% | 97.5% | Strong. |
+| Multi-session reasoning | 57.5% | 87.5% | 97.5% | 100.0% | 100.0% | Good candidate discovery. |
+| Preference following | 23.1% | 46.2% | 51.3% | 61.5% | 94.9% | Strong target for semantic preference bridges. |
+| Summarization | 13.9% | 38.9% | 52.8% | 63.9% | 100.0% | Candidate discovery high, with set-coverage upside. |
+| Temporal reasoning | 90.0% | 100.0% | 100.0% | 100.0% | 100.0% | Strong. |
 
 ## 10M Category Breakdown
 
 | Type | Hit@20 | Hit@100 | Read |
 |---|---:|---:|---|
-| Contradiction resolution | 90.0% | 100.0% | Robust at 10M. |
-| Knowledge update | 80.0% | 90.0% | Strong. |
-| Multi-session reasoning | 70.0% | 85.0% | Good candidate discovery with full-evidence upside. |
-| Information extraction | 65.0% | 75.0% | Strong base with top-rank upside. |
-| Temporal reasoning | 40.0% | 80.0% | Candidate set exists; rank lift is available. |
-| Instruction following | 40.0% | 50.0% | Clear target for intent-aware scoring. |
-| Event ordering | 30.0% | 65.0% | Clear target for order-aware reranking. |
-| Summarization | 31.2% | 43.8% | Clear target for set-coverage reranking. |
-| Preference following | 15.0% | 50.0% | Clear target for semantic preference bridges. |
+| Contradiction resolution | 95.0% | 100.0% | Robust at 10M. |
+| Knowledge update | 95.0% | 100.0% | Strong. |
+| Multi-session reasoning | 85.0% | 100.0% | Good candidate discovery with full-evidence upside. |
+| Information extraction | 80.0% | 90.0% | Strong base with top-rank upside. |
+| Temporal reasoning | 65.0% | 80.0% | Candidate set exists; rank lift is available. |
+| Instruction following | 25.0% | 50.0% | Clear target for intent-aware scoring. |
+| Event ordering | 50.0% | 85.0% | Clear target for order-aware reranking. |
+| Summarization | 50.0% | 68.8% | Clear target for set-coverage reranking. |
+| Preference following | 55.0% | 75.0% | Clear target for semantic preference bridges. |
 
-## CueBridge Diagnostic At 128K
+## Historical CueBridge Diagnostic At 128K
 
-Question-oracle CueBridge mode improved BEAM 128K Hit@20 from `287/355` to `297/355`.
+This separate question-oracle calibration predates the latest raw 128K run. It
+improved Hit@20 from `287/355` to `297/355`; do not compare its raw column
+directly with the latest 128K baseline above.
 
 | Metric | Raw | CueBridge diagnostic | Delta |
 |---|---:|---:|---:|
@@ -77,9 +79,9 @@ What works now:
 
 | Strength | Evidence |
 |---|---|
-| Candidate discovery | 128K Hit@100 is 94.4%; 10M Hit@100 is 71.6%. |
+| Candidate discovery | 128K Hit@100 is 96.3%; 1M Hit@100 is 93.1%; 10M Hit@100 is 83.5%. |
 | Contradictions and updates | These categories stay strong even at 10M. |
-| Embedding-free architecture | The engine stays in the reported leading 10M band with deterministic indexing. |
+| Embedding-free architecture | The engine preserves strong 10M candidate discovery with deterministic indexing. |
 
 Next lift areas:
 
@@ -91,6 +93,24 @@ Next lift areas:
 | Instruction following | Add intent-aware scoring for instruction-shaped memories. |
 
 The next practical upgrade is a deterministic reranker over the top-100 candidate set: evidence-set coverage, recency/order features, intent-specific scoring, and conservative CueBridge artifacts.
+
+## Retrieved Context Footprint
+
+Each BEAM JSON result now records `ctx_tokens` for the top-20 memory text for
+every scored question, matching the benchmark's primary Hit@20 metric. This is
+an approximate, model-agnostic token count (using the same word/punctuation
+estimator as the LoCoMo harness), not the model tokenizer. The evaluator also
+prints aggregate `Avg`, `P50`, `P95`, `P99`, and `Max` values, plus average/P95
+values by question type. `ctx_tokens_returned` retains the count for the full
+returned limit (normally top-100) for diagnostic comparison. When CueBridge
+comparison is enabled, the raw baseline counts are retained under
+`raw_result.ctx_tokens` and `raw_result.ctx_tokens_returned`.
+
+| Run | Avg | P50 | P95 | P99 | Max |
+|---|---:|---:|---:|---:|---:|
+| Latest raw 128K, top-20 | 4,702 | 2,816 | 14,889 | 20,954 | 34,393 |
+| Latest raw 1M, top-20 | 2,934 | 1,354 | 11,554 | 20,731 | 29,243 |
+| Latest raw 10M, top-20 | 1,749 | 1,220 | 4,170 | 16,802 | 19,733 |
 
 ## Reproduce
 
@@ -105,6 +125,10 @@ Raw 128K:
 ```bash
 CONTEXT=128k bash evals/beam/run_beam.sh
 ```
+
+The wrapper defaults to message-level ingestion (`cuemap add` / `/memories`),
+which preserves one indexed memory per BEAM turn. To reproduce the older
+segmented long-form path explicitly, set `INGEST_MODE=long-form`.
 
 Raw 1M:
 
@@ -136,7 +160,8 @@ Useful knobs:
 |---|---:|---|
 | `CONTEXT` | `128k` | BEAM tier: `128k`, `500k`, `1m`, or `10m`. |
 | `LIMIT` | `100` | Recall limit; BEAM reports include @50 and @100. |
+| `SEMANTIC_MODE` | `hybrid` | Retrieval mode: `lexical`, `semantic`, or `hybrid`. |
 | `MODE` | `raw` | `raw`, `product-cuebridge`, or `question-oracle`. |
 | `DELETE_PROJECTS` | `1` | Delete temporary eval projects after each record. |
 
-The wrapper writes fresh output under `evals/beam/results/` by default. The metrics above came from the v0.7 release calibration runs for `128k`, `1m`, and `10m`.
+The wrapper writes fresh output under `evals/beam/results/` by default. The figures above come from the latest v0.7.2 raw runs for all three tiers.

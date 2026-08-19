@@ -331,55 +331,82 @@ To optimize storage efficiency, especially for large textual memories, CueMap em
 
 Tests performed on **Real-World Data** (Wikipedia Articles), processing full natural language sentences with the complete NLP pipeline.
 
-**Hardware:** MacBook Pro M-series, 64GB RAM, single node. The final v0.7.2 release table is being refreshed with semantic reranking disabled so it remains comparable with the sparse-core baseline. The checked-in v0.7 baseline below is retained until the remaining BEAM 10M and performance runs complete.
+**Hardware:** MacBook Pro M-series, 64GB RAM, single node. The v0.7.2 release table below records completed lexical and hybrid runs at 10K, 100K, and 1M memories. Lexical runs isolate the sparse core with the semantic encoder disabled; hybrid runs include the bundled local encoder. P95 is the release headline percentile, while P99 remains available in the JSON diagnostics.
 
 #### Benchmark Methodology
 
 The NL benchmark script lives at `benchmarks/benchmark_nl.py`.
 
 Benchmark setup:
-- Uses Wikipedia parquet files as the source corpus. You can obtain Wikipedia source data from official [Wikimedia dumps](https://dumps.wikimedia.org/) or an Internet Archive mirror, then prepare/extract text into parquet files with a `text` column.
+- Uses the public [Wikipedia Plaintext (2023-07-01) Kaggle dataset](https://www.kaggle.com/datasets/jjinho/wikipedia-20230701) as the release corpus. The benchmark script downloads it automatically when `--wikipedia-path` is omitted, caches it under `~/.cache/cuemap/benchmarks/wikipedia-20230701`, and samples parquet files with a `text` column. Install the downloader first with `python -m pip install kagglehub`; configure Kaggle access if Kaggle prompts for authentication. To avoid the download or use another corpus, pass `--wikipedia-path /path/to/parquet-or-directory`.
 - Deduplicates sampled snippets and consumes them without replacement, so 100K and 1M write runs do not reuse the same text.
 - Writes use HTTP `POST /memories` with `minimal_response=true` and no explicit cues, forcing CueMap to run deterministic cue/facet extraction and indexing.
 - Reads generate keyword-style natural-language queries from retained ingested snippets.
-- Recall numbers use the script's lean recall mode: `auto_reinforce=false`, salience disabled, alias expansion disabled, semantic reranking disabled, CueBridge artifacts disabled, `depth=1`, `expansion_depth=1`, and parent/order/evidence reconstruction disabled. This isolates the core sparse recall path.
+- Recall numbers use the script's lean recall mode: `semantic_mode=lexical`, `auto_reinforce=false`, salience disabled, alias expansion disabled, CueBridge artifacts disabled, `depth=1`, `expansion_depth=1`, and parent/order/evidence reconstruction disabled. This isolates the core sparse recall path from the bundled semantic encoder and reranker.
+- Each requested size runs in its own run-scoped project, so a 1M pass is not layered on top of a previous 100K pass or stale state from an earlier invocation.
 - `--trace-timing` records engine timing breakdowns but is not required for throughput measurements.
 
-Example run:
+Example run with the checked-in release fixture:
 
 ```bash
-cuemap start --disable-snapshots --disable-bg-jobs
+CUEMAP_SEMANTIC_ENCODER_ENABLED=false cuemap start --disable-snapshots --disable-bg-jobs
 
 python benchmarks/benchmark_nl.py \
-  --sizes 100000,1000000 \
+  --sizes 10000,100000,1000000 \
   --project-id nl_test \
-  --wikipedia-path /Users/<username>/Downloads/wikipedia/ \
-  --trace-timing \
+  --semantic-mode lexical \
   --wiki-reservoir-size 20000 \
   --query-sample-size 5000 \
   --payload-buffer-size 500
 ```
 
-#### 1. Ingestion (Write) Performance
-*Measures HTTP ingestion, deterministic cue/facet extraction, source-key upsert, and indexing.*
+Restart the engine without `CUEMAP_SEMANTIC_ENCODER_ENABLED=false`, then run the
+same command with `--semantic-mode hybrid` to produce the hybrid comparison. The
+dataset is downloaded only once and reused from the local cache on subsequent
+runs.
 
-| Dataset Scale | Avg Latency | P50 | P99 | Throughput |
+#### v0.7.2 latency comparison
+
+The lexical release rerun now covers 10K, 100K, and 1M writes plus lean recall
+queries. The compact comparison below records the 10K, 100K, and 1M hybrid
+runs as well.
+
+| Mode | Write avg | Write P50 | Write P95 | Write throughput | Read avg | Read P50 | Read P95 | Read throughput |
+|:---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Lexical | 2.13 ms | 1.88 ms | 4.13 ms | 470 ops/s | 1.05 ms | 1.01 ms | 1.60 ms | 939 ops/s |
+| Hybrid | 11.52 ms | 10.38 ms | 17.45 ms | 87 ops/s | 6.54 ms | 6.80 ms | 8.41 ms | 152 ops/s |
+
+The script still stores p99 in the JSON result for diagnostics, but p95 is the
+headline percentile used by the console output and release chart.
+
+| Hybrid scale | Write avg | Write P50 | Write P95 | Write throughput | Read avg | Read P50 | Read P95 | Read throughput |
+|:---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **10,000** | 11.52 ms | 10.38 ms | 17.45 ms | 87 ops/s | 6.54 ms | 6.80 ms | 8.41 ms | 152 ops/s |
+| **100,000** | 11.21 ms | 10.27 ms | 16.43 ms | 89 ops/s | 6.94 ms | 7.14 ms | 8.83 ms | 144 ops/s |
+| **1,000,000** | 11.28 ms | 10.38 ms | 16.81 ms | 89 ops/s | 8.36 ms | 8.12 ms | 10.67 ms | 119 ops/s |
+
+#### 1. Ingestion (Write) Performance — lexical
+*Measures HTTP ingestion, deterministic cue/facet extraction, memory allocation, and indexing.*
+
+| Dataset Scale | Avg Latency | P50 | P95 | Throughput |
 |:---|:---|:---|:---|:---|
-| **100,000** | 3.13 ms | 2.56 ms | 10.98 ms | 320 ops/s |
-| **1,000,000** | 2.85 ms | 2.39 ms | 11.23 ms | 351 ops/s |
+| **10,000** | 2.13 ms | 1.88 ms | 4.13 ms | 470 ops/s |
+| **100,000** | 2.92 ms | 2.41 ms | 5.70 ms | 343 ops/s |
+| **1,000,000** | 3.33 ms | 2.74 ms | 6.18 ms | 301 ops/s |
 
 Write latency remains mostly flat with project size; the dominant cost is per-memory extraction/indexing rather than corpus scan time.
 
-#### 2. Recall (Read) Performance
+#### 2. Recall (Read) Performance — lexical
 *Measures the time to parse a query, resolve deterministic cues, and score sparse candidate intersections.*
 
-| Dataset Scale | Avg Latency | P50 | P99 |
+| Dataset Scale | Avg Latency | P50 | P95 | Throughput |
 |:---|:---|:---|:---|
-| **100,000** | 1.73 ms | 1.65 ms | 3.67 ms |
-| **1,000,000** | 2.70 ms | 2.06 ms | 5.10 ms |
+| **10,000** | 1.05 ms | 1.01 ms | 1.60 ms | 939 ops/s |
+| **100,000** | 1.86 ms | 1.71 ms | 3.16 ms | 535 ops/s |
+| **1,000,000** | 2.63 ms | 2.06 ms | 3.72 ms | 378 ops/s |
 
 **Key Metrics**:
-- **Low-latency recall:** The 1M-memory v0.7 baseline measured 2.7ms average with 5.1ms p99; replace these values with the final semantic-reranker-disabled v0.7.2 run before publishing.
+- **Low-latency recall:** The lexical v0.7.2 1M run measured 2.63ms average with 3.72ms p95; hybrid measurements remain separate because they include bundled encoder work.
 - **Numeric ID memory reduction:** 1M in-memory footprint dropped from about 5.25GB to about 1.93GB after the v0.7 numeric memory-ID refactor.
 - **Controlled hot path:** the release benchmark disables the local semantic encoder, LLMs, network services, and disk scans; normal v0.7.2 hybrid recall can use the bundled local encoder for bounded reranking.
 
