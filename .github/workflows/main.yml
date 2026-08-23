@@ -1,8 +1,8 @@
 name: Build and Publish Optional NPM Binaries
 
 on:
-  release:
-    types: [created]
+  push:
+    branches: [main]
   workflow_dispatch: # Allow manual triggering
 
 jobs:
@@ -95,7 +95,7 @@ jobs:
               cpu: [cpu],
               bin: { cuemap: "bin/cuemap" },
               files: ["bin", "assets", "README.md", "LICENSE"],
-              repository: { type: "git", url: "https://github.com/cuemap-dev/engine.git" },
+              repository: { type: "git", url: "https://github.com/cuemap-dev/cuemap.git" },
               author: "Kaan Demirel",
               license: "BSL-1.1",
               publishConfig: { access: "public" },
