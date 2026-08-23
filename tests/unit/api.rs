@@ -2604,7 +2604,10 @@
             )
             .await
             .unwrap();
+        #[cfg(feature = "semantic-encoder")]
         assert_eq!(intent.status(), StatusCode::OK);
+        #[cfg(not(feature = "semantic-encoder"))]
+        assert_eq!(intent.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         let global_stats = router
             .clone()
@@ -3001,7 +3004,10 @@
             )
             .await
             .unwrap();
+        #[cfg(feature = "semantic-encoder")]
         assert_eq!(classify_ok.status(), StatusCode::OK);
+        #[cfg(not(feature = "semantic-encoder"))]
+        assert_eq!(classify_ok.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         for (method, uri) in [
             ("GET", "/memories/1"),

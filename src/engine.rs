@@ -4130,7 +4130,10 @@ mod tests {
         assert!(engine.encode_semantic_text("bad").is_none());
         let _ = engine.classify_intent("anything", IntentTarget::Memory);
         let _ = engine.classify_intent_with_embedding("anything", IntentTarget::Memory, &[1.0, 0.0, 0.0]);
+        #[cfg(feature = "semantic-encoder")]
         assert!(engine.configure_semantic_encoder().is_ok());
+        #[cfg(not(feature = "semantic-encoder"))]
+        assert!(engine.configure_semantic_encoder().is_err());
 
         let mut bad = SemanticConfig::default();
         bad.enabled = true;
