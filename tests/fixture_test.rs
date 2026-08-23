@@ -2,13 +2,12 @@ use cuemap::engine::CueMapEngine;
 use cuemap::persistence::PersistenceManager;
 use cuemap::structures::MainStats;
 use cuemap::config::ServerConfig;
-use std::fs;
-use std::path::PathBuf;
 
 #[test]
 fn test_fixture_loading_and_recall() {
     // 1. Create a dummy snapshot file
-    let fixture_path = PathBuf::from("/private/tmp/cuemap_fixture_test.bin");
+    let fixture_dir = tempfile::tempdir().expect("Failed to create fixture directory");
+    let fixture_path = fixture_dir.path().join("cuemap_fixture_test.bin");
 
     {
         // Scope to drop engine
@@ -49,7 +48,4 @@ fn test_fixture_loading_and_recall() {
     let results = loaded_engine.recall(vec!["test_cue".to_string()], 5, false, None);
     assert!(!results.is_empty());
     assert_eq!(results[0].content, "Test Content");
-
-    // Cleanup
-    let _ = fs::remove_file(fixture_path);
 }

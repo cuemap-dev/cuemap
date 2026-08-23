@@ -2,6 +2,7 @@ use crate::config::TuningConfig;
 use crate::cuebridge::{CueBridgeArtifactSummary, CueBridgeArtifacts, CueBridgeAliasExpansion};
 use crate::engine::CueMapEngine;
 use crate::normalization::NormalizationConfig;
+use crate::semantic::SemanticEncoder;
 use crate::structures::{LexiconStats, MainStats, MemoryId};
 use crate::taxonomy::Taxonomy;
 use ahash::RandomState;
@@ -51,17 +52,47 @@ impl ProjectContext {
         config: crate::config::ServerConfig,
         project_id: String,
     ) -> Self {
+        let mut context = Self::new_with_encoder(
+            normalization,
+            taxonomy,
+            tuning,
+            config,
+            project_id,
+            None,
+        );
+        if let Err(error) = context.main.configure_semantic_encoder() {
+            tracing::warn!(
+                project_id = %context.main.project_id,
+                error = %error,
+                "Semantic encoder unavailable; continuing without automatic text embeddings"
+            );
+        }
+        context
+    }
+
+    pub fn new_with_encoder(
+        normalization: NormalizationConfig,
+        taxonomy: Taxonomy,
+        tuning: Arc<TuningConfig>,
+        config: crate::config::ServerConfig,
+        project_id: String,
+        semantic_encoder: Option<Arc<dyn SemanticEncoder>>,
+    ) -> Self {
         let mut main = CueMapEngine::with_tuning(tuning.as_ref().clone());
         main.config = config.clone();
         main.project_id = project_id.clone();
+        main.set_semantic_config(config.semantic.clone());
+        main.set_semantic_encoder(semantic_encoder);
 
         let mut aliases = CueMapEngine::with_tuning(tuning.as_ref().clone());
         aliases.config = config.clone();
+        aliases.config.semantic = crate::semantic::SemanticConfig::default();
         aliases.config.server.store_content_on_disk = false; // Disable for aliases (tiny memories, arbitrary IDs)
         aliases.project_id = project_id.clone();
 
         let mut lexicon = CueMapEngine::with_tuning(tuning.as_ref().clone());
         lexicon.config = config.clone();
+        lexicon.config.semantic = crate::semantic::SemanticConfig::default();
         lexicon.config.server.store_content_on_disk = false; // Disable for lexicon (tiny memories, arbitrary IDs)
         lexicon.project_id = project_id.clone();
 

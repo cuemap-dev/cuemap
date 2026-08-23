@@ -11,4 +11,20 @@ data/reports/
 data/snapshots/
 tests/data/
 snapshots/
-scripts/
+__pycache__/
+*.py[cod]
+evals/**/bin/
+vendor/onnxruntime/archives/
+vendor/onnxruntime/ios-arm64/
+vendor/onnxruntime/ios-arm64-sim/
+assets/all-MiniLM-L6-v2/
+coverage/
+lcov.info
+codecov.json
+evals/intent/
+vendor/
+
+# Local release outputs and helpers
+benchmarks/benchmark_nl_results.json
+evals/release-20260815_122352/
+scripts/run-sdk-integration-tests.sh

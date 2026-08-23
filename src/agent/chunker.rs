@@ -256,6 +256,8 @@ struct TextBlock {
     text: String,
     start_line: usize,
     end_line: usize,
+    kind: BlockKind,
+    language: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1585,9 +1587,12 @@ impl Chunker {
         Self::chunk_text_with_config(content, &SegmenterConfig::default())
     }
 
-    /// Chunk longform text by logical blocks instead of sliding sentence windows.
-    /// This keeps paragraph/list/code structure together for long assistant turns,
-    /// tickets, notes, and documents while still splitting oversized blocks.
+    /// Chunk longform text by logical blocks.
+    ///
+    /// Plain prose inside a logical block uses the configured sentence window,
+    /// while headings, lists, tables, and fenced/code-like blocks retain their
+    /// logical structure. Code blocks are parsed with the existing Tree-sitter
+    /// chunkers so they receive AST-derived cues rather than generic text cues.
     pub fn chunk_text_logical_blocks(content: &str, config: &SegmenterConfig) -> Vec<Chunk> {
         let blocks = Self::logical_text_blocks(content);
         if blocks.is_empty() {
@@ -1596,99 +1601,316 @@ impl Chunker {
 
         let line_count = content.lines().count().max(1);
         let mut chunks = Vec::new();
-        let mut pending = String::new();
-        let mut pending_start = 1usize;
-        let mut pending_end = 1usize;
-
-        let flush_pending = |chunks: &mut Vec<Chunk>,
-                             pending: &mut String,
-                             pending_start: &mut usize,
-                             pending_end: &mut usize| {
-            let trimmed = pending.trim();
-            if trimmed.is_empty() {
-                return;
-            }
-            chunks.push(Chunk {
-                content: trimmed.to_string(),
-                start_line: *pending_start,
-                end_line: *pending_end,
-                context: format!("block:{}", chunks.len()),
-                structural_cues: vec![
-                    "lang:text".to_string(),
-                    "type:logical_block".to_string(),
-                    format!("block:{}", chunks.len()),
-                ],
-                category: ChunkCategory::Prose,
-            });
-            pending.clear();
-        };
-
-        for block in blocks {
+        for (block_idx, block) in blocks.into_iter().enumerate() {
             let block_text = block.text.trim();
             if block_text.is_empty() {
                 continue;
             }
 
-            if block_text.len() > config.max_chunk_chars {
-                flush_pending(
-                    &mut chunks,
-                    &mut pending,
-                    &mut pending_start,
-                    &mut pending_end,
-                );
-                let mut split_config = config.clone();
-                split_config.overlap = split_config.overlap.min(split_config.window_size / 2);
-                for split in Self::chunk_text_with_config(block_text, &split_config) {
-                    chunks.push(Chunk {
-                        content: split.content,
-                        start_line: block.start_line.max(1),
-                        end_line: block.end_line.min(line_count),
-                        context: format!("block:{}:{}", block.start_line, split.context),
-                        structural_cues: vec![
-                            "lang:text".to_string(),
-                            "type:logical_block_split".to_string(),
-                            format!("block:{}", chunks.len()),
-                        ],
-                        category: ChunkCategory::Prose,
-                    });
-                }
+            let inferred_language = block
+                .language
+                .clone()
+                .or_else(|| Self::infer_code_language(block_text));
+            let is_code = block.kind == BlockKind::CodeFence
+                || (block.kind == BlockKind::Plain
+                    && inferred_language.is_some()
+                    && Self::looks_like_unfenced_code(block_text));
+
+            if is_code {
+                chunks.extend(Self::chunk_logical_code_block(
+                    &block,
+                    block_idx,
+                    inferred_language.as_deref(),
+                    config.max_chunk_chars,
+                    line_count,
+                ));
                 continue;
             }
 
-            let pending_len = pending.len();
-            let sep_len = if pending.is_empty() { 0 } else { 2 };
-            if pending_len + sep_len + block_text.len() > config.max_chunk_chars {
-                flush_pending(
-                    &mut chunks,
-                    &mut pending,
-                    &mut pending_start,
-                    &mut pending_end,
-                );
+            let use_sentence_windows = block.kind == BlockKind::Plain;
+            if use_sentence_windows {
+                let mut split_config = config.clone();
+                split_config.overlap = split_config.overlap.min(split_config.window_size / 2);
+                let splits = Self::chunk_text_with_config(block_text, &split_config);
+                if splits.len() > 1 || block_text.len() > config.max_chunk_chars {
+                    for split in splits {
+                        let mut cues = split.structural_cues;
+                        cues.push("type:logical_block".to_string());
+                        cues.push("type:logical_block_split".to_string());
+                        cues.push(format!("block:{}", block_idx));
+                        cues.sort();
+                        cues.dedup();
+                        chunks.push(Chunk {
+                            content: split.content,
+                            start_line: block.start_line
+                                .saturating_add(split.start_line.saturating_sub(1))
+                                .max(1),
+                            end_line: block.start_line
+                                .saturating_add(split.end_line.saturating_sub(1))
+                                .min(line_count),
+                            context: format!("block:{}:{}", block_idx, split.context),
+                            structural_cues: cues,
+                            category: ChunkCategory::Prose,
+                        });
+                    }
+                    continue;
+                }
             }
 
-            if pending.is_empty() {
-                pending_start = block.start_line.max(1);
-                pending_end = block.end_line.max(pending_start);
-                pending.push_str(block_text);
-            } else {
-                pending.push_str("\n\n");
-                pending.push_str(block_text);
-                pending_end = block.end_line.max(pending_end);
-            }
+            let mut cues = vec![
+                "lang:text".to_string(),
+                "type:logical_block".to_string(),
+                format!("block:{}", block_idx),
+            ];
+            cues.push(format!(
+                "block_kind:{}",
+                match block.kind {
+                    BlockKind::Plain => "plain",
+                    BlockKind::Heading => "heading",
+                    BlockKind::List => "list",
+                    BlockKind::Table => "table",
+                    BlockKind::CodeFence => "code",
+                }
+            ));
+            chunks.push(Chunk {
+                content: block_text.to_string(),
+                start_line: block.start_line.max(1),
+                end_line: block.end_line.min(line_count),
+                context: format!("block:{}", block_idx),
+                structural_cues: cues,
+                category: ChunkCategory::Prose,
+            });
         }
-
-        flush_pending(
-            &mut chunks,
-            &mut pending,
-            &mut pending_start,
-            &mut pending_end,
-        );
 
         if chunks.is_empty() {
             return Self::chunk_text_with_config(content, config);
         }
 
         chunks
+    }
+
+    /// Route a logical code block through the same Tree-sitter chunkers used by
+    /// file ingestion. A small code block remains one logical chunk, but its
+    /// chunk carries the union of AST cues found inside it. Oversized blocks use
+    /// the AST chunks so the configured maximum remains meaningful.
+    fn chunk_logical_code_block(
+        block: &TextBlock,
+        block_idx: usize,
+        language: Option<&str>,
+        max_chunk_chars: usize,
+        line_count: usize,
+    ) -> Vec<Chunk> {
+        let (code, code_start_line) = Self::code_fence_body(&block.text, block.start_line);
+        let code = code.trim();
+        if code.is_empty() {
+            return Vec::new();
+        }
+
+        let normalized_language = language
+            .map(Self::normalize_code_language)
+            .filter(|value| !value.is_empty());
+        let language = normalized_language.as_deref();
+        let parser_chunks = Self::chunk_code_by_language(code, language);
+
+        if code.len() <= max_chunk_chars {
+            let mut cues = vec![
+                "type:logical_block".to_string(),
+                "type:logical_code_block".to_string(),
+                format!("block:{}", block_idx),
+            ];
+            cues.push(format!(
+                "lang:{}",
+                language.unwrap_or("code")
+            ));
+            for parser_chunk in &parser_chunks {
+                cues.extend(parser_chunk.structural_cues.iter().cloned());
+            }
+            cues.sort();
+            cues.dedup();
+
+            return vec![Chunk {
+                content: code.to_string(),
+                start_line: code_start_line.max(1),
+                end_line: (code_start_line
+                    .saturating_add(code.lines().count().saturating_sub(1)))
+                .min(line_count),
+                context: format!("block:{}:code", block_idx),
+                structural_cues: cues,
+                category: if Self::is_structured_language(language) {
+                    ChunkCategory::Structured
+                } else {
+                    ChunkCategory::Code
+                },
+            }];
+        }
+
+        if !parser_chunks.is_empty() {
+            return parser_chunks
+                .into_iter()
+                .enumerate()
+                .map(|(part_idx, mut chunk)| {
+                    chunk.start_line = code_start_line
+                        .saturating_add(chunk.start_line.saturating_sub(1))
+                        .max(1);
+                    chunk.end_line = code_start_line
+                        .saturating_add(chunk.end_line.saturating_sub(1))
+                        .min(line_count);
+                    chunk.context = format!("block:{}:{}", block_idx, chunk.context);
+                    chunk.structural_cues.push("type:logical_block".to_string());
+                    chunk.structural_cues.push(format!("block:{}", block_idx));
+                    chunk
+                        .structural_cues
+                        .push(format!("code_part:{}", part_idx));
+                    chunk.structural_cues.sort();
+                    chunk.structural_cues.dedup();
+                    chunk
+                })
+                .collect();
+        }
+
+        let mut cues = vec![
+            "type:logical_block".to_string(),
+            "type:logical_code_block".to_string(),
+            format!("block:{}", block_idx),
+            format!("lang:{}", language.unwrap_or("code")),
+        ];
+        cues.sort();
+        cues.dedup();
+        let lines: Vec<&str> = code.lines().collect();
+        lines
+            .chunks(20)
+            .enumerate()
+            .map(|(part_idx, part)| Chunk {
+                content: part.join("\n"),
+                start_line: code_start_line.saturating_add(part_idx * 20).max(1),
+                end_line: code_start_line
+                    .saturating_add(part_idx * 20 + part.len().saturating_sub(1))
+                    .min(line_count),
+                context: format!("block:{}:code_part:{}", block_idx, part_idx),
+                structural_cues: {
+                    let mut part_cues = cues.clone();
+                    part_cues.push(format!("code_part:{}", part_idx));
+                    part_cues
+                },
+                category: ChunkCategory::Code,
+            })
+            .collect()
+    }
+
+    fn chunk_code_by_language(content: &str, language: Option<&str>) -> Vec<Chunk> {
+        match language {
+            Some("python") => Self::chunk_python(content),
+            Some("rust") => Self::chunk_rust(content),
+            Some("typescript") => Self::chunk_typescript(content),
+            Some("javascript") => Self::chunk_javascript(content),
+            Some("go") => Self::chunk_go(content),
+            Some("html") => Self::chunk_html(content),
+            Some("css") => Self::chunk_css(content),
+            Some("php") => Self::chunk_php(content),
+            Some("java") => Self::chunk_java(content),
+            _ => Vec::new(),
+        }
+    }
+
+    fn code_fence_body(text: &str, start_line: usize) -> (String, usize) {
+        let mut lines: Vec<&str> = text.lines().collect();
+        let has_fence = lines
+            .first()
+            .map(|line| {
+                let trimmed = line.trim();
+                trimmed.starts_with("```") || trimmed.starts_with("~~~")
+            })
+            .unwrap_or(false);
+        if has_fence {
+            lines.remove(0);
+            if lines
+                .last()
+                .map(|line| {
+                    let trimmed = line.trim();
+                    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+                })
+                .unwrap_or(false)
+            {
+                lines.pop();
+            }
+            (lines.join("\n"), start_line.saturating_add(1))
+        } else {
+            (text.to_string(), start_line)
+        }
+    }
+
+    fn normalize_code_language(language: &str) -> String {
+        let value = language
+            .trim()
+            .to_ascii_lowercase()
+            .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+            .to_string();
+        match value.as_str() {
+            "py" => "python".to_string(),
+            "rs" => "rust".to_string(),
+            "ts" | "tsx" => "typescript".to_string(),
+            "js" | "jsx" => "javascript".to_string(),
+            "htm" => "html".to_string(),
+            _ => value,
+        }
+    }
+
+    fn is_structured_language(language: Option<&str>) -> bool {
+        matches!(language, Some("json" | "yaml" | "xml" | "csv"))
+    }
+
+    fn infer_code_language(content: &str) -> Option<String> {
+        let lower = content.to_ascii_lowercase();
+        let trimmed = lower.trim_start();
+        if trimmed.starts_with("def ")
+            || trimmed.starts_with("class ")
+            || trimmed.starts_with("from ")
+            || trimmed.starts_with("import ")
+            || lower.contains("if __name__ ==")
+        {
+            return Some("python".to_string());
+        }
+        if trimmed.starts_with("fn ")
+            || trimmed.starts_with("use ")
+            || trimmed.starts_with("struct ")
+            || trimmed.starts_with("enum ")
+            || trimmed.starts_with("impl ")
+        {
+            return Some("rust".to_string());
+        }
+        if trimmed.starts_with("package ") || trimmed.starts_with("func ") {
+            return Some("go".to_string());
+        }
+        if trimmed.starts_with("#include ") || trimmed.starts_with("public class ") {
+            return Some("java".to_string());
+        }
+        if lower.contains("=>")
+            || trimmed.starts_with("const ")
+            || trimmed.starts_with("let ")
+            || trimmed.starts_with("function ")
+            || trimmed.starts_with("interface ")
+        {
+            return Some("javascript".to_string());
+        }
+        None
+    }
+
+    fn looks_like_unfenced_code(content: &str) -> bool {
+        let lines: Vec<&str> = content.lines().collect();
+        let trimmed = content.trim_start();
+        let strong_prefix = [
+            "def ", "class ", "fn ", "func ", "struct ", "enum ", "impl ",
+            "package ", "import ", "from ", "#include ", "const ", "let ",
+            "function ", "interface ", "public class ",
+        ];
+        if strong_prefix.iter().any(|prefix| trimmed.starts_with(prefix)) {
+            return true;
+        }
+        lines.len() >= 2
+            && (content.contains("{\n")
+                || content.contains(";\n")
+                || content.contains("=>")
+                || content.contains("::"))
     }
 
     fn logical_text_blocks(content: &str) -> Vec<TextBlock> {
@@ -1698,20 +1920,26 @@ impl Chunker {
         let mut last_line = 1usize;
         let mut in_fence = false;
         let mut current_kind = BlockKind::Plain;
+        let mut current_language: Option<String> = None;
 
         let flush = |blocks: &mut Vec<TextBlock>,
                      current: &mut String,
                      start_line: &mut usize,
-                     last_line: usize| {
+                     last_line: usize,
+                     kind: BlockKind,
+                     language: &mut Option<String>| {
             let trimmed = current.trim();
             if trimmed.is_empty() {
                 current.clear();
+                *language = None;
                 return;
             }
             blocks.push(TextBlock {
                 text: trimmed.to_string(),
                 start_line: *start_line,
                 end_line: last_line,
+                kind,
+                language: language.take(),
             });
             current.clear();
         };
@@ -1732,7 +1960,14 @@ impl Chunker {
                 last_line = line_no;
                 if is_fence {
                     in_fence = false;
-                    flush(&mut blocks, &mut current, &mut start_line, last_line);
+                    flush(
+                        &mut blocks,
+                        &mut current,
+                        &mut start_line,
+                        last_line,
+                        current_kind,
+                        &mut current_language,
+                    );
                     current_kind = BlockKind::Plain;
                 }
                 continue;
@@ -1740,10 +1975,22 @@ impl Chunker {
 
             if is_fence {
                 if !current.trim().is_empty() {
-                    flush(&mut blocks, &mut current, &mut start_line, last_line);
+                    flush(
+                        &mut blocks,
+                        &mut current,
+                        &mut start_line,
+                        last_line,
+                        current_kind,
+                        &mut current_language,
+                    );
                 }
                 start_line = line_no;
                 current_kind = BlockKind::CodeFence;
+                current_language = trimmed
+                    .get(3..)
+                    .and_then(|value| value.trim().split_whitespace().next())
+                    .map(Self::normalize_code_language)
+                    .filter(|value| !value.is_empty());
                 in_fence = true;
                 current.push_str(line);
                 current.push('\n');
@@ -1752,7 +1999,14 @@ impl Chunker {
             }
 
             if trimmed.is_empty() {
-                flush(&mut blocks, &mut current, &mut start_line, last_line);
+                flush(
+                    &mut blocks,
+                    &mut current,
+                    &mut start_line,
+                    last_line,
+                    current_kind,
+                    &mut current_language,
+                );
                 current_kind = BlockKind::Plain;
                 continue;
             }
@@ -1764,7 +2018,14 @@ impl Chunker {
                     || (current_kind == BlockKind::Table && line_kind != BlockKind::Table));
 
             if should_flush {
-                flush(&mut blocks, &mut current, &mut start_line, last_line);
+                flush(
+                    &mut blocks,
+                    &mut current,
+                    &mut start_line,
+                    last_line,
+                    current_kind,
+                    &mut current_language,
+                );
                 start_line = line_no;
                 current_kind = line_kind;
             }
@@ -1777,7 +2038,14 @@ impl Chunker {
             }
         }
 
-        flush(&mut blocks, &mut current, &mut start_line, last_line);
+        flush(
+            &mut blocks,
+            &mut current,
+            &mut start_line,
+            last_line,
+            current_kind,
+            &mut current_language,
+        );
         blocks
     }
 

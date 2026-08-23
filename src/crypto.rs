@@ -149,3 +149,66 @@ impl ContextSigner {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn passphrase_keys_are_32_bytes_and_deterministic() {
+        let first = EncryptionKey::from_passphrase("secret", b"salt");
+        let second = EncryptionKey::from_passphrase("secret", b"salt");
+        let different = EncryptionKey::from_passphrase("other", b"salt");
+        assert_eq!(first.as_bytes().len(), 32);
+        assert_eq!(first.as_bytes(), second.as_bytes());
+        assert_ne!(first.as_bytes(), different.as_bytes());
+    }
+
+    #[test]
+    fn compression_round_trip_and_magic_detection_work() {
+        let payload = b"a repeated payload that benefits from compression";
+        let compressed = compress(payload).unwrap();
+        assert!(is_compressed(&compressed));
+        assert!(!is_compressed(payload));
+        assert!(!is_compressed(&[0x28, 0xB5, 0x2F]));
+        assert_eq!(decompress(&compressed).unwrap(), payload);
+        assert!(decompress(b"not zstd").is_err());
+    }
+
+    #[test]
+    fn encryption_round_trip_rejects_short_and_wrong_ciphertext() {
+        let key = EncryptionKey::new(vec![7; 32]);
+        let ciphertext = encrypt(b"private text", &key).unwrap();
+        assert_ne!(ciphertext, b"private text");
+        assert_eq!(decrypt(&ciphertext, &key).unwrap(), b"private text");
+        assert!(decrypt(&ciphertext[..11], &key).is_err());
+
+        let wrong_key = EncryptionKey::new(vec![8; 32]);
+        assert!(decrypt(&ciphertext, &wrong_key).is_err());
+    }
+
+    #[test]
+    fn context_signers_produce_expected_algorithms() {
+        let hmac = ContextSigner::from_hmac_secret(b"secret".to_vec()).sign("payload");
+        assert_eq!(hmac.algorithm, "hmac-sha256");
+        assert_eq!(hmac.signature.len(), 64);
+        assert!(hmac.public_key.is_none());
+
+        let seed = format!("ed25519:{}", hex::encode([1u8; 32]));
+        let ed25519 = ContextSigner::from_ed25519_seed_hex(&seed).unwrap().sign("payload");
+        assert_eq!(ed25519.algorithm, "ed25519");
+        assert_eq!(ed25519.signature.len(), 128);
+        assert!(ed25519.public_key.as_deref().unwrap().starts_with("ed25519:"));
+    }
+
+    #[test]
+    fn ed25519_seed_validation_reports_useful_errors() {
+        assert!(ContextSigner::from_ed25519_seed_hex("not-hex").is_err());
+        let short = hex::encode([1u8; 16]);
+        let error = match ContextSigner::from_ed25519_seed_hex(&short) {
+            Ok(_) => panic!("short seeds must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.contains("32-byte hex seed"));
+    }
+}

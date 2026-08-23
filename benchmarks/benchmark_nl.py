@@ -16,6 +16,10 @@ import random
 import os
 import gc
 import hashlib
+import uuid
+import shutil
+import subprocess
+from pathlib import Path
 
 try:
     import pandas as pd
@@ -26,6 +30,100 @@ try:
     import pyarrow.parquet as pq
 except ImportError:
     pq = None
+
+
+KAGGLE_WIKIPEDIA_HANDLE = "jjinho/wikipedia-20230701"
+DEFAULT_WIKIPEDIA_CACHE = Path.home() / ".cache" / "cuemap" / "benchmarks" / "wikipedia-20230701"
+
+
+def _parquet_files(path: Path) -> List[Path]:
+    """Return parquet files below a dataset path, including nested downloads."""
+    if not path.exists():
+        return []
+    if path.is_file():
+        return [path] if path.suffix.lower() == ".parquet" else []
+    return sorted(path.rglob("*.parquet"))
+
+
+def ensure_wikipedia_dataset(path: Optional[str]) -> str:
+    """Resolve an explicit parquet path or download the release fixture on demand.
+
+    The benchmark intentionally does not vendor Wikipedia data. When no path is
+    supplied, the public Kaggle fixture used for the release run is downloaded
+    into a reusable local cache. KaggleHub is preferred, with the Kaggle CLI as
+    a fallback for environments that already have it configured.
+    """
+    if path and path.strip():
+        return os.path.expanduser(path)
+
+    cache_root = Path(
+        os.environ.get("CUEMAP_BENCHMARK_WIKIPEDIA_DIR", str(DEFAULT_WIKIPEDIA_CACHE))
+    ).expanduser()
+    cache_root.mkdir(parents=True, exist_ok=True)
+
+    parquet_files = _parquet_files(cache_root)
+    if parquet_files:
+        print(
+            f"Using cached Kaggle Wikipedia fixture at {cache_root} "
+            f"({len(parquet_files):,} parquet files)."
+        )
+        return str(cache_root)
+
+    print(
+        f"No --wikipedia-path supplied; downloading Kaggle dataset "
+        f"{KAGGLE_WIKIPEDIA_HANDLE} to {cache_root}..."
+    )
+    errors = []
+
+    try:
+        import kagglehub
+    except ImportError:
+        errors.append(
+            "kagglehub is not installed (install it with `python -m pip install kagglehub`)"
+        )
+    else:
+        try:
+            kagglehub.dataset_download(
+                KAGGLE_WIKIPEDIA_HANDLE,
+                output_dir=str(cache_root),
+            )
+        except Exception as exc:
+            errors.append(f"kagglehub download failed: {exc}")
+
+    parquet_files = _parquet_files(cache_root)
+    if not parquet_files:
+        kaggle_executable = shutil.which("kaggle")
+        if kaggle_executable:
+            try:
+                subprocess.run(
+                    [
+                        kaggle_executable,
+                        "datasets",
+                        "download",
+                        KAGGLE_WIKIPEDIA_HANDLE,
+                        "--path",
+                        str(cache_root),
+                        "--unzip",
+                    ],
+                    check=True,
+                )
+            except (OSError, subprocess.CalledProcessError) as exc:
+                errors.append(f"Kaggle CLI download failed: {exc}")
+        else:
+            errors.append("the `kaggle` CLI is not installed")
+
+    parquet_files = _parquet_files(cache_root)
+    if not parquet_files:
+        detail = "; ".join(errors)
+        raise RuntimeError(
+            "Could not download the Kaggle Wikipedia fixture. "
+            "Install kagglehub (`python -m pip install kagglehub`) and configure "
+            "Kaggle access if prompted, or pass --wikipedia-path to a local parquet "
+            f"dataset. Details: {detail}"
+        )
+
+    print(f"Downloaded {len(parquet_files):,} parquet files to {cache_root}.")
+    return str(cache_root)
 
 
 @dataclass
@@ -84,8 +182,7 @@ class WikiLoader:
         if (pd or pq) and os.path.exists(path):
             try:
                 if os.path.isdir(path):
-                    import glob
-                    files = glob.glob(os.path.join(path, "*.parquet"))
+                    files = [str(file) for file in Path(path).rglob("*.parquet")]
                     if not files:
                         print(f"  ! No parquet files found in {path}")
                         return
@@ -225,7 +322,10 @@ class CueMapNLBenchmark:
         query_sample_size: int = 10000,
         include_metadata: bool = False,
         batch_writes: bool = False,
+        semantic_mode: str = "lexical",
     ):
+        if semantic_mode not in {"lexical", "semantic", "hybrid"}:
+            raise ValueError("semantic_mode must be lexical, semantic, or hybrid")
         self.python_url = python_url
         self.rust_url = rust_url
         self.project_id = project_id
@@ -239,6 +339,7 @@ class CueMapNLBenchmark:
         self.query_sample_size = max(1, query_sample_size)
         self.include_metadata = include_metadata
         self.batch_writes = batch_writes
+        self.semantic_mode = semantic_mode
         self.synthetic_counter = 0
         
     def _get_headers(self) -> dict:
@@ -247,6 +348,17 @@ class CueMapNLBenchmark:
         if self.project_id:
             headers["X-Project-ID"] = self.project_id
         return headers
+
+    async def _read_json_response(self, response: aiohttp.ClientResponse, operation: str) -> Any:
+        """Read a JSON response and fail loudly on HTTP or payload errors."""
+        body = await response.text()
+        if not 200 <= response.status < 300:
+            detail = body[:500].replace("\n", " ")
+            raise RuntimeError(f"{operation} failed with HTTP {response.status}: {detail}")
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"{operation} returned invalid JSON") from exc
     
     async def generate_memory_content(self, idx: int, embedded_cues: List[str]) -> str:
         """Generate memory content with embedded cues for extraction."""
@@ -298,9 +410,8 @@ class CueMapNLBenchmark:
             }
             
             async with session.post(f"{url}/memories", json=payload, headers=self._get_headers()) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    memory_ids.append(data["id"])
+                data = await self._read_json_response(resp, "memory ingestion")
+                memory_ids.append(data["id"])
         
         return memory_ids
 
@@ -344,7 +455,7 @@ class CueMapNLBenchmark:
                     json={"memories": payloads, "minimal_response": True},
                     headers=self._get_headers(),
                 ) as resp:
-                    await resp.json()
+                    await self._read_json_response(resp, "batch memory ingestion")
                 op_end = time.time()
                 per_memory_ms = ((op_end - op_start) * 1000) / max(1, len(payloads))
                 latencies.extend([per_memory_ms] * len(payloads))
@@ -352,7 +463,7 @@ class CueMapNLBenchmark:
                 for payload in payloads:
                     op_start = time.time()
                     async with session.post(f"{url}/memories", json=payload, headers=self._get_headers()) as resp:
-                        await resp.json()
+                        await self._read_json_response(resp, "memory ingestion")
                     op_end = time.time()
                     latencies.append((op_end - op_start) * 1000)
 
@@ -409,6 +520,10 @@ class CueMapNLBenchmark:
                 payload = {
                     "query_text": query_text, 
                     "cues": [], # No explicit cues
+                    # Keep the release latency benchmark on the sparse lexical
+                    # path. Rust defaults to hybrid recall when this field is
+                    # omitted, which would include encoder/reranking work.
+                    "semantic_mode": self.semantic_mode,
                     "limit": 5,
                     "trace_timing": trace_timing,
                 }
@@ -420,7 +535,6 @@ class CueMapNLBenchmark:
                     "disable_cuebridge_artifacts": True,
                     "depth": 1,
                     "expansion_depth": 1,
-                    "cuepacks": [],
                     "parent_fusion": "off",
                     "ordered_reconstruction": "off",
                     "evidence_coverage": "off",
@@ -437,7 +551,7 @@ class CueMapNLBenchmark:
             for payload in payloads:
                 op_start = time.time()
                 async with session.post(f"{url}/recall", json=payload, headers=self._get_headers()) as resp:
-                    body = await resp.json()
+                    body = await self._read_json_response(resp, "memory recall")
                 op_end = time.time()
                 
                 latencies.append((op_end - op_start) * 1000)  # Convert to ms
@@ -580,7 +694,7 @@ class CueMapNLBenchmark:
             print(f"Dataset Size: {result.dataset_size:,}")
             print(f"Time: {result.total_time:.2f}s")
             print(f"Throughput: {result.throughput:.0f} ops/s")
-            print(f"Latency (ms): Avg={result.avg_latency:.2f}, P50={result.p50_latency:.2f}, P99={result.p99_latency:.2f}")
+            print(f"Latency (ms): Avg={result.avg_latency:.2f}, P50={result.p50_latency:.2f}, P95={result.p95_latency:.2f}")
             if result.timing_summary:
                 timing_items = [
                     item for item in result.timing_summary.items()
@@ -590,21 +704,21 @@ class CueMapNLBenchmark:
                     item for item in result.timing_summary.items()
                     if item not in timing_items
                 ]
-                print("Timing breakdown (avg / p99 ms):")
+                print("Timing breakdown (avg / p95 ms):")
                 for key, stats in sorted(
                     timing_items,
                     key=lambda item: item[1]["avg"],
                     reverse=True
                 )[:20]:
-                    print(f"  {key}: {stats['avg']:.3f} / {stats['p99']:.3f} ms")
+                    print(f"  {key}: {stats['avg']:.3f} / {stats['p95']:.3f} ms")
                 if counter_items:
-                    print("Trace counters (avg / p99):")
+                    print("Trace counters (avg / p95):")
                     for key, stats in sorted(
                         counter_items,
                         key=lambda item: item[1]["avg"],
                         reverse=True
                     )[:12]:
-                        print(f"  {key}: {stats['avg']:.3f} / {stats['p99']:.3f}")
+                        print(f"  {key}: {stats['avg']:.3f} / {stats['p95']:.3f}")
             print("-" * 40)
 
     def save_results(self, results: List[BenchmarkResult], filename: str = "benchmark_nl_results.json"):
@@ -639,7 +753,7 @@ async def main():
     parser = argparse.ArgumentParser(description='CueMap NL Benchmark: Python vs Rust')
     parser.add_argument('--sizes', type=str, help='Comma-separated list of sizes (e.g., 10000,100000)')
     parser.add_argument('--project-id', type=str, default="nl_test",help='Project ID for multi-tenant instance')
-    parser.add_argument('--wikipedia-path', type=str, default=os.path.expanduser('~/Downloads/wikipedia/'), help='Path to Wikipedia parquet file or directory')
+    parser.add_argument('--wikipedia-path', type=str, default=None, help='Path to a local Wikipedia parquet file or directory; omitted downloads the release Kaggle fixture')
     parser.add_argument('--wait-for-jobs', action='store_true', help='Wait for background jobs to complete before running recall benchmarks')
     parser.add_argument('--trace-timing', action='store_true', help='Request and aggregate /recall timing breakdowns from the Rust server')
     parser.add_argument('--wiki-reservoir-size', type=int, default=50000, help='Maximum unique sampled Wikipedia snippets to keep in RAM')
@@ -648,11 +762,13 @@ async def main():
     parser.add_argument('--query-sample-size', type=int, default=10000, help='Maximum ingested texts retained for recall query generation')
     parser.add_argument('--include-metadata', action='store_true', help='Include per-memory benchmark metadata during writes')
     parser.add_argument('--batch-writes', action='store_true', help='Write each payload buffer through /memories/batch instead of one POST per memory')
+    parser.add_argument('--semantic-mode', choices=('lexical', 'semantic', 'hybrid'), default='lexical', help='Rust recall mode; lexical is the release sparse-core benchmark default')
     args = parser.parse_args()
     
     print("CueMap NL Benchmark: Python vs Rust")
     print("Testing Natural Language Extraction & Query Resolution")
     print("="*80)
+    print("Release sparse-core mode: start Rust with CUEMAP_SEMANTIC_ENCODER_ENABLED=false")
     
     if args.project_id:
         print(f"Running in Multi-Tenant mode for project: {args.project_id}")
@@ -670,10 +786,11 @@ async def main():
               
     print(f"\nRunning benchmark for sizes: {sizes_to_run}")
 
+    wikipedia_path = ensure_wikipedia_dataset(args.wikipedia_path)
     requested_unique_writes = sum(sizes_to_run)
     effective_wiki_reservoir_size = args.wiki_reservoir_size
     effective_wiki_file_limit = args.wiki_file_limit
-    if args.wikipedia_path and effective_wiki_reservoir_size < requested_unique_writes:
+    if wikipedia_path and effective_wiki_reservoir_size < requested_unique_writes:
         effective_wiki_reservoir_size = requested_unique_writes
         print(
             f"Auto-increasing Wikipedia unique reservoir from "
@@ -691,17 +808,19 @@ async def main():
         python_url="http://localhost:8000",
         rust_url="http://localhost:8080",
         project_id=args.project_id,
-        wiki_path=args.wikipedia_path,
+        wiki_path=wikipedia_path,
         wiki_reservoir_size=effective_wiki_reservoir_size,
         wiki_file_limit=effective_wiki_file_limit,
         payload_buffer_size=args.payload_buffer_size,
         query_sample_size=args.query_sample_size,
         include_metadata=args.include_metadata,
         batch_writes=args.batch_writes,
+        semantic_mode=args.semantic_mode,
     )
     
     try:
         results = []
+        run_tag = f"{int(time.time())}_{os.getpid()}_{uuid.uuid4().hex[:6]}"
         async with aiohttp.ClientSession() as session:
              # Health check
             print("\nChecking server health...")
@@ -717,9 +836,20 @@ async def main():
             print("✓ Rust server is healthy\n")
 
             for idx, size in enumerate(sizes_to_run):
+                # Keep every requested scale isolated. Otherwise a 1M pass
+                # after a 100K pass would benchmark 1.1M memories in the same
+                # project, and rerunning the command could reuse old state.
+                base_project_id = args.project_id or "nl_test"
+                suffix = f"_{run_tag}_{size}"
+                prefix_length = 64 - len(suffix)
+                if prefix_length < 3:
+                    raise ValueError("--project-id is too long for a run-scoped benchmark project")
+                benchmark.project_id = f"{base_project_id[:prefix_length]}{suffix}"
                 print(f"\n{'='*60}")
                 print(f"Benchmarking with {size:,} memories [{idx+1}/{len(sizes_to_run)}]")
                 print(f"{'='*60}")
+                print(f"  Project: {benchmark.project_id}")
+                print(f"  Rust recall mode: {benchmark.semantic_mode}")
                 
                 num_queries = 1000 if size <= 10000 else 500
                 
@@ -751,7 +881,9 @@ async def main():
                     # Wait for background jobs before recall benchmarks (if flag set)
                     if args.wait_for_jobs:
                         await benchmark.wait_for_jobs(session, benchmark.rust_url)
-                except Exception as e: print(f"  ✗ Failed: {e}")
+                except Exception as e:
+                    print(f"  ✗ Failed: {e}")
+                    raise
                 
                 if py_healthy:
                     print(f"\n[Python] Read (NL) benchmark ({num_queries} queries)...")
@@ -763,7 +895,7 @@ async def main():
                             ingested_texts=py_texts
                         )
                         results.append(res)
-                        print(f"  ✓ Completed in {res.total_time:.2f}s (P99: {res.p99_latency:.2f}ms)")
+                        print(f"  ✓ Completed in {res.total_time:.2f}s (P95: {res.p95_latency:.2f}ms)")
                     except Exception as e: print(f"  ✗ Failed: {e}")
 
                 print(f"[Rust] Read (NL, Lean) benchmark ({num_queries} queries)...")
@@ -776,8 +908,10 @@ async def main():
                         trace_timing=args.trace_timing
                     )
                     results.append(res)
-                    print(f"  ✓ Completed in {res.total_time:.2f}s (P99: {res.p99_latency:.2f}ms)")
-                except Exception as e: print(f"  ✗ Failed: {e}")
+                    print(f"  ✓ Completed in {res.total_time:.2f}s (P95: {res.p95_latency:.2f}ms)")
+                except Exception as e:
+                    print(f"  ✗ Failed: {e}")
+                    raise
 
         benchmark.print_results(results)
         benchmark.save_results(results)

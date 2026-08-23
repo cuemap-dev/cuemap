@@ -1,5 +1,6 @@
 use crate::auth::AuthConfig;
-use crate::jobs::JobQueue;
+use crate::jobs::{Job, JobQueue};
+use crate::intent::IntentTarget;
 use crate::metrics::MetricsCollector;
 use crate::multi_tenant::{validate_project_id, MultiTenantEngine};
 use crate::normalization::normalize_cue;
@@ -27,10 +28,14 @@ pub struct AddMemoryRequest {
     pub cues: Vec<String>,
     #[serde(default)]
     pub source_key: Option<String>,
+    /// Original event timestamp as Unix seconds. When omitted, ingestion time is used.
+    #[serde(default)]
+    pub event_time: Option<f64>,
     #[serde(default)]
     pub metadata: Option<HashMap<String, serde_json::Value>>,
+    /// Optional precomputed embedding for opt-in semantic retrieval.
     #[serde(default)]
-    pub cuepacks: Option<Vec<String>>,
+    pub embedding: Option<Vec<f32>>,
     #[serde(default)]
     pub disable_temporal_chunking: bool,
     #[serde(default)]
@@ -64,6 +69,13 @@ pub struct RecallRequest {
     pub cues: Vec<String>,
     #[serde(default)]
     pub query_text: Option<String>,
+    /// Optional precomputed query embedding for opt-in semantic retrieval.
+    #[serde(default)]
+    pub query_embedding: Option<Vec<f32>>,
+    /// Selects lexical-only, semantic-only, or combined query signals.
+    /// Hybrid preserves the existing behavior when omitted.
+    #[serde(default)]
+    pub semantic_mode: crate::semantic::SemanticRecallMode,
     #[serde(default)]
     pub query_time: Option<String>,
     #[serde(default = "default_limit")]
@@ -86,8 +98,6 @@ pub struct RecallRequest {
     pub disable_alias_expansion: bool,
     #[serde(default = "default_depth")]
     pub depth: usize,
-    #[serde(default)]
-    pub cuepacks: Option<Vec<String>>,
     #[serde(default)]
     pub parent_fusion: ParentFusionMode,
     #[serde(default = "default_parent_fusion_limit")]
@@ -114,6 +124,13 @@ pub struct RecallRequest {
     pub disable_cuebridge_artifacts: bool,
     #[serde(default = "default_cuebridge_gap_limit")]
     pub cuebridge_gap_limit: usize,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct IntentClassificationRequest {
+    pub text: String,
+    #[serde(default)]
+    pub target: IntentTarget,
 }
 
 #[derive(Debug, Deserialize)]
@@ -216,17 +233,15 @@ impl Default for ParentFusionMode {
     }
 }
 
-fn apply_query_intent(
+fn apply_query_plan(
     ctx: &crate::projects::ProjectContext,
-    cuepack_registry: &crate::cuepacks::CuePackRegistry,
-    cuepack_selection: Option<&[String]>,
     query_text: Option<&str>,
     query_time: Option<&str>,
     expanded_cues: &mut Vec<(String, f64)>,
-) -> Option<crate::facets::QueryIntent> {
+) -> Option<crate::facets::StructuralQueryPlan> {
     let query_text = query_text?;
     let total_memories = ctx.main.total_memories().max(1);
-    let intent = crate::facets::compile_query_intent_with_cuepacks(query_text, query_time, |cue| {
+    let intent = crate::facets::compile_query_plan_with_reference_time(query_text, query_time, |cue| {
         let df = ctx.main.get_cue_frequency(cue);
         if df == 0 {
             return false;
@@ -279,7 +294,7 @@ fn apply_query_intent(
         } else {
             df <= 16 || df * 5 <= total_memories
         }
-    }, cuepack_registry, cuepack_selection);
+    });
 
     for (cue, multiplier) in &intent.cue_weight_adjustments {
         if let Some((_, weight)) = expanded_cues
@@ -383,12 +398,12 @@ struct OrderedReconstructionCandidate {
 
 fn should_run_ordered_reconstruction(
     mode: OrderedReconstructionMode,
-    query_intent: Option<&crate::facets::QueryIntent>,
+    query_plan: Option<&crate::facets::StructuralQueryPlan>,
 ) -> bool {
     match mode {
         OrderedReconstructionMode::Off => false,
         OrderedReconstructionMode::Force => true,
-        OrderedReconstructionMode::Auto => query_intent
+        OrderedReconstructionMode::Auto => query_plan
             .map(|intent| {
                 intent.labels.iter().any(|label| {
                     label == "ordered_reconstruction"
@@ -627,12 +642,12 @@ struct EvidenceCoverageCandidate {
 
 fn should_run_evidence_coverage(
     mode: EvidenceCoverageMode,
-    query_intent: Option<&crate::facets::QueryIntent>,
+    query_plan: Option<&crate::facets::StructuralQueryPlan>,
 ) -> bool {
     match mode {
         EvidenceCoverageMode::Off => false,
         EvidenceCoverageMode::Force => true,
-        EvidenceCoverageMode::Auto => query_intent
+        EvidenceCoverageMode::Auto => query_plan
             .map(|intent| {
                 intent
                     .labels
@@ -1189,13 +1204,13 @@ struct SlateRerankIntent {
 fn slate_rerank_requested(
     ordered_mode: OrderedReconstructionMode,
     evidence_mode: EvidenceCoverageMode,
-    query_intent: Option<&crate::facets::QueryIntent>,
+    query_plan: Option<&crate::facets::StructuralQueryPlan>,
 ) -> bool {
     if ordered_mode == OrderedReconstructionMode::Off && evidence_mode == EvidenceCoverageMode::Off {
         return false;
     }
 
-    query_intent
+    query_plan
         .map(|intent| {
             intent.labels.iter().any(|label| {
                 label == "ordered_reconstruction"
@@ -1208,9 +1223,9 @@ fn slate_rerank_requested(
 }
 
 fn slate_rerank_intent(
-    query_intent: Option<&crate::facets::QueryIntent>,
+    query_plan: Option<&crate::facets::StructuralQueryPlan>,
 ) -> SlateRerankIntent {
-    let Some(intent) = query_intent else {
+    let Some(intent) = query_plan else {
         return SlateRerankIntent::default();
     };
     let target_role = if intent.labels.iter().any(|label| label == "source_user") {
@@ -1459,11 +1474,11 @@ fn apply_slate_rerank(
     expanded_cues: &[(String, f64)],
     ordered_mode: OrderedReconstructionMode,
     evidence_mode: EvidenceCoverageMode,
-    query_intent: Option<&crate::facets::QueryIntent>,
+    query_plan: Option<&crate::facets::StructuralQueryPlan>,
     limit: usize,
 ) -> usize {
     if all_results.len() <= SLATE_RERANK_PROTECTED_RESULTS
-        || !slate_rerank_requested(ordered_mode, evidence_mode, query_intent)
+        || !slate_rerank_requested(ordered_mode, evidence_mode, query_plan)
     {
         return 0;
     }
@@ -1486,7 +1501,7 @@ fn apply_slate_rerank(
         return 0;
     }
 
-    let intent = slate_rerank_intent(query_intent);
+    let intent = slate_rerank_intent(query_plan);
     let mut selected = candidates
         .iter()
         .take(SLATE_RERANK_PROTECTED_RESULTS)
@@ -1614,14 +1629,14 @@ struct ParentFusionHit {
 fn should_run_parent_fusion(
     results: &[crate::engine::RecallResult],
     mode: ParentFusionMode,
-    query_intent: Option<&crate::facets::QueryIntent>,
+    query_plan: Option<&crate::facets::StructuralQueryPlan>,
     query_text: Option<&str>,
 ) -> bool {
     match mode {
         ParentFusionMode::Off => false,
         ParentFusionMode::Force => true,
         ParentFusionMode::Auto => {
-            if !query_supports_parent_fusion(query_intent, query_text) {
+            if !query_supports_parent_fusion(query_plan, query_text) {
                 return false;
             }
 
@@ -1639,10 +1654,10 @@ fn should_run_parent_fusion(
 }
 
 fn query_supports_parent_fusion(
-    query_intent: Option<&crate::facets::QueryIntent>,
+    query_plan: Option<&crate::facets::StructuralQueryPlan>,
     query_text: Option<&str>,
 ) -> bool {
-    if query_intent
+    if query_plan
         .is_some_and(|intent| intent.labels.iter().any(|label| label == "temporal_order"))
     {
         return true;
@@ -2026,12 +2041,19 @@ fn source_role_from_metadata(metadata: &HashMap<String, serde_json::Value>) -> O
 }
 
 fn source_answer_projection_requested(
-    query_intent: Option<&crate::facets::QueryIntent>,
+    query_plan: Option<&crate::facets::StructuralQueryPlan>,
     query_text: Option<&str>,
 ) -> bool {
-    let Some(intent) = query_intent else {
+    let Some(intent) = query_plan else {
         return false;
     };
+    if !intent
+        .labels
+        .iter()
+        .any(|label| label == "__semantic_facets_removed__")
+    {
+        return false;
+    }
     let has_assistant_source = intent.labels.iter().any(|label| label == "source_assistant");
     if has_assistant_source {
         return true;
@@ -2073,11 +2095,11 @@ fn query_wants_list_answer(query_text: Option<&str>) -> bool {
 
 fn source_answer_projection_cues(
     ctx: &crate::projects::ProjectContext,
-    query_intent: Option<&crate::facets::QueryIntent>,
+    query_plan: Option<&crate::facets::StructuralQueryPlan>,
     query_text: Option<&str>,
     all_results: &[crate::engine::RecallResult],
 ) -> Vec<(String, f64)> {
-    if !source_answer_projection_requested(query_intent, query_text) {
+    if !source_answer_projection_requested(query_plan, query_text) {
         return Vec::new();
     }
     if ctx.main.get_cue_frequency("source_role:assistant") == 0 {
@@ -2120,13 +2142,20 @@ fn source_answer_projection_cues(
 
 fn source_prompt_projection_cues(
     ctx: &crate::projects::ProjectContext,
-    query_intent: Option<&crate::facets::QueryIntent>,
+    query_plan: Option<&crate::facets::StructuralQueryPlan>,
     query_text: Option<&str>,
     all_results: &[crate::engine::RecallResult],
 ) -> Vec<(String, f64)> {
-    let Some(intent) = query_intent else {
+    let Some(intent) = query_plan else {
         return Vec::new();
     };
+    if !intent
+        .labels
+        .iter()
+        .any(|label| label == "__semantic_facets_removed__")
+    {
+        return Vec::new();
+    }
     if !intent.labels.iter().any(|label| label == "source_answer")
         || !intent.labels.iter().any(|label| label == "source_assistant")
     {
@@ -2176,10 +2205,15 @@ fn source_prompt_projection_cues(
 }
 
 fn user_context_projection_requested(
-    query_intent: Option<&crate::facets::QueryIntent>,
+    query_plan: Option<&crate::facets::StructuralQueryPlan>,
     query_text: Option<&str>,
 ) -> bool {
-    if query_intent
+    if !query_plan
+        .is_some_and(|intent| intent.labels.iter().any(|label| label == "__semantic_facets_removed__"))
+    {
+        return false;
+    }
+    if query_plan
         .map(|intent| {
             intent.labels.iter().any(|label| {
                 matches!(
@@ -2384,9 +2418,9 @@ fn projection_pivot_matches_context(
 }
 
 fn suppress_user_context_projection_for_intent(
-    query_intent: Option<&crate::facets::QueryIntent>,
+    query_plan: Option<&crate::facets::StructuralQueryPlan>,
 ) -> bool {
-    query_intent
+    query_plan
         .map(|intent| {
             intent
                 .labels
@@ -2398,22 +2432,27 @@ fn suppress_user_context_projection_for_intent(
 
 fn user_context_projection_cues(
     ctx: &crate::projects::ProjectContext,
-    query_intent: Option<&crate::facets::QueryIntent>,
+    query_plan: Option<&crate::facets::StructuralQueryPlan>,
     query_text: Option<&str>,
     all_results: &[crate::engine::RecallResult],
 ) -> Vec<(String, f64)> {
-    if !user_context_projection_requested(query_intent, query_text) {
+    if !query_plan
+        .is_some_and(|intent| intent.labels.iter().any(|label| label == "__semantic_facets_removed__"))
+    {
+        return Vec::new();
+    }
+    if !user_context_projection_requested(query_plan, query_text) {
         return Vec::new();
     }
     if ctx.main.get_cue_frequency("source_role:user") == 0 {
         return Vec::new();
     }
 
-    if suppress_user_context_projection_for_intent(query_intent) {
+    if suppress_user_context_projection_for_intent(query_plan) {
         return Vec::new();
     }
 
-    let allow_high_confidence_pivot = query_intent
+    let allow_high_confidence_pivot = query_plan
         .map(|intent| {
             intent
                 .labels
@@ -2608,14 +2647,14 @@ struct StandingInstructionProjection {
 }
 
 fn standing_instruction_projection_requested(
-    query_intent: Option<&crate::facets::QueryIntent>,
+    query_plan: Option<&crate::facets::StructuralQueryPlan>,
 ) -> bool {
-    query_intent
+    query_plan
         .map(|intent| {
             intent
                 .labels
                 .iter()
-                .any(|label| label == "instruction_applicable")
+                .any(|label| label == "__semantic_facets_removed__")
         })
         .unwrap_or(false)
 }
@@ -2783,10 +2822,10 @@ fn standing_instruction_projection_anchors(query_text: Option<&str>) -> Vec<Stri
 
 fn standing_instruction_projection_cues(
     ctx: &crate::projects::ProjectContext,
-    query_intent: Option<&crate::facets::QueryIntent>,
+    query_plan: Option<&crate::facets::StructuralQueryPlan>,
     query_text: Option<&str>,
 ) -> StandingInstructionProjection {
-    if !standing_instruction_projection_requested(query_intent) {
+    if !standing_instruction_projection_requested(query_plan) {
         return StandingInstructionProjection::default();
     }
     if ctx.main.get_cue_frequency("type:standing_instruction") == 0 {
@@ -2931,13 +2970,13 @@ struct PreferenceProjection {
     anchors: Vec<String>,
 }
 
-fn preference_projection_requested(query_intent: Option<&crate::facets::QueryIntent>) -> bool {
-    query_intent
+fn preference_projection_requested(query_plan: Option<&crate::facets::StructuralQueryPlan>) -> bool {
+    query_plan
         .map(|intent| {
             intent
                 .labels
                 .iter()
-                .any(|label| label == "preference_applicable")
+                .any(|label| label == "__semantic_facets_removed__")
         })
         .unwrap_or(false)
 }
@@ -3043,10 +3082,10 @@ fn preference_projection_anchors(query_text: Option<&str>) -> Vec<String> {
 
 fn preference_projection_cues(
     ctx: &crate::projects::ProjectContext,
-    query_intent: Option<&crate::facets::QueryIntent>,
+    query_plan: Option<&crate::facets::StructuralQueryPlan>,
     query_text: Option<&str>,
 ) -> PreferenceProjection {
-    if !preference_projection_requested(query_intent) {
+    if !preference_projection_requested(query_plan) {
         return PreferenceProjection::default();
     }
 
@@ -3210,12 +3249,17 @@ fn merge_preference_projection_results(
 
 fn apply_user_context_adjacency_preference(
     all_results: &mut [crate::engine::RecallResult],
-    query_intent: Option<&crate::facets::QueryIntent>,
+    query_plan: Option<&crate::facets::StructuralQueryPlan>,
     query_text: Option<&str>,
 ) {
+    if !query_plan
+        .is_some_and(|intent| intent.labels.iter().any(|label| label == "__semantic_facets_removed__"))
+    {
+        return;
+    }
     const MAX_ADJACENCY_PIVOTS: usize = 4;
 
-    if !user_context_projection_requested(query_intent, query_text) {
+    if !user_context_projection_requested(query_plan, query_text) {
         return;
     }
 
@@ -3335,23 +3379,23 @@ fn apply_user_context_adjacency_preference(
     }
 }
 
-fn decision_projection_requested(query_intent: Option<&crate::facets::QueryIntent>) -> bool {
-    query_intent
+fn decision_projection_requested(query_plan: Option<&crate::facets::StructuralQueryPlan>) -> bool {
+    query_plan
         .map(|intent| {
             intent
                 .labels
                 .iter()
-                .any(|label| label == "decision_selection")
+                .any(|label| label == "__semantic_facets_removed__")
         })
         .unwrap_or(false)
 }
 
 fn decision_projection_cues(
     ctx: &crate::projects::ProjectContext,
-    query_intent: Option<&crate::facets::QueryIntent>,
+    query_plan: Option<&crate::facets::StructuralQueryPlan>,
     all_results: &[crate::engine::RecallResult],
 ) -> Vec<(String, f64)> {
-    if !decision_projection_requested(query_intent) {
+    if !decision_projection_requested(query_plan) {
         return Vec::new();
     }
 
@@ -3383,7 +3427,7 @@ fn decision_projection_cues(
     if ctx.main.get_cue_frequency("type:selection") > 0 {
         cues.push(("type:selection".to_string(), 2.6));
     }
-    if query_intent
+    if query_plan
         .map(|intent| intent.labels.iter().any(|label| label == "naming_decision"))
         .unwrap_or(false)
         && ctx.main.get_cue_frequency("type:naming") > 0
@@ -3428,9 +3472,9 @@ fn merge_decision_projection_results(
 
 fn apply_source_role_preference(
     all_results: &mut [crate::engine::RecallResult],
-    query_intent: Option<&crate::facets::QueryIntent>,
+    query_plan: Option<&crate::facets::StructuralQueryPlan>,
 ) {
-    let Some(intent) = query_intent else {
+    let Some(intent) = query_plan else {
         return;
     };
 
@@ -3467,82 +3511,25 @@ fn apply_source_role_preference(
 }
 
 fn apply_decision_adjacency_preference(
-    all_results: &mut [crate::engine::RecallResult],
-    query_intent: Option<&crate::facets::QueryIntent>,
+    _all_results: &mut [crate::engine::RecallResult],
+    _query_plan: Option<&crate::facets::StructuralQueryPlan>,
 ) {
-    if !decision_projection_requested(query_intent) {
-        return;
-    }
-
-    let Some((pivot_idx, pivot_session, pivot_score)) = all_results
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, result)| {
-            if crate::facets::has_decision_selection_language(&result.content) {
-                return None;
-            }
-            let session = source_session_cue_from_metadata(&result.metadata)?;
-            Some((idx, session, result.score))
-        })
-        .max_by(|(_, _, left), (_, _, right)| {
-            left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
-        })
-    else {
-        return;
-    };
-
-    let mut session_positions = all_results
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, result)| {
-            if source_session_cue_from_metadata(&result.metadata).as_deref()
-                == Some(pivot_session.as_str())
-            {
-                Some((idx, result.created_at))
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-    session_positions.sort_by(|(_, left), (_, right)| {
-        left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let Some(pivot_position) = session_positions
-        .iter()
-        .position(|(idx, _)| *idx == pivot_idx)
-    else {
-        return;
-    };
-
-    for (position, (idx, _)) in session_positions.iter().enumerate().skip(pivot_position + 1) {
-        let distance = position - pivot_position;
-        if distance > 8 {
-            break;
-        }
-        if !crate::facets::has_decision_selection_language(&all_results[*idx].content) {
-            continue;
-        }
-        let bonus = pivot_score / (distance * distance) as f64;
-        all_results[*idx].score += bonus;
-        all_results[*idx].metadata.insert(
-            "decision_adjacency_boost".to_string(),
-            serde_json::json!({
-                "pivot_session": pivot_session,
-                "distance": distance,
-                "bonus": bonus
-            }),
-        );
-    }
 }
 
 fn apply_source_answer_adjacency_preference(
     all_results: &mut [crate::engine::RecallResult],
-    query_intent: Option<&crate::facets::QueryIntent>,
+    query_plan: Option<&crate::facets::StructuralQueryPlan>,
 ) {
-    let Some(intent) = query_intent else {
+    let Some(intent) = query_plan else {
         return;
     };
+    if !intent
+        .labels
+        .iter()
+        .any(|label| label == "__semantic_facets_removed__")
+    {
+        return;
+    }
     if !intent.labels.iter().any(|label| label == "source_answer")
         || !intent.labels.iter().any(|label| label == "source_assistant")
     {
@@ -3632,8 +3619,6 @@ pub struct RecallGroundedRequest {
     pub disable_alias_expansion: bool,
     #[serde(default = "default_expansion_depth")]
     pub expansion_depth: usize,
-    #[serde(default)]
-    pub cuepacks: Option<Vec<String>>,
 }
 
 fn default_true() -> bool {
@@ -3743,6 +3728,19 @@ pub struct CreateProjectRequest {
 pub struct SetWatchDirRequest {
     pub watch_dir: String,
     #[serde(default)]
+    pub included_paths: Option<Vec<String>>,
+    #[serde(default)]
+    pub ignored_patterns: Option<Vec<String>>,
+    #[serde(default)]
+    pub ignored_extensions: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PreviewDirectoryRequest {
+    pub watch_dir: String,
+    #[serde(default)]
+    pub included_paths: Option<Vec<String>>,
+    #[serde(default)]
     pub ignored_patterns: Option<Vec<String>>,
     #[serde(default)]
     pub ignored_extensions: Option<Vec<String>>,
@@ -3772,7 +3770,6 @@ pub struct EngineState {
     pub cloud_backup: Option<Arc<CloudBackupManager>>,
     pub context_signer: Option<Arc<crate::crypto::ContextSigner>>,
     pub agent_manager: Arc<crate::agent::manager::AgentManager>,
-    pub cuepack_registry: Arc<crate::cuepacks::CuePackRegistry>,
 }
 
 struct StoredMemoryOutcome {
@@ -3795,10 +3792,10 @@ pub fn routes(
     cloud_backup: Option<Arc<CloudBackupManager>>,
     context_signer: Option<Arc<crate::crypto::ContextSigner>>,
     agent_manager: Arc<crate::agent::manager::AgentManager>,
-    cuepack_registry: Arc<crate::cuepacks::CuePackRegistry>,
 ) -> Router {
     let mut router = Router::new()
         .route("/", get(root))
+        .route("/intent/classify", post(classify_intent))
         .route("/memories", post(add_memory))
         .route("/memories/batch", post(add_memories_batch))
         .route("/recall", post(recall))
@@ -3814,7 +3811,10 @@ pub fn routes(
             get(project_artifacts).post(reload_project_artifacts),
         )
         .route("/projects/:id/export", get(export_project))
-        .route("/projects/:id/watch-dir", post(set_project_watch_dir))
+        .route(
+            "/projects/:id/watch-dir",
+            get(get_project_watch_dir).post(set_project_watch_dir),
+        )
         .route("/aliases", post(add_alias).get(get_aliases))
         .route("/aliases/merge", post(merge_aliases))
         .route("/lexicon/inspect/:cue", get(lexicon_inspect))
@@ -3824,6 +3824,7 @@ pub fn routes(
         .route("/ingest/url", post(ingest_url))
         .route("/ingest/content", post(ingest_content))
         .route("/ingest/file", post(ingest_file))
+        .route("/ingest/directory/preview", post(preview_directory))
         .route("/jobs/status", get(jobs_status))
         .route("/debug/analyze-text", post(debug_analyze_text))
         .route("/metrics", get(prometheus_metrics))
@@ -3842,7 +3843,6 @@ pub fn routes(
             cloud_backup,
             context_signer,
             agent_manager,
-            cuepack_registry,
         });
 
     // Add auth middleware if enabled
@@ -3860,8 +3860,42 @@ async fn root() -> impl IntoResponse {
     Json(serde_json::json!({
         "name": "CueMap Rust Engine",
         "version": env!("CARGO_PKG_VERSION"),
-        "description": "High-performance Temporal-Associative Memory Store"
+        "description": "High-performance Temporal-Associative Memory Store",
+        "capabilities": [
+            "repository_ingestion_scope_v1",
+            "semantic_retrieval_v1",
+            "chunk_embeddings_v1",
+            "intent_classification_v1",
+            "intent_job_status_v1"
+        ]
     }))
+}
+
+async fn classify_intent(
+    State(state): State<EngineState>,
+    headers: HeaderMap,
+    Json(req): Json<IntentClassificationRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let project_id = match extract_project_id(&headers) {
+        Ok(id) => id,
+        Err(error) => return error,
+    };
+    let ctx = match state.mt_engine.get_or_create_project(project_id) {
+        Ok(ctx) => ctx,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": error})),
+            )
+        }
+    };
+    match ctx.main.classify_intent(&req.text, req.target) {
+        Ok(classification) => (StatusCode::OK, Json(serde_json::json!(classification))),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": error})),
+        ),
+    }
 }
 
 // Handlers
@@ -3894,6 +3928,26 @@ fn extract_project_id_optional(headers: &HeaderMap) -> Option<String> {
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
         .filter(|s| validate_project_id(s))
+}
+
+fn source_event_time(
+    explicit: Option<f64>,
+    metadata: Option<&HashMap<String, serde_json::Value>>,
+) -> Option<f64> {
+    if explicit.is_some() {
+        return explicit;
+    }
+
+    let value = metadata?.get("source_timestamp")?;
+    if let Some(timestamp) = value.as_f64() {
+        return (timestamp.is_finite() && timestamp >= 0.0).then_some(timestamp);
+    }
+
+    let parsed = chrono::DateTime::parse_from_rfc3339(value.as_str()?).ok()?;
+    Some(
+        parsed.timestamp() as f64
+            + f64::from(parsed.timestamp_subsec_nanos()) / 1_000_000_000.0,
+    )
 }
 
 async fn store_memory_request(
@@ -3938,13 +3992,24 @@ async fn store_memory_request(
         content,
         cues,
         source_key,
+        event_time,
         metadata,
-        cuepacks,
+        embedding,
         disable_temporal_chunking,
         async_ingest: _,
         minimal_response: _,
         trace_timing: _,
     } = req;
+
+    if event_time.is_some_and(|timestamp| !timestamp.is_finite() || timestamp < 0.0) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "error": "event_time must be a finite, non-negative Unix timestamp in seconds"
+            }),
+        ));
+    }
+    let event_time = source_event_time(event_time, metadata.as_ref());
 
     phase_start = Instant::now();
     let mut initial_cues = cues;
@@ -3993,17 +4058,31 @@ async fn store_memory_request(
     };
 
     phase_start = Instant::now();
-    let cuepack_selection = cuepacks.as_deref();
-    let memory_id = ctx.main.add_memory_with_cuepacks_and_source_key(
-        content,
-        report.accepted,
-        metadata,
-        MainStats::default(),
-        disable_temporal_chunking,
-        &state.cuepack_registry,
-        cuepack_selection,
-        source_key,
-    );
+    let memory_id = if let Some(source_key) = source_key {
+        ctx.main
+            .upsert_memory_with_source_key_and_options_and_vector(
+            source_key,
+            content,
+            report.accepted,
+            metadata,
+            None,
+            false,
+            true,
+            disable_temporal_chunking,
+            event_time,
+            embedding,
+        )
+    } else {
+        ctx.main.add_memory_with_event_time_and_vector(
+            content,
+            report.accepted,
+            metadata,
+            MainStats::default(),
+            disable_temporal_chunking,
+            event_time,
+            embedding,
+        )
+    };
     if trace_timing {
         timing.insert(
             "engine_add_ms".to_string(),
@@ -4047,6 +4126,13 @@ async fn add_memory(
 
     match store_memory_request(&state, &project_id, req).await {
         Ok(outcome) => {
+            state
+                .job_queue
+                .enqueue(Job::ClassifyMemory {
+                    project_id: project_id.clone(),
+                    memory_id: outcome.memory_id,
+                })
+                .await;
             let mut body = if outcome.minimal_response {
                 serde_json::json!({
                     "id": outcome.memory_id,
@@ -4102,6 +4188,13 @@ async fn add_memories_batch(
 
         match store_memory_request(&state, &project_id, memory_req).await {
             Ok(outcome) => {
+                state
+                    .job_queue
+                    .enqueue(Job::ClassifyMemory {
+                        project_id: project_id.clone(),
+                        memory_id: outcome.memory_id,
+                    })
+                    .await;
                 ids.push(outcome.memory_id);
                 if let Some(timings) = per_memory_timings.as_mut() {
                     timings.push(serde_json::json!({
@@ -4159,7 +4252,6 @@ async fn recall(
     let EngineState {
         ref mt_engine,
         ref job_queue,
-        ref cuepack_registry,
         ..
     } = &state;
 
@@ -4176,21 +4268,41 @@ async fn recall(
                     Err(_) => return (serde_json::json!({"project_id": project_id, "error": "Capacity reached"}), None),
                 };
 
-                // Collect cues
-                let mut cues_to_process = req.cues.clone();
+                let semantic_only =
+                    req.semantic_mode == crate::semantic::SemanticRecallMode::Semantic;
+
+                // Collect lexical cues unless this is an explicitly semantic-only query.
+                let mut cues_to_process = if semantic_only {
+                    Vec::new()
+                } else {
+                    req.cues.clone()
+                };
 
                 // Extract mandatory constraints from explicit cues
-                let mandatory_cues: Vec<String> = req.cues.iter()
-                    .map(|c| normalize_cue(c, &ctx.normalization).0)
-                    .collect();
+                let mandatory_cues: Vec<String> = if semantic_only {
+                    Vec::new()
+                } else {
+                    req.cues
+                        .iter()
+                        .map(|c| normalize_cue(c, &ctx.normalization).0)
+                        .collect()
+                };
                 let mandatory_cues_ref = if mandatory_cues.is_empty() { None } else { Some(&mandatory_cues) };
 
                 let (original_tokens, _lexicon_mids) = if let Some(text) = &req.query_text {
-                     let (resolved, lex_mids, tokens) = ctx.resolve_cues_from_text(text, false);
-                     cues_to_process.extend(resolved);
-                     (tokens, lex_mids)
+                     if semantic_only {
+                         (Vec::new(), Vec::new())
+                     } else {
+                         let (resolved, lex_mids, tokens) = ctx.resolve_cues_from_text(text, false);
+                         cues_to_process.extend(resolved);
+                         (tokens, lex_mids)
+                     }
                 } else {
-                    (req.cues.clone(), Vec::new())
+                    if semantic_only {
+                        (Vec::new(), Vec::new())
+                    } else {
+                        (req.cues.clone(), Vec::new())
+                    }
                 };
 
                 // Normalize query cues
@@ -4206,14 +4318,49 @@ async fn recall(
                 } else {
                     ctx.expand_query_cues(normalized_cues, &original_tokens)
                 };
-                let query_intent = apply_query_intent(
-                    &ctx,
-                    &state.cuepack_registry,
-                    req.cuepacks.as_deref(),
-                    req.query_text.as_deref(),
-                    req.query_time.as_deref(),
-                    &mut expanded_cues,
-                );
+                let query_plan = if semantic_only {
+                    None
+                } else {
+                    apply_query_plan(
+                        &ctx,
+                        req.query_text.as_deref(),
+                        req.query_time.as_deref(),
+                        &mut expanded_cues,
+                    )
+                };
+                let query_embedding = match req.semantic_mode {
+                    crate::semantic::SemanticRecallMode::Lexical => None,
+                    crate::semantic::SemanticRecallMode::Semantic
+                    | crate::semantic::SemanticRecallMode::Hybrid => req
+                        .query_embedding
+                        .clone()
+                        .or_else(|| {
+                            req.query_text
+                                .as_deref()
+                                .and_then(|text| ctx.main.encode_semantic_text(text))
+                        }),
+                };
+                let query_intent = if req.semantic_mode
+                    == crate::semantic::SemanticRecallMode::Hybrid
+                {
+                    req.query_text
+                        .as_deref()
+                        .and_then(|text| {
+                            query_embedding
+                                .as_deref()
+                                .and_then(|embedding| {
+                                    ctx.main.classify_intent_with_embedding(
+                                        text,
+                                        IntentTarget::Query,
+                                        embedding,
+                                    )
+                                    .ok()
+                                })
+                                .or_else(|| ctx.main.classify_intent(text, IntentTarget::Query).ok())
+                        })
+                } else {
+                    None
+                };
                 let mut all_results: Vec<crate::engine::RecallResult> = Vec::new();
                 let mut used_pivot_memory_ids = std::collections::HashSet::new();
                 let limit = req.limit.max(1);
@@ -4226,17 +4373,37 @@ async fn recall(
                         let heatmap = ctx.market_heatmap.read().ok();
                         let heatmap_ref = heatmap.as_deref();
 
-                        ctx.main.recall_weighted(
-                            expanded_cues.clone(),
-                            current_limit,
-                            false,
-                            req.min_intersection,
-                            req.expansion_depth,
-                            req.explain,
-                            req.disable_salience_bias,
-                            heatmap_ref,
-                            mandatory_cues_ref
-                        )
+                        if req.semantic_mode
+                            == crate::semantic::SemanticRecallMode::Hybrid
+                        {
+                            ctx.main
+                                .recall_weighted_with_query_embedding_rerank_only_and_intent(
+                                    expanded_cues.clone(),
+                                    current_limit,
+                                    false,
+                                    req.min_intersection,
+                                    req.expansion_depth,
+                                    req.explain,
+                                    req.disable_salience_bias,
+                                    heatmap_ref,
+                                    mandatory_cues_ref,
+                                    query_embedding.as_deref(),
+                                    query_intent.as_ref(),
+                                )
+                        } else {
+                            ctx.main.recall_weighted_with_query_embedding(
+                                expanded_cues.clone(),
+                                current_limit,
+                                false,
+                                req.min_intersection,
+                                req.expansion_depth,
+                                req.explain,
+                                req.disable_salience_bias,
+                                heatmap_ref,
+                                mandatory_cues_ref,
+                                query_embedding.as_deref(),
+                            )
+                        }
                     };
 
                     // Add hop metadata
@@ -4281,7 +4448,7 @@ async fn recall(
                 let source_answer_projection_expansions =
                     source_answer_projection_cues(
                         &ctx,
-                        query_intent.as_ref(),
+                        query_plan.as_ref(),
                         req.query_text.as_deref(),
                         &all_results,
                     );
@@ -4305,7 +4472,7 @@ async fn recall(
                 let source_prompt_projection_expansions =
                     source_prompt_projection_cues(
                         &ctx,
-                        query_intent.as_ref(),
+                        query_plan.as_ref(),
                         req.query_text.as_deref(),
                         &all_results,
                     );
@@ -4333,7 +4500,7 @@ async fn recall(
                 let user_context_projection_expansions =
                     user_context_projection_cues(
                         &ctx,
-                        query_intent.as_ref(),
+                        query_plan.as_ref(),
                         req.query_text.as_deref(),
                         &all_results,
                     );
@@ -4356,7 +4523,7 @@ async fn recall(
 
                 let standing_instruction_projection = standing_instruction_projection_cues(
                     &ctx,
-                    query_intent.as_ref(),
+                    query_plan.as_ref(),
                     req.query_text.as_deref(),
                 );
                 if !standing_instruction_projection.cues.is_empty() {
@@ -4383,7 +4550,7 @@ async fn recall(
 
                 let preference_projection = preference_projection_cues(
                     &ctx,
-                    query_intent.as_ref(),
+                    query_plan.as_ref(),
                     req.query_text.as_deref(),
                 );
                 if !preference_projection.cues.is_empty() {
@@ -4409,7 +4576,7 @@ async fn recall(
                 }
 
                 let decision_projection_expansions =
-                    decision_projection_cues(&ctx, query_intent.as_ref(), &all_results);
+                    decision_projection_cues(&ctx, query_plan.as_ref(), &all_results);
                 if !decision_projection_expansions.is_empty() {
                     let heatmap = ctx.market_heatmap.read().ok();
                     let heatmap_ref = heatmap.as_deref();
@@ -4427,14 +4594,14 @@ async fn recall(
                     merge_decision_projection_results(&mut all_results, projection_results);
                 }
 
-                apply_source_role_preference(&mut all_results, query_intent.as_ref());
-                apply_source_answer_adjacency_preference(&mut all_results, query_intent.as_ref());
+                apply_source_role_preference(&mut all_results, query_plan.as_ref());
+                apply_source_answer_adjacency_preference(&mut all_results, query_plan.as_ref());
                 apply_user_context_adjacency_preference(
                     &mut all_results,
-                    query_intent.as_ref(),
+                    query_plan.as_ref(),
                     req.query_text.as_deref(),
                 );
-                apply_decision_adjacency_preference(&mut all_results, query_intent.as_ref());
+                apply_decision_adjacency_preference(&mut all_results, query_plan.as_ref());
                 all_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
                 let results = all_results;
 
@@ -4462,8 +4629,7 @@ async fn recall(
                         serde_json::json!({
                             "query_cues": cues_to_process,
                             "expanded_cues": expanded_cues,
-                            "query_intent": query_intent,
-                            "cuepacks": req.cuepacks.clone().unwrap_or_else(|| vec!["default".to_string()]),
+                            "query_plan": query_plan,
                             "source_answer_projection_cues": source_answer_projection_expansions,
                             "source_prompt_projection_cues": source_prompt_projection_expansions,
                             "user_context_projection_cues": user_context_projection_expansions,
@@ -4540,14 +4706,22 @@ async fn recall(
 
     // Collect cues
     phase_start = Instant::now();
-    let mut cues_to_process = req.cues.clone();
+    let semantic_only = req.semantic_mode == crate::semantic::SemanticRecallMode::Semantic;
+    let mut cues_to_process = if semantic_only {
+        Vec::new()
+    } else {
+        req.cues.clone()
+    };
 
     // Extract mandatory constraints from explicit cues
-    let mandatory_cues: Vec<String> = req
-        .cues
-        .iter()
-        .map(|c| normalize_cue(c, &ctx.normalization).0)
-        .collect();
+    let mandatory_cues: Vec<String> = if semantic_only {
+        Vec::new()
+    } else {
+        req.cues
+            .iter()
+            .map(|c| normalize_cue(c, &ctx.normalization).0)
+            .collect()
+    };
     let mandatory_cues_ref = if mandatory_cues.is_empty() {
         None
     } else {
@@ -4556,7 +4730,8 @@ async fn recall(
 
     let mut lexicon_memory_ids: Vec<MemoryId> = Vec::new();
     let mut tokens_from_text = Vec::new();
-    if let Some(ref text) = req.query_text {
+    if !semantic_only {
+        if let Some(ref text) = req.query_text {
         // 1. Lexicon Recall
         let (resolved, lex_mids, tokens) = ctx.resolve_cues_from_text(text, false);
         cues_to_process.extend(resolved);
@@ -4566,9 +4741,10 @@ async fn recall(
         tokens_from_text = tokens;
         for token in &tokens_from_text {
             if !cues_to_process.contains(token) {
-                cues_to_process.push(token.clone());
-            }
+            cues_to_process.push(token.clone());
         }
+        }
+    }
     }
     if trace_timing {
         timing.insert(
@@ -4601,7 +4777,9 @@ async fn recall(
 
     // Expand aliases
     phase_start = Instant::now();
-    let original_tokens = if req.query_text.is_some() {
+    let original_tokens = if semantic_only {
+        Vec::new()
+    } else if req.query_text.is_some() {
         tokens_from_text.clone()
     } else {
         req.cues.clone()
@@ -4625,17 +4803,19 @@ async fn recall(
         );
     }
     phase_start = Instant::now();
-    let query_intent = apply_query_intent(
-        &ctx,
-        cuepack_registry,
-        req.cuepacks.as_deref(),
-        req.query_text.as_deref(),
-        req.query_time.as_deref(),
-        &mut expanded_cues,
-    );
+    let query_plan = if semantic_only {
+        None
+    } else {
+        apply_query_plan(
+            &ctx,
+            req.query_text.as_deref(),
+            req.query_time.as_deref(),
+            &mut expanded_cues,
+        )
+    };
     if trace_timing {
         timing.insert(
-            "query_intent_ms".to_string(),
+            "query_plan_ms".to_string(),
             serde_json::json!(phase_start.elapsed().as_secs_f64() * 1000.0),
         );
         timing.insert(
@@ -4647,6 +4827,41 @@ async fn recall(
     let mut used_pivot_memory_ids = std::collections::HashSet::new();
     let limit = req.limit.max(1);
     let depth = req.depth.max(1);
+    phase_start = Instant::now();
+    let query_embedding = match req.semantic_mode {
+        crate::semantic::SemanticRecallMode::Lexical => None,
+        crate::semantic::SemanticRecallMode::Semantic
+        | crate::semantic::SemanticRecallMode::Hybrid => req
+            .query_embedding
+            .clone()
+            .or_else(|| {
+                req.query_text
+                    .as_deref()
+                    .and_then(|text| ctx.main.encode_semantic_text(text))
+            }),
+    };
+    let query_intent = if req.semantic_mode == crate::semantic::SemanticRecallMode::Hybrid {
+        req.query_text
+            .as_deref()
+            .and_then(|text| {
+                query_embedding
+                    .as_deref()
+                    .and_then(|embedding| {
+                        ctx.main
+                            .classify_intent_with_embedding(text, IntentTarget::Query, embedding)
+                            .ok()
+                    })
+                    .or_else(|| ctx.main.classify_intent(text, IntentTarget::Query).ok())
+            })
+    } else {
+        None
+    };
+    if trace_timing {
+        timing.insert(
+            "semantic_query_embedding_ms".to_string(),
+            serde_json::json!(phase_start.elapsed().as_secs_f64() * 1000.0),
+        );
+    }
     let mut base_recall_timing: Option<crate::engine::RecallTimingBreakdown> = None;
     let mut base_recall_total_ms = 0.0;
     let mut base_recall_calls = 0usize;
@@ -4659,17 +4874,38 @@ async fn recall(
             let heatmap_ref = heatmap.as_deref();
 
             if trace_timing {
-                let (results, call_timing) = ctx.main.recall_weighted_with_timing(
-                    expanded_cues.clone(),
-                    current_limit,
-                    false,
-                    req.min_intersection,
-                    req.expansion_depth,
-                    req.explain,
+                let (results, call_timing) = if req.semantic_mode
+                    == crate::semantic::SemanticRecallMode::Hybrid
+                {
+                    ctx.main
+                        .recall_weighted_with_query_embedding_rerank_only_with_intent_with_timing(
+                            expanded_cues.clone(),
+                            current_limit,
+                            false,
+                            req.min_intersection,
+                            req.expansion_depth,
+                            req.explain,
                             req.disable_salience_bias,
-                    heatmap_ref,
-                    mandatory_cues_ref,
-                );
+                            heatmap_ref,
+                            mandatory_cues_ref,
+                            query_embedding.as_deref(),
+                            query_intent.as_ref(),
+                        )
+                } else {
+                    ctx.main
+                        .recall_weighted_with_query_embedding_with_timing(
+                            expanded_cues.clone(),
+                            current_limit,
+                            false,
+                            req.min_intersection,
+                            req.expansion_depth,
+                            req.explain,
+                            req.disable_salience_bias,
+                            heatmap_ref,
+                            mandatory_cues_ref,
+                            query_embedding.as_deref(),
+                        )
+                };
                 base_recall_total_ms += call_timing.total_ms;
                 base_recall_calls += 1;
                 if base_recall_timing.is_none() {
@@ -4677,17 +4913,35 @@ async fn recall(
                 }
                 results
             } else {
-                ctx.main.recall_weighted(
-                    expanded_cues.clone(),
-                    current_limit,
-                    false,
-                    req.min_intersection,
-                    req.expansion_depth,
-                    req.explain,
+                if req.semantic_mode == crate::semantic::SemanticRecallMode::Hybrid {
+                    ctx.main
+                        .recall_weighted_with_query_embedding_rerank_only_and_intent(
+                            expanded_cues.clone(),
+                            current_limit,
+                            false,
+                            req.min_intersection,
+                            req.expansion_depth,
+                            req.explain,
                             req.disable_salience_bias,
-                    heatmap_ref,
-                    mandatory_cues_ref,
-                )
+                            heatmap_ref,
+                            mandatory_cues_ref,
+                            query_embedding.as_deref(),
+                            query_intent.as_ref(),
+                        )
+                } else {
+                    ctx.main.recall_weighted_with_query_embedding(
+                        expanded_cues.clone(),
+                        current_limit,
+                        false,
+                        req.min_intersection,
+                        req.expansion_depth,
+                        req.explain,
+                        req.disable_salience_bias,
+                        heatmap_ref,
+                        mandatory_cues_ref,
+                        query_embedding.as_deref(),
+                    )
+                }
             }
         };
 
@@ -4737,7 +4991,7 @@ async fn recall(
     phase_start = Instant::now();
     let source_answer_projection_expansions = source_answer_projection_cues(
         &ctx,
-        query_intent.as_ref(),
+        query_plan.as_ref(),
         req.query_text.as_deref(),
         &all_results,
     );
@@ -4771,7 +5025,7 @@ async fn recall(
     phase_start = Instant::now();
     let source_prompt_projection_expansions = source_prompt_projection_cues(
         &ctx,
-        query_intent.as_ref(),
+        query_plan.as_ref(),
         req.query_text.as_deref(),
         &all_results,
     );
@@ -4809,7 +5063,7 @@ async fn recall(
     phase_start = Instant::now();
     let user_context_projection_expansions = user_context_projection_cues(
         &ctx,
-        query_intent.as_ref(),
+        query_plan.as_ref(),
         req.query_text.as_deref(),
         &all_results,
     );
@@ -4843,7 +5097,7 @@ async fn recall(
     phase_start = Instant::now();
     let standing_instruction_projection = standing_instruction_projection_cues(
         &ctx,
-        query_intent.as_ref(),
+        query_plan.as_ref(),
         req.query_text.as_deref(),
     );
     if !standing_instruction_projection.cues.is_empty() {
@@ -4881,7 +5135,7 @@ async fn recall(
     phase_start = Instant::now();
     let preference_projection = preference_projection_cues(
         &ctx,
-        query_intent.as_ref(),
+        query_plan.as_ref(),
         req.query_text.as_deref(),
     );
     if !preference_projection.cues.is_empty() {
@@ -4918,7 +5172,7 @@ async fn recall(
 
     phase_start = Instant::now();
     let decision_projection_expansions =
-        decision_projection_cues(&ctx, query_intent.as_ref(), &all_results);
+        decision_projection_cues(&ctx, query_plan.as_ref(), &all_results);
     if !decision_projection_expansions.is_empty() {
         let heatmap = ctx.market_heatmap.read().ok();
         let heatmap_ref = heatmap.as_deref();
@@ -4957,7 +5211,7 @@ async fn recall(
             .map(|artifacts| {
                 artifacts.gap_expansions(
                     &expanded_cues,
-                    query_intent.as_ref(),
+                    query_plan.as_ref(),
                     &original_tokens,
                     |cue| ctx.main.get_cue_frequency(cue) > 0,
                     req.cuebridge_gap_limit,
@@ -5013,7 +5267,7 @@ async fn recall(
 
     phase_start = Instant::now();
     let mut ordered_reconstruction_applied_count = 0usize;
-    if should_run_ordered_reconstruction(req.ordered_reconstruction, query_intent.as_ref()) {
+    if should_run_ordered_reconstruction(req.ordered_reconstruction, query_plan.as_ref()) {
         let ordered_results = ordered_reconstruction_results(
             &ctx,
             &expanded_cues,
@@ -5041,7 +5295,7 @@ async fn recall(
 
     phase_start = Instant::now();
     let mut evidence_coverage_applied_count = 0usize;
-    if should_run_evidence_coverage(req.evidence_coverage, query_intent.as_ref()) {
+    if should_run_evidence_coverage(req.evidence_coverage, query_plan.as_ref()) {
         let evidence_results = evidence_coverage_results(
             &ctx,
             &expanded_cues,
@@ -5072,7 +5326,7 @@ async fn recall(
     if should_run_parent_fusion(
         &all_results,
         req.parent_fusion,
-        query_intent.as_ref(),
+        query_plan.as_ref(),
         req.query_text.as_deref(),
     ) {
         let fusion_limit = req
@@ -5114,21 +5368,21 @@ async fn recall(
     }
 
     phase_start = Instant::now();
-    apply_source_role_preference(&mut all_results, query_intent.as_ref());
-    apply_source_answer_adjacency_preference(&mut all_results, query_intent.as_ref());
+    apply_source_role_preference(&mut all_results, query_plan.as_ref());
+    apply_source_answer_adjacency_preference(&mut all_results, query_plan.as_ref());
     apply_user_context_adjacency_preference(
         &mut all_results,
-        query_intent.as_ref(),
+        query_plan.as_ref(),
         req.query_text.as_deref(),
     );
-    apply_decision_adjacency_preference(&mut all_results, query_intent.as_ref());
+    apply_decision_adjacency_preference(&mut all_results, query_plan.as_ref());
     let slate_rerank_applied_count = apply_slate_rerank(
         &ctx,
         &mut all_results,
         &expanded_cues,
         req.ordered_reconstruction,
         req.evidence_coverage,
-        query_intent.as_ref(),
+        query_plan.as_ref(),
         limit,
     );
     all_results.sort_by(|a, b| {
@@ -5227,8 +5481,7 @@ async fn recall(
             "explain": {
                 "query_cues": cues_to_process,
                 "expanded_cues": expanded_cues,
-                "query_intent": query_intent,
-                "cuepacks": req.cuepacks.clone().unwrap_or_else(|| vec!["default".to_string()]),
+                "query_plan": query_plan,
                 "source_answer_projection_cues": source_answer_projection_expansions,
                 "source_prompt_projection_cues": source_prompt_projection_expansions,
                 "user_context_projection_cues": user_context_projection_expansions,
@@ -5481,27 +5734,82 @@ async fn jobs_status(
     headers: HeaderMap,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let project_id_opt = extract_project_id_optional(&headers);
-    let EngineState { job_queue, .. } = state;
+    let EngineState { mt_engine, job_queue, .. } = state;
 
     if let Some(project_id) = project_id_opt {
-        if let Some(session) = job_queue.get_session(&project_id) {
-            let progress = session.get_progress();
-            (StatusCode::OK, Json(serde_json::json!(progress)))
-        } else {
-            // No active session - return idle status
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "phase": "idle",
+        let mut status = if let Some(session) = job_queue.get_session(&project_id) {
+            serde_json::to_value(session.get_progress()).unwrap_or_else(|_| {
+                serde_json::json!({
+                    "phase": "processing",
                     "writes_completed": 0,
-                    "writes_total": 0
-                })),
-            )
+                    "writes_total": 0,
+                    "intent_completed": 0,
+                    "intent_total": 0,
+                    "intent_failed": 0
+                })
+            })
+        } else {
+            serde_json::json!({
+                "phase": "idle",
+                "writes_completed": 0,
+                "writes_total": 0,
+                "intent_completed": 0,
+                "intent_total": 0,
+                "intent_failed": 0
+            })
+        };
+
+        match mt_engine.get_or_create_project(project_id) {
+            Ok(ctx) => add_intent_coverage_to_status(&mut status, &ctx),
+            Err(error) => {
+                if let Some(object) = status.as_object_mut() {
+                    object.insert("intent_ready".to_string(), serde_json::json!(false));
+                    object.insert("intent_error".to_string(), serde_json::json!(error));
+                }
+            }
         }
+        (StatusCode::OK, Json(status))
     } else {
         // Global progress
         let progress = job_queue.get_global_progress();
         (StatusCode::OK, Json(serde_json::json!(progress)))
+    }
+}
+
+fn add_intent_coverage_to_status(status: &mut serde_json::Value, ctx: &crate::projects::ProjectContext) {
+    let (memory_total, annotated, missing, stale) = ctx.main.intent_coverage();
+    let job_intent_total = status
+        .get("intent_total")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let job_intent_completed = status
+        .get("intent_completed")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let job_intent_failed = status
+        .get("intent_failed")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let jobs_ready = job_intent_total == 0
+        || (job_intent_completed >= job_intent_total && job_intent_failed == 0);
+    let coverage_ready = missing == 0 && annotated >= memory_total;
+    if let Some(object) = status.as_object_mut() {
+        object.insert("intent_memory_total".to_string(), serde_json::json!(memory_total));
+        object.insert("intent_annotated".to_string(), serde_json::json!(annotated));
+        object.insert("intent_missing".to_string(), serde_json::json!(missing));
+        object.insert("intent_stale".to_string(), serde_json::json!(stale));
+        object.insert(
+            "intent_ready".to_string(),
+            serde_json::json!(coverage_ready && jobs_ready),
+        );
+        object.insert(
+            "intent_model_version".to_string(),
+            serde_json::json!(ctx.main.config.semantic.model_version),
+        );
+        object.insert(
+            "intent_taxonomy_version".to_string(),
+            serde_json::json!(crate::intent::INTENT_TAXONOMY_VERSION),
+        );
     }
 }
 
@@ -5530,7 +5838,6 @@ async fn recall_grounded(
 
     let EngineState {
         ref mt_engine,
-        ref cuepack_registry,
         ..
     } = &state;
     let start = Instant::now();
@@ -5559,10 +5866,8 @@ async fn recall_grounded(
         // tokens were computed in step 1, reuse them!
         ctx.expand_query_cues(normalized_cues, &tokens)
     };
-    let _query_intent = apply_query_intent(
+    let _query_plan = apply_query_plan(
         &ctx,
-        cuepack_registry,
-        req.cuepacks.as_deref(),
         Some(&req.query_text),
         None,
         &mut expanded_cues,
@@ -5818,6 +6123,123 @@ async fn export_project(
     )
 }
 
+fn normalize_included_paths(paths: Option<Vec<String>>) -> Result<Vec<String>, String> {
+    let mut normalized = Vec::new();
+    for raw_path in paths.unwrap_or_default() {
+        let candidate = raw_path.trim().replace('\\', "/");
+        let candidate = candidate.trim_matches('/');
+        if candidate.is_empty() || candidate == "." {
+            return Ok(Vec::new());
+        }
+
+        let mut components = Vec::new();
+        for component in std::path::Path::new(candidate).components() {
+            match component {
+                std::path::Component::Normal(value) => {
+                    components.push(value.to_string_lossy().to_string())
+                }
+                std::path::Component::CurDir => {}
+                _ => {
+                    return Err(format!(
+                        "Included path '{}' must stay within the watch directory",
+                        raw_path
+                    ))
+                }
+            }
+        }
+        if !components.is_empty() {
+            normalized.push(components.join("/"));
+        }
+    }
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
+}
+
+fn normalize_ignored_extensions(extensions: Option<Vec<String>>) -> Vec<String> {
+    let mut normalized: Vec<String> = extensions
+        .unwrap_or_default()
+        .into_iter()
+        .map(|extension| extension.trim().trim_start_matches('.').to_lowercase())
+        .filter(|extension| !extension.is_empty())
+        .collect();
+    normalized.sort();
+    normalized.dedup();
+    normalized
+}
+
+async fn preview_directory(
+    State(state): State<EngineState>,
+    Json(req): Json<PreviewDirectoryRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let watch_dir = match std::fs::canonicalize(&req.watch_dir) {
+        Ok(path) if path.is_dir() => path.to_string_lossy().to_string(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("Directory '{}' does not exist", req.watch_dir)
+                })),
+            )
+        }
+    };
+    let included_paths = match normalize_included_paths(req.included_paths) {
+        Ok(paths) => paths,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": error})),
+            )
+        }
+    };
+    let config = crate::agent::AgentConfig {
+        project_id: "directory-preview".to_string(),
+        watch_dir,
+        throttle_ms: 0,
+        state_file: None,
+        included_paths,
+        ignored_patterns: req.ignored_patterns.unwrap_or_default(),
+        ignored_extensions: normalize_ignored_extensions(req.ignored_extensions),
+    };
+    let ingester = crate::agent::ingester::Ingester::new(config, state.job_queue);
+
+    match ingester.preview_scope() {
+        Ok(preview) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(preview).unwrap_or_else(|error| {
+                serde_json::json!({"error": format!("Failed to serialize preview: {}", error)})
+            })),
+        ),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": error})),
+        ),
+    }
+}
+
+async fn get_project_watch_dir(
+    State(state): State<EngineState>,
+    Path(project_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match state.mt_engine.load_project_meta(&project_id) {
+        Ok(meta) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "project_id": project_id,
+                "initialized": meta.agent_enabled && meta.watch_dir.is_some(),
+                "watch_dir": meta.watch_dir,
+                "included_paths": meta.included_paths,
+                "ignored_patterns": meta.ignored_patterns,
+                "ignored_extensions": meta.ignored_extensions,
+            })),
+        ),
+        Err(error) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": error})),
+        ),
+    }
+}
+
 async fn set_project_watch_dir(
     State(state): State<EngineState>,
     Path(project_id): Path<String>,
@@ -5827,6 +6249,7 @@ async fn set_project_watch_dir(
         mt_engine,
         read_only,
         agent_manager,
+        data_dir,
         ..
     } = state;
 
@@ -5839,19 +6262,50 @@ async fn set_project_watch_dir(
         );
     }
 
-    match mt_engine.set_project_watch_dir(&project_id, Some(req.watch_dir.clone())) {
+    let watch_dir = match std::fs::canonicalize(&req.watch_dir) {
+        Ok(path) if path.is_dir() => path.to_string_lossy().to_string(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("Directory '{}' does not exist", req.watch_dir)
+                })),
+            )
+        }
+    };
+    let included_paths = match normalize_included_paths(req.included_paths) {
+        Ok(paths) => paths,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": error})),
+            )
+        }
+    };
+    let ignored_patterns = req.ignored_patterns.unwrap_or_default();
+    let ignored_extensions = normalize_ignored_extensions(req.ignored_extensions);
+
+    match mt_engine.set_project_watch_config(
+        &project_id,
+        watch_dir.clone(),
+        included_paths.clone(),
+        ignored_patterns.clone(),
+        ignored_extensions.clone(),
+    ) {
         Ok(_) => {
             // Immediately start/update the agent
             let agent_config = crate::agent::AgentConfig {
                 project_id: project_id.clone(),
-                watch_dir: req.watch_dir.clone(),
+                watch_dir: watch_dir.clone(),
                 throttle_ms: 100, // Small throttle to prevent CPU pinning
-                state_file: Some(std::path::PathBuf::from(format!(
-                    "./snapshots/{}_agent_state.json",
-                    project_id
-                ))),
-                ignored_patterns: req.ignored_patterns.unwrap_or_default(),
-                ignored_extensions: req.ignored_extensions.unwrap_or_default(),
+                state_file: Some(
+                    std::path::PathBuf::from(data_dir)
+                        .join("snapshots")
+                        .join(format!("{}_agent_state.json", project_id)),
+                ),
+                included_paths: included_paths.clone(),
+                ignored_patterns: ignored_patterns.clone(),
+                ignored_extensions: ignored_extensions.clone(),
             };
 
             // Spawn the starting of the agent securely
@@ -5866,7 +6320,11 @@ async fn set_project_watch_dir(
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "status": "updated",
-                    "project_id": project_id
+                    "project_id": project_id,
+                    "watch_dir": watch_dir,
+                    "included_paths": included_paths,
+                    "ignored_patterns": ignored_patterns,
+                    "ignored_extensions": ignored_extensions,
                 })),
             )
         }
@@ -6408,6 +6866,7 @@ async fn recall_web(
         watch_dir: String::new(),
         throttle_ms: 0,
         state_file: None,
+        included_paths: Vec::new(),
         ignored_patterns: Vec::new(),
         ignored_extensions: Vec::new(),
     };
@@ -6552,6 +7011,7 @@ async fn recall_web(
                 watch_dir: String::new(),
                 throttle_ms: 0,
                 state_file: None,
+                included_paths: Vec::new(),
                 ignored_patterns: Vec::new(),
                 ignored_extensions: Vec::new(),
             };
@@ -6639,6 +7099,7 @@ async fn ingest_url(
         watch_dir: String::new(), // Not used for API-driven ingestion
         throttle_ms: 0,
         state_file: None,
+        included_paths: Vec::new(),
         ignored_patterns: Vec::new(),
         ignored_extensions: Vec::new(),
     };
@@ -6708,6 +7169,11 @@ pub struct IngestContentRequest {
     pub metadata: Option<HashMap<String, serde_json::Value>>,
     #[serde(default)]
     pub structural_cues: Vec<String>,
+    /// Optional one-vector-per-produced-chunk embeddings. Supplying one
+    /// vector for the whole document is intentionally not supported because
+    /// it would make every chunk share the same semantic representation.
+    #[serde(default)]
+    pub embeddings: Option<Vec<Vec<f32>>>,
     #[serde(default)]
     pub segmenter: TextSegmenterMode,
     #[serde(default)]
@@ -6731,8 +7197,6 @@ pub struct DebugAnalyzeTextRequest {
     pub existing_cues: Vec<String>,
     #[serde(default)]
     pub available_cues: Vec<String>,
-    #[serde(default)]
-    pub cuepacks: Option<Vec<String>>,
     #[serde(default)]
     pub filename: Option<String>,
     #[serde(default)]
@@ -6831,30 +7295,21 @@ async fn debug_analyze_text(
         })
         .collect();
 
-    let cuepack_selection = req.cuepacks.as_deref();
     let core_facets = crate::facets::extract_memory_facets_core(
         &req.text,
         req.metadata.as_ref(),
         &req.existing_cues,
     );
-    let memory_facets = crate::facets::extract_memory_facets_with_cuepacks(
-        &req.text,
-        req.metadata.as_ref(),
-        &req.existing_cues,
-        &state.cuepack_registry,
-        cuepack_selection,
-    );
+    let memory_facets = core_facets.clone();
     let available_cues: HashSet<String> = req
         .available_cues
         .iter()
         .map(|cue| cue.to_lowercase())
         .collect();
-    let query_intent = crate::facets::compile_query_intent_with_cuepacks(
+    let query_plan = crate::facets::compile_query_plan_with_reference_time(
         &req.text,
         req.query_time.as_deref(),
         |cue| ctx.main.get_cue_frequency(cue) > 0 || available_cues.contains(&cue.to_lowercase()),
-        &state.cuepack_registry,
-        cuepack_selection,
     );
 
     let segmenter_config = segmenter_config_from_debug_request(&req);
@@ -6891,7 +7346,7 @@ async fn debug_analyze_text(
             "normalized_cues": normalized_cues,
             "core_facets": core_facets,
             "memory_facets": memory_facets,
-            "query_intent": query_intent,
+            "query_plan": query_plan,
             "segmenter": req.segmenter,
             "filename": req.filename.unwrap_or_else(|| "content.txt".to_string()),
             "chunks": chunk_summaries,
@@ -6970,19 +7425,41 @@ async fn ingest_content(
         );
     }
 
+    if let Some(embeddings) = req.embeddings.as_ref() {
+        if embeddings.len() != chunks.len() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "embeddings length ({}) must match produced chunk count ({})",
+                        embeddings.len(),
+                        chunks.len()
+                    )
+                })),
+            );
+        }
+    }
+
     // Create an ingester for this request
     let config = AgentConfig {
         project_id: project_id.clone(),
         watch_dir: String::new(),
         throttle_ms: 0,
         state_file: None,
+        included_paths: Vec::new(),
         ignored_patterns: Vec::new(),
         ignored_extensions: Vec::new(),
     };
     let mut ingester = Ingester::new(config, job_queue);
 
     match ingester
-        .process_chunks_with_metadata(chunks, &project_id, &source, req.metadata)
+        .process_chunks_with_metadata_and_embeddings(
+            chunks,
+            &project_id,
+            &source,
+            req.metadata,
+            req.embeddings,
+        )
         .await
     {
         Ok(memory_ids) => (
@@ -7133,11 +7610,10 @@ async fn ingest_file(
                 file_path: source.clone(),
                 structural_cues: chunk.structural_cues.clone(),
                 metadata: None,
+                embedding: None,
                 category: chunk.category,
             })
             .await;
-
-        session.write_complete();
 
         source_keys.push(source_key);
     }
@@ -7554,1519 +8030,5 @@ async fn backup_delete(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::TuningConfig;
-    use crate::normalization::NormalizationConfig;
-    use crate::projects::ProjectContext;
-    use crate::structures::MainStats;
-    use crate::taxonomy::Taxonomy;
-    use std::collections::HashMap;
-    use std::sync::Arc;
-
-    fn recall_result(
-        match_integrity: f64,
-        intersection_count: usize,
-    ) -> crate::engine::RecallResult {
-        crate::engine::RecallResult {
-            memory_id: 1,
-            content: "content".to_string(),
-            score: 1.0,
-            match_integrity,
-            intersection_count,
-            recency_score: 0.0,
-            reinforcement_score: 0.0,
-            salience_score: 0.0,
-            created_at: 0.0,
-            metadata: HashMap::new(),
-            explain: None,
-        }
-    }
-
-    #[test]
-    fn parent_fusion_defaults_off_and_force_runs() {
-        let results = vec![recall_result(0.95, 4)];
-
-        assert!(!should_run_parent_fusion(
-            &results,
-            ParentFusionMode::Off,
-            None,
-            Some("summarize the key points"),
-        ));
-        assert!(should_run_parent_fusion(
-            &results,
-            ParentFusionMode::Force,
-            None,
-            Some("plain lookup"),
-        ));
-    }
-
-    #[test]
-    fn parent_fusion_auto_requires_synthesis_query() {
-        assert!(!should_run_parent_fusion(
-            &[recall_result(0.4, 1)],
-            ParentFusionMode::Auto,
-            None,
-            Some("what is my favorite dessert"),
-        ));
-        assert!(should_run_parent_fusion(
-            &[recall_result(0.4, 1)],
-            ParentFusionMode::Auto,
-            None,
-            Some("summarize my language service progress in order"),
-        ));
-    }
-
-    #[test]
-    fn ordered_reconstruction_is_opt_in_and_intent_gated() {
-        let mut intent = crate::facets::QueryIntent::default();
-        assert!(!should_run_ordered_reconstruction(
-            OrderedReconstructionMode::Off,
-            Some(&intent)
-        ));
-        assert!(should_run_ordered_reconstruction(
-            OrderedReconstructionMode::Force,
-            None
-        ));
-        assert!(!should_run_ordered_reconstruction(
-            OrderedReconstructionMode::Auto,
-            Some(&intent)
-        ));
-
-        intent.labels.push("ordered_reconstruction".to_string());
-        assert!(should_run_ordered_reconstruction(
-            OrderedReconstructionMode::Auto,
-            Some(&intent)
-        ));
-
-        intent.labels.clear();
-        intent
-            .labels
-            .push("multi_evidence_collection".to_string());
-        assert!(should_run_ordered_reconstruction(
-            OrderedReconstructionMode::Auto,
-            Some(&intent)
-        ));
-    }
-
-    #[test]
-    fn evidence_coverage_is_opt_in_and_intent_gated() {
-        let mut intent = crate::facets::QueryIntent::default();
-        assert!(!should_run_evidence_coverage(
-            EvidenceCoverageMode::Off,
-            Some(&intent)
-        ));
-        assert!(should_run_evidence_coverage(
-            EvidenceCoverageMode::Force,
-            None
-        ));
-        assert!(!should_run_evidence_coverage(
-            EvidenceCoverageMode::Auto,
-            Some(&intent)
-        ));
-
-        intent.labels.push("multi_evidence_summary".to_string());
-        assert!(should_run_evidence_coverage(
-            EvidenceCoverageMode::Auto,
-            Some(&intent)
-        ));
-
-        intent.labels.clear();
-        intent
-            .labels
-            .push("multi_evidence_collection".to_string());
-        assert!(should_run_evidence_coverage(
-            EvidenceCoverageMode::Auto,
-            Some(&intent)
-        ));
-
-        intent.labels.clear();
-        intent.labels.push("ordered_reconstruction".to_string());
-        assert!(should_run_evidence_coverage(
-            EvidenceCoverageMode::Auto,
-            Some(&intent)
-        ));
-    }
-
-    #[test]
-    fn evidence_coverage_selects_diverse_session_evidence() {
-        let ctx = ProjectContext::new(
-            NormalizationConfig::default(),
-            Taxonomy::default(),
-            Arc::new(TuningConfig::default()),
-            crate::config::ServerConfig::default(),
-            "evidence_coverage_test".to_string(),
-        );
-
-        let add_turn = |session: &str,
-                        order: i64,
-                        plan: Option<i64>,
-                        content: &str,
-                        cues: &[&str]|
-         -> MemoryId {
-            let mut metadata = HashMap::new();
-            metadata.insert("source_session_id".to_string(), serde_json::json!(session));
-            metadata.insert("source_turn_index".to_string(), serde_json::json!(order));
-            if let Some(plan) = plan {
-                metadata.insert("source_plan_idx".to_string(), serde_json::json!(plan));
-            }
-            ctx.main.add_memory(
-                content.to_string(),
-                cues.iter().map(|cue| cue.to_string()).collect(),
-                Some(metadata),
-                MainStats::default(),
-                false,
-            )
-        };
-
-        let integration = add_turn(
-            "thread-a",
-            1,
-            Some(1),
-            "We designed language service integration.",
-            &["source_role:assistant", "type:answer", "has:list", "language", "service", "integration", "architecture"],
-        );
-        let deployment = add_turn(
-            "thread-a",
-            2,
-            Some(2),
-            "We planned deployment and release steps.",
-            &["source_role:assistant", "type:answer", "deployment", "release", "service"],
-        );
-        let performance = add_turn(
-            "thread-a",
-            3,
-            Some(3),
-            "We improved performance and latency.",
-            &["source_role:assistant", "type:answer", "performance", "latency", "service"],
-        );
-        let unrelated = add_turn(
-            "thread-a",
-            4,
-            Some(4),
-            "We discussed a lunch menu.",
-            &["source_role:assistant", "type:answer", "lunch", "menu"],
-        );
-        let distractor = add_turn(
-            "thread-b",
-            1,
-            Some(2),
-            "A different deployment discussion happened elsewhere.",
-            &["source_role:assistant", "type:answer", "deployment", "service"],
-        );
-
-        let pivot = crate::engine::RecallResult {
-            memory_id: deployment,
-            content: "We planned deployment and release steps.".to_string(),
-            score: 140.0,
-            match_integrity: 0.6,
-            intersection_count: 2,
-            recency_score: 1.0,
-            reinforcement_score: 0.0,
-            salience_score: 0.0,
-            created_at: 0.0,
-            metadata: HashMap::new(),
-            explain: None,
-        };
-        let pivot_score = pivot.score;
-
-        let evidence = evidence_coverage_results(
-            &ctx,
-            &[
-                ("language".to_string(), 1.0),
-                ("service".to_string(), 0.8),
-                ("integration".to_string(), 1.0),
-                ("deployment".to_string(), 1.0),
-                ("performance".to_string(), 1.0),
-            ],
-            &[pivot],
-            10,
-            100,
-            1,
-            true,
-        );
-
-        let ids: Vec<MemoryId> = evidence.iter().map(|result| result.memory_id).collect();
-        assert!(ids.contains(&integration));
-        assert!(ids.contains(&deployment));
-        assert!(ids.contains(&performance));
-        assert!(!ids.contains(&unrelated));
-        assert!(!ids.contains(&distractor));
-        assert!(evidence
-            .iter()
-            .all(|result| result.metadata.contains_key("evidence_coverage")));
-        assert!(evidence.iter().any(|result| result
-            .metadata
-            .contains_key("evidence_coverage_source_plan")));
-        assert!(evidence
-            .iter()
-            .all(|result| result.score < pivot_score));
-    }
-
-    #[test]
-    fn slate_rerank_is_mode_and_intent_gated() {
-        let mut intent = crate::facets::QueryIntent::default();
-        intent.labels.push("multi_evidence_summary".to_string());
-
-        assert!(!slate_rerank_requested(
-            OrderedReconstructionMode::Off,
-            EvidenceCoverageMode::Off,
-            Some(&intent)
-        ));
-        assert!(slate_rerank_requested(
-            OrderedReconstructionMode::Auto,
-            EvidenceCoverageMode::Off,
-            Some(&intent)
-        ));
-
-        let plain_intent = crate::facets::QueryIntent::default();
-        assert!(!slate_rerank_requested(
-            OrderedReconstructionMode::Auto,
-            EvidenceCoverageMode::Off,
-            Some(&plain_intent)
-        ));
-    }
-
-    #[test]
-    fn slate_rerank_promotes_coverage_candidates_below_protected_top() {
-        let ctx = ProjectContext::new(
-            NormalizationConfig::default(),
-            Taxonomy::default(),
-            Arc::new(TuningConfig::default()),
-            crate::config::ServerConfig::default(),
-            "slate_rerank_test".to_string(),
-        );
-
-        let add_turn = |session: &str,
-                        order: i64,
-                        role: &str,
-                        content: &str,
-                        cues: &[&str]|
-         -> MemoryId {
-            let mut metadata = HashMap::new();
-            metadata.insert("source_session_id".to_string(), serde_json::json!(session));
-            metadata.insert("source_turn_index".to_string(), serde_json::json!(order));
-            metadata.insert("source_role".to_string(), serde_json::json!(role));
-            ctx.main.add_memory(
-                content.to_string(),
-                cues.iter().map(|cue| cue.to_string()).collect(),
-                Some(metadata),
-                MainStats::default(),
-                false,
-            )
-        };
-        let make_result = |memory_id: MemoryId,
-                           score: f64,
-                           metadata: HashMap<String, serde_json::Value>|
-         -> crate::engine::RecallResult {
-            crate::engine::RecallResult {
-                memory_id,
-                content: format!("memory {memory_id}"),
-                score,
-                match_integrity: 0.2,
-                intersection_count: 1,
-                recency_score: 0.0,
-                reinforcement_score: 0.0,
-                salience_score: 0.0,
-                created_at: 0.0,
-                metadata,
-                explain: None,
-            }
-        };
-
-        let protected_a = add_turn(
-            "thread-a",
-            1,
-            "assistant",
-            "Protected top result A.",
-            &["overview"],
-        );
-        let protected_b = add_turn(
-            "thread-a",
-            2,
-            "assistant",
-            "Protected top result B.",
-            &["overview"],
-        );
-        let protected_c = add_turn(
-            "thread-a",
-            3,
-            "assistant",
-            "Protected top result C.",
-            &["overview"],
-        );
-        let mut results = vec![
-            make_result(protected_a, 300.0, HashMap::new()),
-            make_result(protected_b, 290.0, HashMap::new()),
-            make_result(protected_c, 280.0, HashMap::new()),
-        ];
-
-        for rank in 0..25 {
-            let id = add_turn(
-                "thread-b",
-                rank,
-                "assistant",
-                "Generic distractor.",
-                &["generic", "discussion"],
-            );
-            results.push(make_result(id, 270.0 - rank as f64, HashMap::new()));
-        }
-
-        let relevant_late = add_turn(
-            "thread-a",
-            24,
-            "assistant",
-            "We covered deployment and latency.",
-            &["deployment", "latency", "service", "type:answer"],
-        );
-        let relevant_later = add_turn(
-            "thread-a",
-            40,
-            "assistant",
-            "We also covered integration architecture.",
-            &["integration", "architecture", "service", "type:answer"],
-        );
-        let mut evidence_metadata = HashMap::new();
-        evidence_metadata.insert("evidence_coverage".to_string(), serde_json::json!(true));
-        results.push(make_result(relevant_late, 150.0, evidence_metadata.clone()));
-        results.push(make_result(relevant_later, 149.0, evidence_metadata));
-
-        let mut intent = crate::facets::QueryIntent::default();
-        intent.labels.push("multi_evidence_summary".to_string());
-        let moved = apply_slate_rerank(
-            &ctx,
-            &mut results,
-            &[
-                ("deployment".to_string(), 1.0),
-                ("latency".to_string(), 1.0),
-                ("integration".to_string(), 1.0),
-                ("architecture".to_string(), 1.0),
-                ("service".to_string(), 0.8),
-            ],
-            OrderedReconstructionMode::Auto,
-            EvidenceCoverageMode::Off,
-            Some(&intent),
-            100,
-        );
-        results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        let ids: Vec<MemoryId> = results.iter().map(|result| result.memory_id).collect();
-        assert_eq!(&ids[..3], &[protected_a, protected_b, protected_c]);
-        assert!(ids.iter().position(|id| *id == relevant_late).unwrap() < 20);
-        assert!(ids.iter().position(|id| *id == relevant_later).unwrap() < 20);
-        assert!(moved >= 2);
-        assert!(results
-            .iter()
-            .any(|result| result.memory_id == relevant_late
-                && result.metadata.contains_key("slate_rerank")));
-    }
-
-    #[test]
-    fn slate_rerank_promotes_strong_summary_candidates_without_helper_metadata() {
-        let ctx = ProjectContext::new(
-            NormalizationConfig::default(),
-            Taxonomy::default(),
-            Arc::new(TuningConfig::default()),
-            crate::config::ServerConfig::default(),
-            "slate_rerank_summary_signal_test".to_string(),
-        );
-
-        let add_turn = |session: &str,
-                        order: i64,
-                        content: &str,
-                        cues: &[&str]|
-         -> MemoryId {
-            let mut metadata = HashMap::new();
-            metadata.insert("source_session_id".to_string(), serde_json::json!(session));
-            metadata.insert("source_turn_index".to_string(), serde_json::json!(order));
-            ctx.main.add_memory(
-                content.to_string(),
-                cues.iter().map(|cue| cue.to_string()).collect(),
-                Some(metadata),
-                MainStats::default(),
-                false,
-            )
-        };
-        let make_result = |memory_id: MemoryId,
-                           score: f64|
-         -> crate::engine::RecallResult {
-            crate::engine::RecallResult {
-                memory_id,
-                content: format!("memory {memory_id}"),
-                score,
-                match_integrity: 0.2,
-                intersection_count: 1,
-                recency_score: 0.0,
-                reinforcement_score: 0.0,
-                salience_score: 0.0,
-                created_at: 0.0,
-                metadata: HashMap::new(),
-                explain: None,
-            }
-        };
-
-        let protected_a = add_turn("thread-a", 1, "Protected A.", &["overview"]);
-        let protected_b = add_turn("thread-a", 2, "Protected B.", &["overview"]);
-        let protected_c = add_turn("thread-a", 3, "Protected C.", &["overview"]);
-        let mut results = vec![
-            make_result(protected_a, 300.0),
-            make_result(protected_b, 290.0),
-            make_result(protected_c, 280.0),
-        ];
-
-        for rank in 0..25 {
-            let id = add_turn(
-                "thread-b",
-                rank,
-                "Generic project discussion.",
-                &["generic", "project"],
-            );
-            results.push(make_result(id, 270.0 - rank as f64));
-        }
-
-        let relevant = add_turn(
-            "thread-c",
-            8,
-            "City autocomplete in the weather app uses a debounced API lookup.",
-            &["city", "autocomplete", "weather", "app", "lookup"],
-        );
-        results.push(make_result(relevant, 150.0));
-
-        let mut intent = crate::facets::QueryIntent::default();
-        intent.labels.push("multi_evidence_summary".to_string());
-        let moved = apply_slate_rerank(
-            &ctx,
-            &mut results,
-            &[
-                ("city".to_string(), 1.0),
-                ("autocomplete".to_string(), 1.0),
-                ("weather".to_string(), 1.0),
-                ("app".to_string(), 0.8),
-                ("implementation".to_string(), 0.8),
-            ],
-            OrderedReconstructionMode::Auto,
-            EvidenceCoverageMode::Off,
-            Some(&intent),
-            100,
-        );
-        results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        let ids: Vec<MemoryId> = results.iter().map(|result| result.memory_id).collect();
-        assert_eq!(&ids[..3], &[protected_a, protected_b, protected_c]);
-        assert!(ids.iter().position(|id| *id == relevant).unwrap() < 20);
-        assert!(moved >= 1);
-        assert!(results
-            .iter()
-            .any(|result| result.memory_id == relevant
-                && result.metadata.contains_key("slate_rerank")));
-    }
-
-    #[test]
-    fn slate_rerank_promotes_standing_instruction_for_instruction_query() {
-        let ctx = ProjectContext::new(
-            NormalizationConfig::default(),
-            Taxonomy::default(),
-            Arc::new(TuningConfig::default()),
-            crate::config::ServerConfig::default(),
-            "slate_rerank_instruction_test".to_string(),
-        );
-
-        let add_turn = |content: &str, cues: &[&str]| -> MemoryId {
-            ctx.main.add_memory(
-                content.to_string(),
-                cues.iter().map(|cue| cue.to_string()).collect(),
-                None,
-                MainStats::default(),
-                false,
-            )
-        };
-        let make_result = |memory_id: MemoryId,
-                           score: f64|
-         -> crate::engine::RecallResult {
-            crate::engine::RecallResult {
-                memory_id,
-                content: format!("memory {memory_id}"),
-                score,
-                match_integrity: 0.1,
-                intersection_count: 1,
-                recency_score: 0.0,
-                reinforcement_score: 0.0,
-                salience_score: 0.0,
-                created_at: 0.0,
-                metadata: HashMap::new(),
-                explain: None,
-            }
-        };
-
-        let protected_a = add_turn("Protected A", &["layout"]);
-        let protected_b = add_turn("Protected B", &["layout"]);
-        let protected_c = add_turn("Protected C", &["layout"]);
-        let mut results = vec![
-            make_result(protected_a, 300.0),
-            make_result(protected_b, 290.0),
-            make_result(protected_c, 280.0),
-        ];
-        for rank in 0..45 {
-            let id = add_turn("Generic layout discussion", &["layout", "project"]);
-            results.push(make_result(id, 270.0 - rank as f64));
-        }
-
-        let instruction = add_turn(
-            "Always include semantic HTML5 tag usage details when I ask about markup structure.",
-            &[
-                "type:standing_instruction",
-                "instruction_trigger:markup",
-                "semantic",
-                "html5",
-                "tag",
-                "structure",
-            ],
-        );
-        results.push(make_result(instruction, 120.0));
-
-        let mut intent = crate::facets::QueryIntent::default();
-        intent.labels.push("instruction_applicable".to_string());
-        let moved = apply_slate_rerank(
-            &ctx,
-            &mut results,
-            &[
-                ("blog".to_string(), 1.0),
-                ("layout".to_string(), 1.0),
-                ("header".to_string(), 1.0),
-                ("navigation".to_string(), 1.0),
-                ("footer".to_string(), 1.0),
-            ],
-            OrderedReconstructionMode::Auto,
-            EvidenceCoverageMode::Off,
-            Some(&intent),
-            100,
-        );
-        results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        let ids: Vec<MemoryId> = results.iter().map(|result| result.memory_id).collect();
-        assert_eq!(&ids[..3], &[protected_a, protected_b, protected_c]);
-        assert!(ids.iter().position(|id| *id == instruction).unwrap() < 20);
-        assert!(moved >= 1);
-        assert!(results
-            .iter()
-            .any(|result| result.memory_id == instruction
-                && result.metadata.contains_key("slate_rerank")));
-    }
-
-    #[test]
-    fn slate_rerank_orders_selected_ordered_candidates_after_selection() {
-        let ctx = ProjectContext::new(
-            NormalizationConfig::default(),
-            Taxonomy::default(),
-            Arc::new(TuningConfig::default()),
-            crate::config::ServerConfig::default(),
-            "slate_rerank_ordered_test".to_string(),
-        );
-
-        let add_turn = |session: &str, order: i64, content: &str, cues: &[&str]| -> MemoryId {
-            let mut metadata = HashMap::new();
-            metadata.insert("source_session_id".to_string(), serde_json::json!(session));
-            metadata.insert("source_turn_index".to_string(), serde_json::json!(order));
-            ctx.main.add_memory(
-                content.to_string(),
-                cues.iter().map(|cue| cue.to_string()).collect(),
-                Some(metadata),
-                MainStats::default(),
-                false,
-            )
-        };
-        let make_result = |memory_id: MemoryId,
-                           score: f64,
-                           ordered: bool|
-         -> crate::engine::RecallResult {
-            let mut metadata = HashMap::new();
-            if ordered {
-                metadata.insert("ordered_reconstruction".to_string(), serde_json::json!(true));
-            }
-            crate::engine::RecallResult {
-                memory_id,
-                content: format!("memory {memory_id}"),
-                score,
-                match_integrity: 0.3,
-                intersection_count: 1,
-                recency_score: 0.0,
-                reinforcement_score: 0.0,
-                salience_score: 0.0,
-                created_at: 0.0,
-                metadata,
-                explain: None,
-            }
-        };
-
-        let protected_a = add_turn("thread-a", 1, "Protected A", &["bootstrap"]);
-        let protected_b = add_turn("thread-a", 2, "Protected B", &["bootstrap"]);
-        let protected_c = add_turn("thread-a", 3, "Protected C", &["bootstrap"]);
-        let mut results = vec![
-            make_result(protected_a, 300.0, false),
-            make_result(protected_b, 290.0, false),
-            make_result(protected_c, 280.0, false),
-        ];
-        for rank in 0..25 {
-            let id = add_turn("thread-b", rank, "Generic project discussion", &["project"]);
-            results.push(make_result(id, 270.0 - rank as f64, false));
-        }
-
-        let first = add_turn("thread-a", 5, "Bootstrap CDN setup", &["bootstrap", "cdn"]);
-        let second = add_turn("thread-a", 7, "Bootstrap form classes", &["bootstrap", "form"]);
-        let third = add_turn("thread-a", 11, "Bootstrap modal upgrade", &["bootstrap", "modal"]);
-        results.push(make_result(third, 151.0, true));
-        results.push(make_result(first, 150.0, true));
-        results.push(make_result(second, 149.0, true));
-
-        let mut intent = crate::facets::QueryIntent::default();
-        intent.labels.push("ordered_reconstruction".to_string());
-        let moved = apply_slate_rerank(
-            &ctx,
-            &mut results,
-            &[
-                ("bootstrap".to_string(), 1.0),
-                ("cdn".to_string(), 1.0),
-                ("form".to_string(), 1.0),
-                ("modal".to_string(), 1.0),
-            ],
-            OrderedReconstructionMode::Auto,
-            EvidenceCoverageMode::Off,
-            Some(&intent),
-            100,
-        );
-        results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        let ids: Vec<MemoryId> = results.iter().map(|result| result.memory_id).collect();
-        assert_eq!(&ids[..3], &[protected_a, protected_b, protected_c]);
-        let first_pos = ids.iter().position(|id| *id == first).unwrap();
-        let second_pos = ids.iter().position(|id| *id == second).unwrap();
-        let third_pos = ids.iter().position(|id| *id == third).unwrap();
-        assert!(first_pos < 20);
-        assert!(second_pos < 20);
-        assert!(third_pos < 20);
-        assert!(first_pos < second_pos);
-        assert!(second_pos < third_pos);
-        assert!(moved >= 3);
-    }
-
-    #[test]
-    fn ordered_reconstruction_scans_selected_session_in_order() {
-        let ctx = ProjectContext::new(
-            NormalizationConfig::default(),
-            Taxonomy::default(),
-            Arc::new(TuningConfig::default()),
-            crate::config::ServerConfig::default(),
-            "ordered_test".to_string(),
-        );
-
-        let add_turn = |session: &str, order: i64, content: &str, cues: &[&str]| -> MemoryId {
-            let mut metadata = HashMap::new();
-            metadata.insert("source_session_id".to_string(), serde_json::json!(session));
-            metadata.insert("source_turn_index".to_string(), serde_json::json!(order));
-            ctx.main.add_memory(
-                content.to_string(),
-                cues.iter().map(|cue| cue.to_string()).collect(),
-                Some(metadata),
-                MainStats::default(),
-                false,
-            )
-        };
-
-        let first = add_turn(
-            "thread-a",
-            1,
-            "We integrated the language detection service.",
-            &["language", "service", "integrate"],
-        );
-        let second = add_turn(
-            "thread-a",
-            2,
-            "Then we optimized translation service latency.",
-            &["translation", "service", "optimize"],
-        );
-        let distractor = add_turn(
-            "thread-b",
-            1,
-            "A different service discussion happened elsewhere.",
-            &["translation", "service", "discussion"],
-        );
-
-        let mut pivot_metadata = HashMap::new();
-        pivot_metadata.insert("source_session_id".to_string(), serde_json::json!("thread-a"));
-        pivot_metadata.insert("source_turn_index".to_string(), serde_json::json!(2));
-        let pivot = crate::engine::RecallResult {
-            memory_id: second,
-            content: "Then we optimized translation service latency.".to_string(),
-            score: 120.0,
-            match_integrity: 0.6,
-            intersection_count: 2,
-            recency_score: 1.0,
-            reinforcement_score: 0.0,
-            salience_score: 0.0,
-            created_at: 0.0,
-            metadata: pivot_metadata,
-            explain: None,
-        };
-
-        let ordered = ordered_reconstruction_results(
-            &ctx,
-            &[
-                ("language".to_string(), 1.0),
-                ("translation".to_string(), 1.0),
-                ("service".to_string(), 1.0),
-                ("optimize".to_string(), 1.0),
-            ],
-            &[pivot],
-            10,
-            100,
-            1,
-            true,
-        );
-
-        let ids: Vec<MemoryId> = ordered.iter().map(|result| result.memory_id).collect();
-        assert!(ids.contains(&first));
-        assert!(ids.contains(&second));
-        assert!(!ids.contains(&distractor));
-        assert!(ordered
-            .iter()
-            .all(|result| result.metadata.contains_key("ordered_reconstruction")));
-    }
-
-    #[test]
-    fn segment_link_requires_parent_and_chunk_idx() {
-        assert_eq!(
-            segment_link_from_cues(&[
-                "parent:abc".to_string(),
-                "chunk_idx:7".to_string(),
-                "source_role:user".to_string(),
-            ]),
-            Some(("parent:abc".to_string(), 7))
-        );
-        assert_eq!(
-            segment_link_from_cues(&["parent:abc".to_string()]),
-            None
-        );
-    }
-
-    #[test]
-    fn stitched_chunk_join_removes_overlapped_sentences() {
-        let joined = join_stitched_chunk_contents(&[
-            "First sentence. Shared sentence.".to_string(),
-            "Shared sentence. Final sentence.".to_string(),
-        ]);
-
-        assert_eq!(joined, "First sentence. Shared sentence. Final sentence.");
-    }
-
-    #[test]
-    fn source_answer_projection_requires_assistant_answer_language() {
-        let source_answer_intent = crate::facets::QueryIntent {
-            labels: vec!["source_answer".to_string()],
-            ..Default::default()
-        };
-        assert!(!source_answer_projection_requested(
-            Some(&source_answer_intent),
-            Some("What did I buy last week?")
-        ));
-        assert!(source_answer_projection_requested(
-            Some(&source_answer_intent),
-            Some("What was in the assistant answer?")
-        ));
-
-        let assistant_intent = crate::facets::QueryIntent {
-            labels: vec!["source_assistant".to_string()],
-            ..Default::default()
-        };
-        assert!(source_answer_projection_requested(
-            Some(&assistant_intent),
-            Some("Can you remind me?")
-        ));
-    }
-
-    #[test]
-    fn user_context_projection_targets_advice_without_source_intents() {
-        assert!(user_context_projection_requested(
-            None,
-            Some("I've been having trouble with battery life. Any tips?")
-        ));
-
-        let recommendation_intent = crate::facets::QueryIntent {
-            labels: vec!["recommendation".to_string()],
-            ..Default::default()
-        };
-        assert!(user_context_projection_requested(
-            Some(&recommendation_intent),
-            Some("Can you recommend something for me?")
-        ));
-        assert!(!user_context_projection_requested(
-            Some(&recommendation_intent),
-            Some("Can you suggest a hotel for my upcoming trip to Miami?")
-        ));
-
-        for label in ["source_answer", "source_assistant", "source_user", "decision_selection"] {
-            let intent = crate::facets::QueryIntent {
-                labels: vec![label.to_string()],
-                ..Default::default()
-            };
-            assert!(
-                !user_context_projection_requested(Some(&intent), Some("Any tips?")),
-                "source-specific query should not request user context projection for {label}"
-            );
-        }
-    }
-
-    #[test]
-    fn user_context_projection_anchors_require_specific_context() {
-        let phone_accessory_anchors =
-            projection_anchor_cues(Some("Can you suggest some useful accessories for my phone?"));
-        assert_eq!(
-            phone_accessory_anchors,
-            vec!["accessory".to_string(), "phone".to_string()]
-        );
-
-        let media_recommendation_anchors =
-            projection_anchor_cues(Some("Can you recommend a show or movie for me to watch tonight?"));
-        assert!(media_recommendation_anchors.is_empty());
-
-        let troubleshooting_anchors = projection_anchor_cues(Some(
-            "I've been having trouble with the battery life on my phone lately. Any tips?",
-        ));
-        assert!(troubleshooting_anchors.contains(&"battery".to_string()));
-        assert!(troubleshooting_anchors.contains(&"life".to_string()));
-        assert!(troubleshooting_anchors.contains(&"phone".to_string()));
-
-        let navigation_anchors = projection_anchor_cues(Some(
-            "I'm a bit anxious about getting around Tokyo. Do you have any helpful tips?",
-        ));
-        assert_eq!(
-            navigation_anchors,
-            vec!["anxious".to_string(), "tokyo".to_string()]
-        );
-
-        let relevant = "assistant: A power bank can help with phone battery life while traveling.";
-        let incidental = "assistant: You could schedule a phone call during the morning.";
-
-        assert!(projection_anchor_match_count(relevant, &troubleshooting_anchors) >= 2);
-        assert!(projection_anchor_match_count(incidental, &troubleshooting_anchors) < 2);
-        assert!(!projection_pivot_matches_context(
-            "assistant: A camera bag can complement your Sony setup.",
-            4,
-            &phone_accessory_anchors,
-            true
-        ));
-        assert!(!projection_pivot_matches_context(
-            "assistant: A camera bag can complement your Sony setup.",
-            3,
-            &phone_accessory_anchors,
-            true
-        ));
-        assert!(projection_pivot_matches_context(
-            "assistant: A phone case is a useful accessory for your phone setup.",
-            2,
-            &phone_accessory_anchors,
-            true
-        ));
-        assert!(!projection_pivot_matches_context(
-            "assistant: A camera bag can complement your Sony setup.",
-            4,
-            &phone_accessory_anchors,
-            false
-        ));
-
-        let vague_interest_intent = crate::facets::QueryIntent {
-            labels: vec!["vague_interest_recommendation".to_string()],
-            ..Default::default()
-        };
-        assert!(suppress_user_context_projection_for_intent(Some(
-            &vague_interest_intent
-        )));
-    }
-
-    #[test]
-    fn standing_instruction_projection_is_cuepack_intent_gated() {
-        let ctx = ProjectContext::new(
-            NormalizationConfig::default(),
-            Taxonomy::default(),
-            Arc::new(TuningConfig::default()),
-            crate::config::ServerConfig::default(),
-            "standing_instruction_test".to_string(),
-        );
-
-        let instruction_id = ctx.main.add_memory(
-            "Always provide fallback strategies when I ask about error handling in API services."
-                .to_string(),
-            vec!["api".to_string(), "error_handling".to_string()],
-            None,
-            MainStats::default(),
-            false,
-        );
-
-        assert!(standing_instruction_projection_cues(
-            &ctx,
-            None,
-            Some("What are some ways I can manage problems that come up when my API calls fail?")
-        )
-        .cues
-        .is_empty());
-
-        let intent = crate::facets::QueryIntent {
-            labels: vec!["instruction_applicable".to_string()],
-            ..Default::default()
-        };
-        let projection = standing_instruction_projection_cues(
-            &ctx,
-            Some(&intent),
-            Some("What are some ways I can manage problems that come up when my API calls fail?"),
-        );
-
-        assert!(projection
-            .cues
-            .iter()
-            .any(|(cue, _)| cue == "type:standing_instruction"));
-        assert!(projection
-            .cues
-            .iter()
-            .any(|(cue, _)| cue == "instruction_trigger:api"));
-
-        let projection_results = ctx.main.recall_weighted(
-            projection.cues.clone(),
-            10,
-            false,
-            None,
-            1,
-            false,
-            true,
-            None,
-            None,
-        );
-        let mut all_results = Vec::new();
-        merge_standing_instruction_projection_results(
-            &ctx,
-            &mut all_results,
-            projection_results,
-            &projection.anchors,
-        );
-
-        let projected = all_results
-            .iter()
-            .find(|result| result.memory_id == instruction_id)
-            .expect("standing instruction should be projected");
-        assert!(projected
-            .metadata
-            .contains_key("standing_instruction_projection"));
-    }
-
-    #[test]
-    fn standing_instruction_projection_uses_morphological_anchor_variants() {
-        let anchors =
-            standing_instruction_projection_anchors(Some("How do I implement a login feature?"));
-        assert!(anchors.contains(&"implement".to_string()));
-        assert!(anchors.contains(&"implementation".to_string()));
-
-        let ctx = ProjectContext::new(
-            NormalizationConfig::default(),
-            Taxonomy::default(),
-            Arc::new(TuningConfig::default()),
-            crate::config::ServerConfig::default(),
-            "standing_instruction_morphology_test".to_string(),
-        );
-
-        ctx.main.add_memory(
-            "Always format code snippets with syntax highlighting when I ask about implementation details."
-                .to_string(),
-            Vec::new(),
-            None,
-            MainStats::default(),
-            false,
-        );
-
-        let intent = crate::facets::QueryIntent {
-            labels: vec!["instruction_applicable".to_string()],
-            ..Default::default()
-        };
-        let projection = standing_instruction_projection_cues(
-            &ctx,
-            Some(&intent),
-            Some("How do I implement a login feature?"),
-        );
-
-        assert!(projection
-            .cues
-            .iter()
-            .any(|(cue, _)| cue == "instruction_trigger:implementation"));
-    }
-
-    #[test]
-    fn standing_instruction_projection_maps_chance_to_probability_anchor() {
-        let anchors = standing_instruction_projection_anchors(Some(
-            "How do I calculate the chance of drawing a red card from a standard deck?",
-        ));
-        assert!(anchors.contains(&"chance".to_string()));
-        assert!(anchors.contains(&"probability".to_string()));
-
-        let ctx = ProjectContext::new(
-            NormalizationConfig::default(),
-            Taxonomy::default(),
-            Arc::new(TuningConfig::default()),
-            crate::config::ServerConfig::default(),
-            "standing_instruction_probability_test".to_string(),
-        );
-
-        ctx.main.add_memory(
-            "Always provide step-by-step explanations with concrete examples when I ask about probability concepts."
-                .to_string(),
-            Vec::new(),
-            None,
-            MainStats::default(),
-            false,
-        );
-
-        let intent = crate::facets::QueryIntent {
-            labels: vec!["instruction_applicable".to_string()],
-            ..Default::default()
-        };
-        let projection = standing_instruction_projection_cues(
-            &ctx,
-            Some(&intent),
-            Some("How do I calculate the chance of drawing a red card from a standard deck?"),
-        );
-
-        assert!(projection
-            .cues
-            .iter()
-            .any(|(cue, _)| cue == "instruction_trigger:probability"));
-    }
-
-    #[test]
-    fn preference_projection_is_cuepack_intent_gated() {
-        let ctx = ProjectContext::new(
-            NormalizationConfig::default(),
-            Taxonomy::default(),
-            Arc::new(TuningConfig::default()),
-            crate::config::ServerConfig::default(),
-            "preference_projection_test".to_string(),
-        );
-
-        let memory_id = ctx.main.add_memory(
-            "I prefer geometric vector methods over purely trigonometric formulas for clarity, so can you explain how to use vector algebra to calculate geodesic length between two points on a sphere?".to_string(),
-            vec![
-                "sphere".to_string(),
-                "two_point".to_string(),
-                "vector".to_string(),
-                "geodesic".to_string(),
-            ],
-            None,
-            MainStats::default(),
-            false,
-        );
-
-        let query = "Can you show me how to find the shortest path between two points on a sphere?";
-        assert!(preference_projection_cues(&ctx, None, Some(query))
-            .cues
-            .is_empty());
-
-        let intent = crate::facets::QueryIntent {
-            labels: vec!["preference_applicable".to_string()],
-            ..Default::default()
-        };
-        let projection = preference_projection_cues(&ctx, Some(&intent), Some(query));
-
-        assert!(projection
-            .cues
-            .iter()
-            .any(|(cue, _)| cue == "type:preference"));
-        assert!(projection
-            .cues
-            .iter()
-            .any(|(cue, _)| cue == "sphere" || cue == "two_point"));
-
-        let projection_results = ctx.main.recall_weighted(
-            projection.cues.clone(),
-            10,
-            false,
-            None,
-            1,
-            false,
-            true,
-            None,
-            None,
-        );
-        let mut all_results = Vec::new();
-        merge_preference_projection_results(
-            &ctx,
-            &mut all_results,
-            projection_results,
-            &projection.anchors,
-        );
-
-        let projected = all_results
-            .iter()
-            .find(|result| result.memory_id == memory_id)
-            .expect("matching preference should be projected");
-        assert!(projected.metadata.contains_key("preference_projection"));
-    }
-
-    #[test]
-    fn user_context_projection_merge_marks_and_updates_results() {
-        let mut existing = recall_result(0.2, 1);
-        existing.memory_id = 10;
-        existing.score = 10.0;
-
-        let mut projected = recall_result(0.8, 3);
-        projected.memory_id = 10;
-        projected.score = 50.0;
-        projected
-            .metadata
-            .insert("source_role".to_string(), serde_json::json!("user"));
-
-        let mut all_results = vec![existing];
-        merge_user_context_projection_results(&mut all_results, vec![projected]);
-
-        assert_eq!(all_results.len(), 1);
-        assert_eq!(all_results[0].score, 50.0);
-        assert!(all_results[0]
-            .metadata
-            .contains_key("user_context_projection"));
-    }
-
-    #[test]
-    fn source_prompt_projection_filters_short_scaffold_prompts() {
-        let mut scaffold = recall_result(0.1, 1);
-        scaffold.memory_id = 20;
-        scaffold.content = "user: Write another scene".to_string();
-        scaffold.score = 5000.0;
-        scaffold
-            .metadata
-            .insert("source_role".to_string(), serde_json::json!("user"));
-
-        let mut source = recall_result(0.8, 9);
-        source.memory_id = 21;
-        source.content =
-            "user: Write a comedy movie scene. Andy wears an untidy stained white shirt."
-                .to_string();
-        source.score = 600.0;
-        source
-            .metadata
-            .insert("source_role".to_string(), serde_json::json!("user"));
-
-        let mut results = Vec::new();
-        merge_source_prompt_projection_results(
-            &mut results,
-            vec![scaffold, source],
-            Some("what was Andy wearing in the script you wrote for the comedy movie scene?"),
-        );
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].memory_id, 21);
-        assert!(results[0]
-            .metadata
-            .contains_key("source_prompt_projection"));
-        assert!(results[0].score > 600.0);
-    }
-
-    #[test]
-    fn user_context_adjacency_prefers_nearest_prior_user_turn() {
-        let mut expected = recall_result(0.2, 1);
-        expected.memory_id = 30;
-        expected.score = 100.0;
-        expected.created_at = 1.0;
-        expected
-            .metadata
-            .insert("source_role".to_string(), serde_json::json!("user"));
-        expected.metadata.insert(
-            "source_session_id".to_string(),
-            serde_json::json!("conversation-3"),
-        );
-        expected
-            .metadata
-            .insert("user_context_projection".to_string(), serde_json::json!(true));
-
-        let mut pivot = recall_result(0.6, 2);
-        pivot.memory_id = 31;
-        pivot.score = 500.0;
-        pivot.created_at = 2.0;
-        pivot
-            .metadata
-            .insert("source_role".to_string(), serde_json::json!("assistant"));
-        pivot.metadata.insert(
-            "source_session_id".to_string(),
-            serde_json::json!("conversation-3"),
-        );
-
-        let mut later_user = recall_result(0.2, 1);
-        later_user.memory_id = 32;
-        later_user.score = 900.0;
-        later_user.created_at = 3.0;
-        later_user
-            .metadata
-            .insert("source_role".to_string(), serde_json::json!("user"));
-        later_user.metadata.insert(
-            "source_session_id".to_string(),
-            serde_json::json!("conversation-3"),
-        );
-        later_user
-            .metadata
-            .insert("user_context_projection".to_string(), serde_json::json!(true));
-
-        let mut results = vec![expected, pivot, later_user];
-        apply_user_context_adjacency_preference(&mut results, None, Some("Any tips?"));
-
-        assert!(results[0].score > results[2].score);
-        assert!(results[0]
-            .metadata
-            .contains_key("user_context_adjacency_boost"));
-        assert!(!results[2]
-            .metadata
-            .contains_key("user_context_adjacency_boost"));
-    }
-
-    #[test]
-    fn user_context_adjacency_considers_bounded_multiple_pivots() {
-        fn with_source(
-            mut result: crate::engine::RecallResult,
-            role: &str,
-            session: &str,
-            projected: bool,
-        ) -> crate::engine::RecallResult {
-            result
-                .metadata
-                .insert("source_role".to_string(), serde_json::json!(role));
-            result.metadata.insert(
-                "source_session_id".to_string(),
-                serde_json::json!(session),
-            );
-            if projected {
-                result
-                    .metadata
-                    .insert("user_context_projection".to_string(), serde_json::json!(true));
-            }
-            result
-        }
-
-        let mut first_user = recall_result(0.2, 1);
-        first_user.memory_id = 40;
-        first_user.score = 90.0;
-        first_user.created_at = 1.0;
-
-        let mut first_pivot = recall_result(0.6, 2);
-        first_pivot.memory_id = 41;
-        first_pivot.score = 900.0;
-        first_pivot.created_at = 2.0;
-
-        let mut second_user = recall_result(0.2, 1);
-        second_user.memory_id = 42;
-        second_user.score = 80.0;
-        second_user.created_at = 3.0;
-
-        let mut second_pivot = recall_result(0.6, 2);
-        second_pivot.memory_id = 43;
-        second_pivot.score = 800.0;
-        second_pivot.created_at = 4.0;
-
-        let mut expected = recall_result(0.2, 1);
-        expected.memory_id = 44;
-        expected.score = 70.0;
-        expected.created_at = 5.0;
-
-        let mut expected_pivot = recall_result(0.6, 2);
-        expected_pivot.memory_id = 45;
-        expected_pivot.score = 500.0;
-        expected_pivot.created_at = 6.0;
-
-        let mut results = vec![
-            with_source(first_user, "user", "conversation-7", true),
-            with_source(first_pivot, "assistant", "conversation-7", false),
-            with_source(second_user, "user", "conversation-7", true),
-            with_source(second_pivot, "assistant", "conversation-7", false),
-            with_source(expected, "user", "conversation-7", true),
-            with_source(expected_pivot, "assistant", "conversation-7", false),
-        ];
-
-        apply_user_context_adjacency_preference(
-            &mut results,
-            None,
-            Some("Any helpful tips?"),
-        );
-
-        assert!(results[4]
-            .metadata
-            .contains_key("user_context_adjacency_boost"));
-        assert!(results[4].score > 70.0);
-    }
-
-    #[test]
-    fn source_session_cue_is_derived_from_structured_metadata() {
-        let mut metadata = HashMap::new();
-        metadata.insert(
-            "source_session_id".to_string(),
-            serde_json::json!("Answer ShareGPT hA7AkP3 0"),
-        );
-
-        assert_eq!(
-            source_session_cue_from_metadata(&metadata).as_deref(),
-            Some("source_session:answer_sharegpt_ha7akp3_0")
-        );
-    }
-
-    #[test]
-    fn list_answer_detection_covers_ordinals_without_topic_words() {
-        assert!(query_wants_list_answer(Some(
-            "What was the 7th item you listed?"
-        )));
-        assert!(query_wants_list_answer(Some(
-            "Remind me what was in the list you provided."
-        )));
-        assert!(!query_wants_list_answer(Some(
-            "What did I purchase yesterday?"
-        )));
-    }
-
-    #[test]
-    fn source_role_preference_demotes_structured_role_mismatches() {
-        let mut user_result = recall_result(1.0, 3);
-        user_result.score = 100.0;
-        user_result
-            .metadata
-            .insert("source_role".to_string(), serde_json::json!("user"));
-
-        let mut assistant_result = recall_result(1.0, 3);
-        assistant_result.memory_id = 50;
-        assistant_result.score = 80.0;
-        assistant_result
-            .metadata
-            .insert("source_role".to_string(), serde_json::json!("assistant"));
-
-        let intent = crate::facets::QueryIntent {
-            labels: vec!["source_assistant".to_string()],
-            ..Default::default()
-        };
-        let mut results = vec![user_result, assistant_result];
-        apply_source_role_preference(&mut results, Some(&intent));
-
-        assert!(results[0].score < results[1].score);
-        assert_eq!(results[1].score, 80.0);
-    }
-
-    #[test]
-    fn source_answer_adjacency_prefers_immediate_assistant_reply() {
-        let mut pivot = recall_result(1.0, 5);
-        pivot.score = 1000.0;
-        pivot.created_at = 1.0;
-        pivot.metadata
-            .insert("source_role".to_string(), serde_json::json!("user"));
-        pivot.metadata.insert(
-            "source_session_id".to_string(),
-            serde_json::json!("conversation-1"),
-        );
-
-        let mut immediate_answer = recall_result(1.0, 2);
-        immediate_answer.memory_id = 60;
-        immediate_answer.score = 300.0;
-        immediate_answer.created_at = 2.0;
-        immediate_answer
-            .metadata
-            .insert("source_role".to_string(), serde_json::json!("assistant"));
-        immediate_answer.metadata.insert(
-            "source_session_id".to_string(),
-            serde_json::json!("conversation-1"),
-        );
-
-        let mut later_answer = recall_result(1.0, 8);
-        later_answer.memory_id = 61;
-        later_answer.score = 1000.0;
-        later_answer.created_at = 6.0;
-        later_answer
-            .metadata
-            .insert("source_role".to_string(), serde_json::json!("assistant"));
-        later_answer.metadata.insert(
-            "source_session_id".to_string(),
-            serde_json::json!("conversation-1"),
-        );
-
-        let intent = crate::facets::QueryIntent {
-            labels: vec!["source_answer".to_string(), "source_assistant".to_string()],
-            ..Default::default()
-        };
-        let mut results = vec![pivot, immediate_answer, later_answer];
-        apply_source_answer_adjacency_preference(&mut results, Some(&intent));
-
-        assert!(results[1].score > results[2].score);
-        assert!(results[1]
-            .metadata
-            .contains_key("source_answer_adjacency_boost"));
-    }
-
-    #[test]
-    fn decision_adjacency_prefers_selection_after_proposal() {
-        let mut proposal = recall_result(1.0, 6);
-        proposal.score = 3000.0;
-        proposal.created_at = 1.0;
-        proposal.content =
-            "assistant: Here are some potential names: Radik, Nucleus, Fissionator.".to_string();
-        proposal
-            .metadata
-            .insert("source_role".to_string(), serde_json::json!("assistant"));
-        proposal.metadata.insert(
-            "source_session_id".to_string(),
-            serde_json::json!("conversation-2"),
-        );
-
-        let mut selected = recall_result(1.0, 1);
-        selected.memory_id = 70;
-        selected.score = 300.0;
-        selected.created_at = 2.0;
-        selected.content = "user: Fissionator is a really cool one.".to_string();
-        selected
-            .metadata
-            .insert("source_role".to_string(), serde_json::json!("user"));
-        selected.metadata.insert(
-            "source_session_id".to_string(),
-            serde_json::json!("conversation-2"),
-        );
-
-        let mut later = recall_result(1.0, 4);
-        later.memory_id = 71;
-        later.score = 900.0;
-        later.created_at = 5.0;
-        later.content = "assistant: Fissionator could have radioactive attacks.".to_string();
-        later
-            .metadata
-            .insert("source_role".to_string(), serde_json::json!("assistant"));
-        later.metadata.insert(
-            "source_session_id".to_string(),
-            serde_json::json!("conversation-2"),
-        );
-
-        let intent = crate::facets::QueryIntent {
-            labels: vec![
-                "decision_selection".to_string(),
-                "naming_decision".to_string(),
-            ],
-            ..Default::default()
-        };
-        let mut results = vec![proposal, selected, later];
-        apply_decision_adjacency_preference(&mut results, Some(&intent));
-
-        assert!(results[1].score > results[0].score);
-        assert!(results[1].score > results[2].score);
-        assert!(results[1]
-            .metadata
-            .contains_key("decision_adjacency_boost"));
-    }
-}
+#[path = "../tests/unit/api.rs"]
+mod tests;

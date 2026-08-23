@@ -1,16 +1,32 @@
 [package]
 name = "cuemap"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2021"
+autobins = false
 license = "BSL-1.1"
+description = "High-performance temporal-associative memory engine for AI agents"
+readme = "README.md"
+repository = "https://github.com/cuemap-dev/cuemap"
+homepage = "https://cuemap.dev"
+keywords = ["ai", "memory", "agents", "retrieval", "rag"]
+categories = ["database-implementations", "text-processing"]
+exclude = [
+    "/.github",
+    "/benchmarks",
+    "/evals",
+    "/scripts",
+    "/src/bin",
+    "/tests/evals",
+    "/vendor",
+    "/assets/all-MiniLM-L6-v2",
+    "**/.DS_Store",
+    "**/__pycache__",
+    "**/*.pyc",
+]
 
 [[bin]]
 name = "cuemap"
 path = "src/main.rs"
-
-[[bin]]
-name = "check_bin"
-path = "src/bin/check_bin.rs"
 
 [dependencies]
 axum = { version = "0.7", features = ["macros"] }
@@ -49,6 +65,7 @@ tree-sitter-java = "0.23.0"
 tree-sitter-php = "0.23.0"
 csv = "1.3"
 serde_yaml = "0.9"
+half = { version = "1.8.3", features = ["serde"] }
 roxmltree = "0.20"
 pdf-extract = "0.7.2"
 docx-rs = "0.4"
@@ -81,6 +98,12 @@ base64 = "0.21"
 ahash = "0.8"
 toml = "1.0.3"
 quick-xml = "0.39.2"
+ort = { version = "2.0.0-rc.13", optional = true, features = ["coreml", "lax-feature-matching"] }
+tokenizers = { version = "0.23.1", optional = true }
+
+[features]
+default = ["semantic-encoder"]
+semantic-encoder = ["dep:ort", "dep:tokenizers"]
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["full", "test-util"] }
@@ -129,10 +152,6 @@ path = "tests/agent/mod.rs"
 [[test]]
 name = "facets"
 path = "tests/facets/mod.rs"
-
-[[test]]
-name = "cuepacks"
-path = "tests/cuepacks/mod.rs"
 
 [[test]]
 name = "cuebridge"

@@ -51,7 +51,59 @@ struct PersistedState<T> {
     cue_global_counts: Option<HashMap<String, u64>>,
 }
 
-const PERSISTENCE_VERSION: u32 = 2;
+// Version 2 snapshots used bincode. Version 3 uses zstd-compressed JSON so
+// serde_json::Value metadata can be restored reliably (bincode cannot
+// deserialize dynamic JSON values) without making snapshots unnecessarily
+// large. Keep accepting v2 for snapshots that do not contain such metadata.
+const PERSISTENCE_VERSION: u32 = 3;
+const LEGACY_PERSISTENCE_VERSION: u32 = 2;
+
+fn serialize_state<T>(state: &PersistedState<T>) -> Result<Vec<u8>, std::io::Error>
+where
+    T: Serialize,
+{
+    let json = serde_json::to_vec(state).map_err(|error| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+    })?;
+    zstd::stream::encode_all(std::io::Cursor::new(json), 3)
+}
+
+fn deserialize_state<T>(data: &[u8]) -> Result<PersistedState<T>, std::io::Error>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let decoded = if crate::crypto::is_compressed(data) {
+        zstd::stream::decode_all(std::io::Cursor::new(data))?
+    } else {
+        data.to_vec()
+    };
+
+    match serde_json::from_slice(&decoded) {
+        Ok(state) => Ok(state),
+        Err(json_error) => bincode::deserialize(&decoded).map_err(|bincode_error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                "failed to decode snapshot as JSON ({json_error}) or legacy bincode ({bincode_error})"
+                ),
+            )
+        }),
+    }
+}
+
+fn check_snapshot_version(version: u32) -> Result<(), std::io::Error> {
+    if version == PERSISTENCE_VERSION || version == LEGACY_PERSISTENCE_VERSION {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Unsupported snapshot version {} (expected {} or {}). Reingest required.",
+                version, PERSISTENCE_VERSION, LEGACY_PERSISTENCE_VERSION
+            ),
+        ))
+    }
+}
 
 pub struct PersistenceManager {
     data_dir: PathBuf,
@@ -143,8 +195,9 @@ impl PersistenceManager {
             cue_global_counts: global_counts_map,
         };
 
-        // Serialize to bincode
-        let data = bincode::serialize(&state)?;
+        // JSON is intentionally used for new snapshots, then compressed to
+        // keep the on-disk representation close to the old bincode size.
+        let data = serialize_state(&state)?;
 
         // Write to temp file first (atomic operation)
         let temp_path = path.with_extension("bin.tmp");
@@ -197,14 +250,8 @@ impl PersistenceManager {
         info!("Loading state from {:?}", path);
 
         let data = fs::read(path)?;
-        let state: PersistedState<T> = bincode::deserialize(&data)?;
-        if state.version != PERSISTENCE_VERSION {
-            return Err(format!(
-                "Unsupported snapshot version {} (expected {}). Reingest required.",
-                state.version, PERSISTENCE_VERSION
-            )
-            .into());
-        }
+        let state: PersistedState<T> = deserialize_state(&data)?;
+        check_snapshot_version(state.version)?;
 
         info!(
             "Loaded {} memories and {} cues from snapshot (version: {}, saved: {})",
@@ -329,14 +376,8 @@ impl PersistenceManager {
         info!("Loading state from {:?}", snapshot_path);
 
         let data = fs::read(&snapshot_path)?;
-        let state: PersistedState<T> = bincode::deserialize(&data)?;
-        if state.version != PERSISTENCE_VERSION {
-            return Err(format!(
-                "Unsupported snapshot version {} (expected {}). Reingest required.",
-                state.version, PERSISTENCE_VERSION
-            )
-            .into());
-        }
+        let state: PersistedState<T> = deserialize_state(&data)?;
+        check_snapshot_version(state.version)?;
 
         info!(
             "Loaded {} memories and {} cues from snapshot (version: {}, saved: {})",
@@ -440,8 +481,9 @@ impl PersistenceManager {
             cue_global_counts: global_counts_map,
         };
 
-        // Serialize to bincode
-        let data = bincode::serialize(&state)?;
+        // Keep the on-disk format compressed JSON so arbitrary metadata values
+        // round-trip without sacrificing snapshot size.
+        let data = serialize_state(&state)?;
 
         // Write to temp file first (atomic operation)
         let temp_path = self.temp_snapshot_path();
@@ -925,84 +967,5 @@ impl CloudBackupManager {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_config_from_args_s3() {
-        let config = CloudBackupConfig::from_args(
-            Some("s3"),
-            Some("my-bucket"),
-            Some("us-west-2"),
-            None,
-            "cuemap/",
-            true,
-        )
-        .unwrap();
-
-        assert!(config.enabled);
-        assert!(config.auto_backup);
-        assert_eq!(config.prefix, "cuemap/");
-
-        match config.provider {
-            Some(CloudProvider::S3 {
-                bucket,
-                region,
-                endpoint,
-            }) => {
-                assert_eq!(bucket, "my-bucket");
-                assert_eq!(region, "us-west-2");
-                assert!(endpoint.is_none());
-            }
-            _ => panic!("Expected S3 provider"),
-        }
-    }
-
-    #[test]
-    fn test_config_from_args_s3_with_endpoint() {
-        let config = CloudBackupConfig::from_args(
-            Some("s3"),
-            Some("my-bucket"),
-            Some("us-east-1"),
-            Some("http://localhost:9000"),
-            "backups/",
-            false,
-        )
-        .unwrap();
-
-        match config.provider {
-            Some(CloudProvider::S3 { endpoint, .. }) => {
-                assert_eq!(endpoint, Some("http://localhost:9000".to_string()));
-            }
-            _ => panic!("Expected S3 provider"),
-        }
-    }
-
-    #[test]
-    fn test_config_from_args_gcs() {
-        let config =
-            CloudBackupConfig::from_args(Some("gcs"), Some("gcs-bucket"), None, None, "", false)
-                .unwrap();
-
-        match config.provider {
-            Some(CloudProvider::GCS { bucket }) => {
-                assert_eq!(bucket, "gcs-bucket");
-            }
-            _ => panic!("Expected GCS provider"),
-        }
-    }
-
-    #[test]
-    fn test_config_from_args_missing_bucket() {
-        let result = CloudBackupConfig::from_args(Some("s3"), None, None, None, "", false);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_config_disabled_by_default() {
-        let config = CloudBackupConfig::from_args(None, None, None, None, "", false).unwrap();
-
-        assert!(!config.enabled);
-        assert!(config.provider.is_none());
-    }
-}
+#[path = "../tests/unit/persistence.rs"]
+mod tests;

@@ -1,8 +1,8 @@
 name: Build and Publish Optional NPM Binaries
 
 on:
-  release:
-    types: [created]
+  push:
+    branches: [main]
   workflow_dispatch: # Allow manual triggering
 
 jobs:
@@ -55,44 +55,64 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build Rust Engine
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
         
       - name: Prepare NPM Package Structure
         shell: bash
         run: |
-          mkdir -p npm-packages/${{ matrix.pkg_name }}/bin
+          package_dir="npm-packages/${{ matrix.pkg_name }}"
+          mkdir -p "${package_dir}/bin" "${package_dir}/assets"
           
-          # Copy binary based on OS extension (.exe for Windows)
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            cp target/${{ matrix.target }}/release/cuemap.exe npm-packages/${{ matrix.pkg_name }}/bin/cuemap.exe
-          else
-            cp target/${{ matrix.target }}/release/cuemap npm-packages/${{ matrix.pkg_name }}/bin/cuemap
-            chmod +x npm-packages/${{ matrix.pkg_name }}/bin/cuemap
-          fi
+          cp target/${{ matrix.target }}/release/cuemap "${package_dir}/bin/cuemap-native"
+          cp scripts/npm-native-wrapper.cjs "${package_dir}/bin/cuemap"
+          cp scripts/npm-native-README.md "${package_dir}/README.md"
+          cp LICENSE "${package_dir}/LICENSE"
+          chmod +x "${package_dir}/bin/cuemap" "${package_dir}/bin/cuemap-native"
+
+          tokenizer_url="https://cuemap.dev/assets/en_tokenizer.bin.gz"
+          tokenizer_sha256="f54fd31ec463f8646d0239bb531a64e0210ed1ae02bf5e3b42aeeb9bff8305ba"
+          curl -fsSL --retry 3 "${tokenizer_url}" -o "${package_dir}/assets/en_tokenizer.bin.gz"
+          node -e '
+            const fs = require("node:fs");
+            const crypto = require("node:crypto");
+            const [file, expected] = process.argv.slice(1);
+            const actual = crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+            if (actual !== expected) throw new Error(`Tokenizer checksum mismatch: ${actual}`);
+          ' "${package_dir}/assets/en_tokenizer.bin.gz" "${tokenizer_sha256}"
+          gzip -dc "${package_dir}/assets/en_tokenizer.bin.gz" > "${package_dir}/assets/en_tokenizer.bin"
+          rm "${package_dir}/assets/en_tokenizer.bin.gz"
           
-          # Create the package.json for this specific architecture package
-          cat <<EOF > npm-packages/${{ matrix.pkg_name }}/package.json
-          {
-            "name": "@cuemap-dev/${{ matrix.pkg_name }}",
-            "version": "${{ github.event.release.tag_name || '0.6.6' }}",
-            "description": "Pre-compiled CueMap Engine for ${{ matrix.npm_os }} ${{ matrix.npm_arch }}",
-            "engines": {
-              "node": ">= 18"
-            },
-            "os": ["${{ matrix.npm_os }}"],
-            "cpu": ["${{ matrix.npm_arch }}"],
-            "bin": {
-              "cuemap": "bin/cuemap${{ matrix.os == 'windows-latest' && '.exe' || '' }}"
-            },
-            "repository": {
-              "type": "git",
-              "url": "https://github.com/cuemap-dev/cuemap.git"
-            },
-            "author": "Kaan Demirel",
-            "license": "BSL-1.1"
-          }
-          EOF
+          version="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
+          node -e '
+            const fs = require("node:fs");
+            const [output, version, os, cpu, packageName] = process.argv.slice(1);
+            const manifest = {
+              name: `@cuemap-dev/${packageName}`,
+              version,
+              description: `Pre-compiled CueMap Engine for ${os} ${cpu}`,
+              engines: { node: ">=18" },
+              os: [os],
+              cpu: [cpu],
+              bin: { cuemap: "bin/cuemap" },
+              files: ["bin", "assets", "README.md", "LICENSE"],
+              repository: { type: "git", url: "https://github.com/cuemap-dev/cuemap.git" },
+              author: "Kaan Demirel",
+              license: "BSL-1.1",
+              publishConfig: { access: "public" },
+            };
+            if (os === "linux") manifest.libc = ["glibc"];
+            fs.writeFileSync(output, `${JSON.stringify(manifest, null, 2)}\n`);
+          ' "${package_dir}/package.json" "${version}" "${{ matrix.npm_os }}" "${{ matrix.npm_arch }}" "${{ matrix.pkg_name }}"
+
+      - name: Verify NPM package contents
+        working-directory: npm-packages/${{ matrix.pkg_name }}
+        shell: bash
+        run: |
+          test -x bin/cuemap
+          test -x bin/cuemap-native
+          test -s assets/en_tokenizer.bin
+          npm pack --dry-run
 
       - name: Publish to NPM
         working-directory: npm-packages/${{ matrix.pkg_name }}
-        run: npm publish --access public --verbose
+        run: npm publish --access public --provenance --verbose

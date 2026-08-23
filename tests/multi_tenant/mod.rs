@@ -2,7 +2,9 @@ use cuemap::config::TuningConfig;
 use cuemap::multi_tenant::*;
 use cuemap::structures::MainStats;
 use std::fs;
+use std::time::Duration;
 use tempfile::tempdir;
+use tokio::time::sleep;
 
 #[test]
 fn test_project_id_validation() {
@@ -107,6 +109,28 @@ fn test_snapshot_roundtrip() {
 }
 
 #[test]
+fn test_load_all_restores_every_project_snapshot() {
+    let dir = tempdir().unwrap();
+    let project_id = "load-all-project".to_string();
+    let first = MultiTenantEngine::with_snapshots_dir(dir.path(), TuningConfig::default());
+    let context = first.get_or_create_project(project_id.clone()).unwrap();
+    context.main.add_memory(
+        "load all content".to_string(),
+        vec!["load-all".to_string()],
+        None,
+        MainStats::default(),
+        true,
+    );
+    first.save_project(&project_id).unwrap();
+
+    let second = MultiTenantEngine::with_snapshots_dir(dir.path(), TuningConfig::default());
+    let results = second.load_all();
+    assert!(matches!(results.get(&project_id), Some(Ok(()))));
+    let restored = second.get_project(&project_id).expect("project should be restored");
+    assert_eq!(restored.main.total_memories(), 1);
+}
+
+#[test]
 fn test_delete_project() {
     let dir = tempdir().unwrap();
     let engine = MultiTenantEngine::with_snapshots_dir(
@@ -122,4 +146,84 @@ fn test_delete_project() {
     assert!(engine.get_project(&project_id.to_string()).is_some());
     assert!(engine.delete_project(&project_id.to_string()));
     assert!(engine.get_project(&project_id.to_string()).is_none());
+}
+
+#[test]
+fn repository_ingestion_scope_is_persisted_in_project_metadata() {
+    let dir = tempdir().unwrap();
+    let snapshots_dir = dir.path().join("snapshots");
+    let watch_dir = dir.path().join("repo");
+    fs::create_dir_all(&snapshots_dir).unwrap();
+    fs::create_dir(&watch_dir).unwrap();
+    let engine = MultiTenantEngine::with_snapshots_dir(
+        &snapshots_dir,
+        TuningConfig::default(),
+    );
+    let project_id = "scope-persistence";
+    engine
+        .get_or_create_project(project_id.to_string())
+        .unwrap();
+
+    engine
+        .set_project_watch_config(
+            project_id,
+            watch_dir.to_string_lossy().to_string(),
+            vec!["src".to_string(), "README.md".to_string()],
+            vec!["docs/**".to_string()],
+            vec!["log".to_string()],
+        )
+        .unwrap();
+
+    let metadata = engine
+        .load_project_meta(&project_id.to_string())
+        .unwrap();
+    assert!(metadata.agent_enabled);
+    assert_eq!(metadata.included_paths, vec!["src", "README.md"]);
+    assert_eq!(metadata.ignored_patterns, vec!["docs/**"]);
+    assert_eq!(metadata.ignored_extensions, vec!["log"]);
+}
+
+#[tokio::test]
+async fn periodic_snapshots_persist_projects_created_after_scheduler_start() {
+    let dir = tempdir().unwrap();
+    let snapshots_dir = dir.path().join("snapshots");
+    fs::create_dir_all(&snapshots_dir).unwrap();
+
+    let engine = MultiTenantEngine::with_snapshots_dir(
+        &snapshots_dir,
+        TuningConfig::default(),
+    );
+    engine.start_periodic_snapshots(Duration::from_millis(20));
+
+    let project_id = "periodic-new-project".to_string();
+    let context = engine.get_or_create_project(project_id.clone()).unwrap();
+    context.main.add_memory(
+        "persisted by the periodic scheduler".to_string(),
+        vec!["snapshot:periodic".to_string()],
+        None,
+        MainStats::default(),
+        false,
+    );
+
+    for _ in 0..100 {
+        let reloaded = MultiTenantEngine::with_snapshots_dir(
+            &snapshots_dir,
+            TuningConfig::default(),
+        );
+        if let Ok(reloaded_context) = reloaded.load_project(&project_id) {
+            let matches = reloaded_context.main.recall(
+                vec!["snapshot:periodic".to_string()],
+                10,
+                false,
+                None,
+            );
+            if matches.len() == 1 {
+                assert_eq!(matches[0].content, "persisted by the periodic scheduler");
+                return;
+            }
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    panic!("periodic snapshot did not persist a project created after startup");
 }

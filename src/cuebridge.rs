@@ -250,7 +250,7 @@ impl CueBridgeArtifacts {
     pub fn gap_expansions<F>(
         &self,
         query_cues: &[(String, f64)],
-        query_intent: Option<&crate::facets::QueryIntent>,
+        query_plan: Option<&crate::facets::StructuralQueryPlan>,
         ordered_tokens: &[String],
         available: F,
         max_expansions: usize,
@@ -264,7 +264,7 @@ impl CueBridgeArtifacts {
 
         let query_cue_set = normalized_set(query_cues.iter().map(|(cue, _)| cue));
         let token_set = normalized_set(ordered_tokens.iter());
-        let intent_set = query_intent
+        let intent_set = query_plan
             .map(|intent| normalized_set(intent.labels.iter()))
             .unwrap_or_default();
         let mut out = Vec::new();
@@ -592,24 +592,5 @@ fn sanitize_weight(value: f64, default: f64) -> f64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn gap_pack_rejects_bare_entry_without_gates() {
-        let entry = RuntimeGapEntry {
-            artifact: "test".to_string(),
-            artifact_hash: "hash".to_string(),
-            id: "gap".to_string(),
-            signature: RuntimeQuerySignature::default(),
-            expansions: vec![RawExpansion {
-                cue: "target".to_string(),
-                weight: 1.0,
-            }],
-            negative_gates: Vec::new(),
-            confidence: 1.0,
-            max_fanout: 1,
-        };
-        assert!(!entry.matches(&HashSet::new(), &HashSet::new(), &HashSet::new()));
-    }
-}
+#[path = "../tests/unit/cuebridge.rs"]
+mod tests;

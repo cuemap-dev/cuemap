@@ -1,5 +1,8 @@
 # CueMap Rust Engine
 
+[![CI](https://github.com/cuemap-dev/cuemap/actions/workflows/coverage.yml/badge.svg?branch=v0.7.2)](https://github.com/cuemap-dev/cuemap/actions/workflows/coverage.yml)
+[![Coverage](https://codecov.io/github/cuemap-dev/cuemap/branch/v0.7.2/graph/badge.svg?flag=rust-engine)](https://app.codecov.io/github/cuemap-dev/cuemap)
+
 **High-performance temporal-associative memory store** designed for dynamic contextual retrieval.
 
 ## Overview
@@ -7,14 +10,14 @@
 CueMap implements a **Continuous Gradient Algorithm** optimized for associative data structures:
 
 1.  **Intersection (Context Filter)**: Triangulates relevant memories by overlapping cues
-2.  **CuePack-Guided Intent Routing**: Uses compiled deterministic rules to add structural facets and weighted intent cues without runtime model calls.
+2.  **Structural Extraction**: Emits deterministic cues for observable evidence such as dates, numbers, lists, source metadata, and surface entities.
 3.  **Recency & Salience (Signal Dynamics)**: Balances fresh data with salient, high-signal events prioritized by an adaptive impact scoring module.
 4.  **Reinforcement (Access-based Learning)**: Frequently accessed memories gain signal strength, remaining highly accessible even as they age.
-5.  **Deterministic Facets & Intent Routing**: Extracts synchronous source, evidence, temporal, type, and entity facets, then uses sparse intent cues and reranking during recall.
+5.  **Sparse Recall**: Uses normalized lexical cues, structural facets, recency, salience, and bounded deterministic reranking.
 
-As of v0.7.0, CueMap's core path is deterministic and embedding-free. GloVe/Ollama cue generation, WordNet/POS expansion, semantic bridges, pattern completion, external lexicon graphs, context expansion/speculation endpoints, and autonomous consolidation have been removed from the core engine.
+As of v0.7.2, CueMap's default core path is deterministic and ontology-free. GloVe/Ollama cue generation, WordNet/POS expansion, semantic bridges, pattern completion, external lexicon graphs, context expansion/speculation endpoints, and autonomous consolidation have been removed from the default engine path. v0.7.2 bundles a qint8 `all-MiniLM-L3-v2` vector layer for semantic reranking, intent classification, and query embeddings; the `edge` profile selects a q4 build of the same model. The encoder can still be disabled for constrained builds or deployments.
 
-v0.7.0 also uses numeric per-project memory IDs everywhere. If callers need deterministic upsert/dedupe identity, pass `source_key`; memory IDs remain compact runtime addresses.
+v0.7.2 also uses numeric per-project memory IDs everywhere. If callers need deterministic upsert/dedupe identity, pass `source_key`; memory IDs remain compact runtime addresses.
 
 Built with Rust for maximum performance and reliability.
 
@@ -36,8 +39,8 @@ CueMap treats the nlprule tokenizer as a runtime asset, not a build artifact. Se
 ### Docker
 
 ```bash
-docker build -t cuemap/engine:0.7.1 .
-docker run -p 8080:8080 -v "$(pwd)/local_snapshot_dir:/app/data" cuemap/engine:0.7.1
+docker build -t cuemap/engine:0.7.2 .
+docker run -p 8080:8080 -v "$(pwd)/local_snapshot_dir:/app/data" cuemap/engine:0.7.2
 ```
 
 The container runs as the unprivileged `cuemap` user. Ensure a bind-mounted data directory is writable by UID/GID `10001`, or use a Docker-managed volume. Runtime defaults can be overridden with `CUEMAP_PORT`, `CUEMAP_DATA_DIR`, `CUEMAP_SNAPSHOT_INTERVAL_SECONDS`, `TOKENIZER_PATH`, and `RUST_LOG`.
@@ -51,7 +54,7 @@ Build the Darwin ARM64, Darwin x64, and Linux x64 native packages without publis
 ./scripts/verify-npm-native-packages.sh
 ```
 
-The packager builds Linux on Debian Bookworm for an older glibc baseline, bundles the checksum-pinned tokenizer, and writes package tarballs plus `SHA256SUMS` under `dist/npm-native/tarballs`.
+The packager builds Linux on Debian Trixie, bundles the checksum-pinned tokenizer, and writes package tarballs plus `SHA256SUMS` under `dist/npm-native/tarballs`.
 
 ### CLI Commands
 
@@ -85,7 +88,6 @@ cuemap <COMMAND> [OPTIONS]
 #### Deterministic Semantics
 - **`lexicon`**: Inspect lexicon entries and wire/unwire cues.
 - **`alias`**: Manage explicit deterministic aliases.
-- **`cuepack`**: List, inspect, and validate deterministic semantic packs.
 
 Hint: Use `cuemap --help` to see available commands and options.
 
@@ -162,21 +164,16 @@ CueMap provides complete project isolation with automatic persistence:
 
 ### Usage
 
-CueMap runs in multi-tenant mode by default. Simply specify a project ID in your requests.
+CueMap runs in multi-tenant mode by default. Select a project for CLI commands with `cuemap set-project` or pass `--project` to an individual command.
 
 ```bash
-# Start server
+# Start the server
 ./target/release/cuemap start --port 8080
-```
 
-### Example
-
-```bash
-# Add memory to project
-curl -X POST http://localhost:8080/memories \
-  -H "X-Project-ID: my-project" \
-  -H "Content-Type: application/json" \
-  -d '{"content": "Important data", "cues": ["test"]}'
+# Choose a project and use the local CLI
+cuemap set-project my-project
+cuemap add "Important data"
+cuemap recall "What is important?"
 
 # Stop server (Ctrl+C) - saves all projects when persistence is enabled
 # Restart server - loads persisted snapshots
@@ -189,8 +186,9 @@ Snapshots are automatically managed:
 - **Created**: Periodically and on graceful shutdown (SIGINT/Ctrl+C) when persistence is enabled.
 - **Loaded**: On server startup
 - **Disabled**: `--disable-snapshots` turns off periodic and shutdown snapshot saves.
-- **Location**: `~/.cuemap/data/snapshots/` by default, or `<--data-dir>/snapshots` when `--data-dir` is set.
-- **Format**: Bincode binary
+- **Location**: `~/.cuemap/data/snapshots/` by default, or `<--data-dir>/snapshots` when `--data-dir` is set. Older installs may also be discovered under the legacy sibling `snapshots/` directory.
+- **Format**: zstd-compressed JSON inside `.bin` files. This preserves arbitrary metadata reliably while keeping snapshots compact; older uncompressed bincode snapshots remain readable when their metadata can be decoded.
+- **Migration note**: Some pre-v0.7.2 bincode snapshots that contain dynamic JSON metadata cannot be decoded by bincode's `deserialize_any` limitation. Those projects are reported at startup and must be reingested or exported from a compatible older binary before upgrading.
 - **Files**: `{project-id}.bin`, `{project-id}_lexicon.bin`, `{project-id}_aliases.bin`
 
 ### Cloud Backup
@@ -215,7 +213,7 @@ Enable cloud backup via CLI flags or `~/.cuemap/server_config.toml`.
 - `local`: Local path (for testing/replication)
 
 **Management**:
-Backups can be triggered manually via API (`/backup/upload`, `/backup/download`).
+Manual backup operations are documented in the [HTTP API reference](https://cuemap.dev/docs/api-reference).
 
 
 ## Authentication
@@ -241,52 +239,7 @@ Or configure keys in `~/.cuemap/server_config.toml`:
 api_keys = ["your-secret-key"]
 ```
 
-### Using Authentication
-
-Include the API key in the `X-API-Key` header:
-
-```bash
-# Without auth (fails if enabled)
-curl http://localhost:8080/stats
-# Response: Missing X-API-Key header
-
-# With correct key
-curl -H "X-API-Key: your-secret-key" -H "X-Project-ID: default" http://localhost:8080/stats
-# Response: {"total_memories": 1000, ...}
-
-# With wrong key
-curl -H "X-API-Key: wrong-key" -H "X-Project-ID: default" http://localhost:8080/stats
-# Response: Invalid API key
-```
-
-### SDK Usage
-
-#### Standard SDKs
-
-Python:
-```python
-from cuemap import CueMap
-
-# With authentication
-client = CueMap(
-    url="http://localhost:8080",
-    api_key="your-secret-key"
-)
-
-client.add("Memory", cues=["test"])
-```
-
-TypeScript:
-```typescript
-import CueMap from 'cuemap';
-
-const client = new CueMap({
-  url: 'http://localhost:8080',
-  apiKey: 'your-secret-key'
-});
-
-await client.add('Memory', ['test']);
-```
+Clients send the configured key in the `X-API-Key` header. See the [HTTP API reference](https://cuemap.dev/docs/api-reference) for request headers and SDK examples.
 
 ### Docker with Authentication
 
@@ -324,61 +277,88 @@ To optimize storage efficiency, especially for large textual memories, CueMap em
 
 ## Performance
 
-### Benchmark Results (v0.7.0)
+### Benchmark Results (v0.7.2)
 
 Tests performed on **Real-World Data** (Wikipedia Articles), processing full natural language sentences with the complete NLP pipeline.
 
-**Hardware:** MacBook Pro M-series, 64GB RAM, single node. These are local v0.7 benchmark numbers from the numeric-ID engine.
+**Hardware:** MacBook Pro M-series, 64GB RAM, single node. The v0.7.2 release table below records completed lexical and hybrid runs at 10K, 100K, and 1M memories. Lexical runs isolate the sparse core with the semantic encoder disabled; hybrid runs include the bundled local encoder. P95 is the release headline percentile, while P99 remains available in the JSON diagnostics.
 
 #### Benchmark Methodology
 
 The NL benchmark script lives at `benchmarks/benchmark_nl.py`.
 
 Benchmark setup:
-- Uses Wikipedia parquet files as the source corpus. You can obtain Wikipedia source data from official [Wikimedia dumps](https://dumps.wikimedia.org/) or an Internet Archive mirror, then prepare/extract text into parquet files with a `text` column.
+- Uses the public [Wikipedia Plaintext (2023-07-01) Kaggle dataset](https://www.kaggle.com/datasets/jjinho/wikipedia-20230701) as the release corpus. The benchmark script downloads it automatically when `--wikipedia-path` is omitted, caches it under `~/.cache/cuemap/benchmarks/wikipedia-20230701`, and samples parquet files with a `text` column. Install the downloader first with `python -m pip install kagglehub`; configure Kaggle access if Kaggle prompts for authentication. To avoid the download or use another corpus, pass `--wikipedia-path /path/to/parquet-or-directory`.
 - Deduplicates sampled snippets and consumes them without replacement, so 100K and 1M write runs do not reuse the same text.
 - Writes use HTTP `POST /memories` with `minimal_response=true` and no explicit cues, forcing CueMap to run deterministic cue/facet extraction and indexing.
 - Reads generate keyword-style natural-language queries from retained ingested snippets.
-- Recall numbers use the script's lean recall mode: `auto_reinforce=false`, salience disabled, alias expansion disabled, CueBridge artifacts disabled, `depth=1`, `expansion_depth=1`, and parent/order/evidence reconstruction disabled. This isolates the core sparse recall path.
+- Recall numbers use the script's lean recall mode: `semantic_mode=lexical`, `auto_reinforce=false`, salience disabled, alias expansion disabled, CueBridge artifacts disabled, `depth=1`, `expansion_depth=1`, and parent/order/evidence reconstruction disabled. This isolates the core sparse recall path from the bundled semantic encoder and reranker.
+- Each requested size runs in its own run-scoped project, so a 1M pass is not layered on top of a previous 100K pass or stale state from an earlier invocation.
 - `--trace-timing` records engine timing breakdowns but is not required for throughput measurements.
 
-Example run:
+Example run with the checked-in release fixture:
 
 ```bash
-cuemap start --disable-snapshots --disable-bg-jobs
+CUEMAP_SEMANTIC_ENCODER_ENABLED=false cuemap start --disable-snapshots --disable-bg-jobs
 
 python benchmarks/benchmark_nl.py \
-  --sizes 100000,1000000 \
+  --sizes 10000,100000,1000000 \
   --project-id nl_test \
-  --wikipedia-path /Users/<username>/Downloads/wikipedia/ \
-  --trace-timing \
+  --semantic-mode lexical \
   --wiki-reservoir-size 20000 \
   --query-sample-size 5000 \
   --payload-buffer-size 500
 ```
 
-#### 1. Ingestion (Write) Performance
-*Measures HTTP ingestion, deterministic cue/facet extraction, source-key upsert, and indexing.*
+Restart the engine without `CUEMAP_SEMANTIC_ENCODER_ENABLED=false`, then run the
+same command with `--semantic-mode hybrid` to produce the hybrid comparison. The
+dataset is downloaded only once and reused from the local cache on subsequent
+runs.
 
-| Dataset Scale | Avg Latency | P50 | P99 | Throughput |
+#### v0.7.2 latency comparison
+
+The lexical release rerun now covers 10K, 100K, and 1M writes plus lean recall
+queries. The compact comparison below records the 10K, 100K, and 1M hybrid
+runs as well.
+
+| Mode | Write avg | Write P50 | Write P95 | Write throughput | Read avg | Read P50 | Read P95 | Read throughput |
+|:---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Lexical | 2.13 ms | 1.88 ms | 4.13 ms | 470 ops/s | 1.05 ms | 1.01 ms | 1.60 ms | 939 ops/s |
+| Hybrid | 11.52 ms | 10.38 ms | 17.45 ms | 87 ops/s | 6.54 ms | 6.80 ms | 8.41 ms | 152 ops/s |
+
+The script still stores p99 in the JSON result for diagnostics, but p95 is the
+headline percentile used by the console output and release chart.
+
+| Hybrid scale | Write avg | Write P50 | Write P95 | Write throughput | Read avg | Read P50 | Read P95 | Read throughput |
+|:---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **10,000** | 11.52 ms | 10.38 ms | 17.45 ms | 87 ops/s | 6.54 ms | 6.80 ms | 8.41 ms | 152 ops/s |
+| **100,000** | 11.21 ms | 10.27 ms | 16.43 ms | 89 ops/s | 6.94 ms | 7.14 ms | 8.83 ms | 144 ops/s |
+| **1,000,000** | 11.28 ms | 10.38 ms | 16.81 ms | 89 ops/s | 8.36 ms | 8.12 ms | 10.67 ms | 119 ops/s |
+
+#### 1. Ingestion (Write) Performance — lexical
+*Measures HTTP ingestion, deterministic cue/facet extraction, memory allocation, and indexing.*
+
+| Dataset Scale | Avg Latency | P50 | P95 | Throughput |
 |:---|:---|:---|:---|:---|
-| **100,000** | 3.13 ms | 2.56 ms | 10.98 ms | 320 ops/s |
-| **1,000,000** | 2.85 ms | 2.39 ms | 11.23 ms | 351 ops/s |
+| **10,000** | 2.13 ms | 1.88 ms | 4.13 ms | 470 ops/s |
+| **100,000** | 2.92 ms | 2.41 ms | 5.70 ms | 343 ops/s |
+| **1,000,000** | 3.33 ms | 2.74 ms | 6.18 ms | 301 ops/s |
 
 Write latency remains mostly flat with project size; the dominant cost is per-memory extraction/indexing rather than corpus scan time.
 
-#### 2. Recall (Read) Performance
+#### 2. Recall (Read) Performance — lexical
 *Measures the time to parse a query, resolve deterministic cues, and score sparse candidate intersections.*
 
-| Dataset Scale | Avg Latency | P50 | P99 |
-|:---|:---|:---|:---|
-| **100,000** | 1.73 ms | 1.65 ms | 3.67 ms |
-| **1,000,000** | 2.70 ms | 2.06 ms | 5.10 ms |
+| Dataset Scale | Avg Latency | P50 | P95 | Throughput |
+|:---|:---|:---|:---|---:|
+| **10,000** | 1.05 ms | 1.01 ms | 1.60 ms | 939 ops/s |
+| **100,000** | 1.86 ms | 1.71 ms | 3.16 ms | 535 ops/s |
+| **1,000,000** | 2.63 ms | 2.06 ms | 3.72 ms | 378 ops/s |
 
 **Key Metrics**:
-- **Low-latency recall:** 1M-memory natural-language recall stays around 2.7ms average with about 5.1ms p99 in the current v0.7 run.
+- **Low-latency recall:** The lexical v0.7.2 1M run measured 2.63ms average with 3.72ms p95; hybrid measurements remain separate because they include bundled encoder work.
 - **Numeric ID memory reduction:** 1M in-memory footprint dropped from about 5.25GB to about 1.93GB after the v0.7 numeric memory-ID refactor.
-- **Deterministic hot path:** recall uses in-memory sparse indexes and does not call embeddings, LLMs, network services, or disk scans.
+- **Controlled hot path:** the release benchmark disables the local semantic encoder, LLMs, network services, and disk scans; normal v0.7.2 hybrid recall can use the bundled local encoder for bounded reranking.
 
 ## Architecture
 
@@ -398,379 +378,15 @@ Write latency remains mostly flat with project size; the dominant cost is per-me
 - **Unstable sorting**: 2-3x faster than stable sort
 - **Iterative deepening**: Early termination on hot paths
 
-## API
+## HTTP API and SDK documentation
 
-### Deterministic Cue Extraction
+The complete HTTP/OpenAPI contract, request and response schemas, authentication headers, ingestion and recall routes, and Python/TypeScript SDK examples live in the [CueMap documentation](https://cuemap.dev/docs/api-reference).
 
-CueMap extracts cues synchronously from content and metadata using deterministic tokenization, normalization, facets, aliases, and CuePack rules. The recall path does not call embeddings, LLMs, WordNet, external APIs, or runtime graph expansion.
+- [Quick start and operations](https://cuemap.dev/docs/)
+- [HTTP API reference](https://cuemap.dev/docs/api-reference)
+- [OpenAPI 3.1 schema](https://cuemap.dev/openapi.yml)
 
-```bash
-# 1. Start CueMap
-./target/release/cuemap start
-
-# 2. Add memory in natural language
-curl -X POST http://localhost:8080/memories \
-  -H "X-Project-ID: default" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "content": "The payments service is down due to a timeout."
-  }'
-# Deterministic extraction adds normalized lexical cues plus structural/facet cues.
-```
-
-## API Reference
-
-### Add Memory
-
-```bash
-# Basic manual cues
-curl -X POST http://localhost:8080/memories \
-  -H "X-Project-ID: default" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "content": "API Rate Limit Policy: 1000/min",
-    "cues": ["api", "rate_limit", "policy"],
-    "source_key": "doc:api-rate-limit-policy"
-  }'
-
-# Deterministic cues are extracted from content when `cues` is omitted or empty
-curl -X POST http://localhost:8080/memories \
-  -H "X-Project-ID: default" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "content": "The payments service is down due to a timeout."
-  }'
-```
-
-### Recall Memories
-
-#### Explicit Cues
-```bash
-curl -X POST http://localhost:8080/recall \
-  -H "X-Project-ID: default" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "cues": ["api", "rate_limit"],
-    "limit": 10
-  }'
-```
-
-#### Natural Language Search (Symbol-First Intent Routing)
-```bash
-curl -X POST http://localhost:8080/recall \
-  -H "X-Project-ID: default" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query_text": "where is process_data used?",
-    "limit": 10,
-    "expansion_depth": 2
-  }'
-```
-Returns surgical code recall. The engine uses a deterministic **Symbol-First Router** with sparse BM25-style scoring to convert fuzzy queries into structural cues (e.g., `calls_function:process_data`). Set `expansion_depth` above 1 to include nearby source-order chunks when session/order metadata is available.
-
-```json
-{
-  "explain": {
-    "query_cues": ["payments"],
-    "expanded_cues": [
-      ["payments", 1.0],
-      ["service:payments", 0.85]
-    ]
-  },
-  "results": [
-    {
-      "content": "...",
-      "score": 145.2,
-      "explain": {
-        "intersection_weighted": 1.85,
-        "recency_component": 0.5
-      }
-    }
-  ]
-}
-```
-
-### Reinforce Memory
-
-```bash
-curl -X PATCH http://localhost:8080/memories/{id}/reinforce \
-  -H "X-Project-ID: default" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "cues": ["important", "urgent"]
-  }'
-```
-Reinforcement is used to boost the relevance of a memory. It is a way to tell CueMap that a memory is important and should be recalled more often. Standard `POST /recall` requests do not auto-reinforce by default; enable `auto_reinforce` explicitly or reinforce a memory manually through the API.
-
-### Get Memory
-
-```bash
-curl -H "X-Project-ID: default" http://localhost:8080/memories/{id}
-```
-
-### Get Stats
-```bash
-curl -H "X-Project-ID: default" http://localhost:8080/stats
-```
-
-### Alias Management
-
-Manage synonyms and semantic mappings deterministically.
-
-#### Add Alias
-```bash
-curl -X POST http://localhost:8080/aliases \
-  -H "X-Project-ID: default" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "from": "pay",
-    "to": "service:payment",
-    "weight": 0.9
-  }'
-```
-
-#### Merge Aliases (Bulk)
-```bash
-curl -X POST http://localhost:8080/aliases/merge \
-  -H "X-Project-ID: default" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "cues": ["bill", "invoice", "statement"],
-    "to": "service:billing"
-  }'
-```
-
-#### Get Aliases
-```bash
-# Reverse lookup: Find all aliases for "service:payment"
-curl -H "X-Project-ID: default" "http://localhost:8080/aliases?cue=service:payment"
-```
-
-### Project Management
-
-#### Create Project
-```bash
-curl -X POST http://localhost:8080/projects \
-  -H "Content-Type: application/json" \
-  -d '{"project_id": "my-project"}'
-```
-
-#### List Projects
-```bash
-curl http://localhost:8080/projects
-```
-
-#### Delete Project
-```bash
-curl -X DELETE "http://localhost:8080/projects/default"
-```
-
-### Lexicon Management
-
-#### Inspect Cue
-View incoming tokens and manually wired canonical cue mappings.
-```bash
-curl "http://localhost:8080/lexicon/inspect/service:payment"
-```
-
-#### Wire Token (Manual Connection)
-Manually connect a token to a canonical cue.
-```bash
-curl -X POST http://localhost:8080/lexicon/wire \
-  -H "Content-Type: application/json" \
-  -d '{
-    "token": "stripe",
-    "canonical": "service:payment"
-  }'
-```
-
-#### Unwire/Delete Entry
-Remove a specific token from the lexicon.
-```bash
-curl -X DELETE "http://localhost:8080/lexicon/entry/cue:stripe"
-```
-
-### CuePacks
-
-CuePacks are deterministic semantic packages. They are the maintainable place for domain vocabulary, semantic phrase families, facet rules, query-intent rules, aliases, and policy metadata. CuePacks are compiled at startup or request setup; recall does not call a network service, run embeddings, scan raw memory content, or read pack files from disk.
-
-Bundled defaults are enabled unless disabled. Place custom packs in `~/.cuemap/cuepacks/` as TOML files and inspect them with:
-
-```bash
-cuemap cuepack list
-cuemap cuepack inspect memory-general
-cuemap cuepack validate ./my-domain-pack.toml
-```
-
-Select packs per request:
-
-```bash
-cuemap recall -p my_project --cuepacks memory-general "which transit app did I use?"
-cuemap recall -p my_project --disable-default-cuepacks "core-only recall"
-```
-
-API requests accept a separate `cuepacks` field. Use `["off"]` for core-only behavior, omit the field for bundled defaults, or pass explicit pack names.
-
-### CueBridge Artifacts
-
-CueBridge artifacts are offline-compiled lexical-gap packages. CueMap loads them into memory and uses them deterministically during recall:
-
-- **AliasPack**: safe lexical variants applied during query cue resolution.
-- **GapPack**: gated expansion cues applied only when exact recall is weak.
-
-Install artifacts into the project artifact directory, then reload them:
-
-```bash
-curl -X POST http://localhost:8080/projects/my-project/artifacts
-```
-
-Inspect active artifacts:
-
-```bash
-curl http://localhost:8080/projects/my-project/artifacts
-```
-
-Recall can disable installed artifacts for baseline checks:
-
-```bash
-cuemap recall -p my_project --disable-cuebridge-artifacts "what foundation did we choose?"
-```
-
-### Cloud Backup Management
-
-#### Upload Snapshot
-```bash
-curl -X POST http://localhost:8080/backup/upload \
-  -H "Content-Type: application/json" \
-  -d '{"project_id": "default"}'
-```
-
-#### Download Snapshot
-```bash
-curl -X POST http://localhost:8080/backup/download \
-  -H "Content-Type: application/json" \
-  -d '{"project_id": "default"}'
-```
-
-#### List Backups
-```bash
-curl http://localhost:8080/backup/list
-```
-
-### Monitoring
-
-#### Prometheus Metrics
-Exposes internal system metrics for scraping (Prometheus format).
-
-```bash
-curl http://localhost:8080/metrics
-# Output:
-# cuemap_ingestion_rate 120.0
-# cuemap_recall_latency_p99 0.8
-# cuemap_memory_usage_bytes 1024
-# ...
-```
-
-### Ingestion
-
-#### Ingest URL
-Extract content from a web page and ingest it.
-```bash
-curl -X POST http://localhost:8080/ingest/url \
-  -H "X-Project-ID: default" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "url": "https://example.com"
-  }'
-```
-
-#### Ingest Raw Content
-Ingest text directly, simulating a file.
-```bash
-curl -X POST http://localhost:8080/ingest/content \
-  -H "X-Project-ID: default" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "content": "The quick brown fox jumps over the lazy dog.",
-    "filename": "fox.txt"
-  }'
-```
-
-#### Ingest File (Multipart)
-Upload a file for processing by the Agent (supports Text, PDF, JSON, etc. if Agent is configured).
-```bash
-curl -X POST http://localhost:8080/ingest/file \
-  -H "X-Project-ID: default" \
-  --form "file=@/path/to/document.pdf"
-```
-
-#### Grounded Recall (Budgeted)
-
-```bash
-curl -X POST http://localhost:8080/recall/grounded \
-  -H "X-Project-ID: default" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query_text": "Why is the server down?",
-    "token_budget": 500,
-    "limit": 10
-  }'
-```
-
-Grounded recall deterministically fills a token budget with the highest-scoring memories and returns a context block designed to be passed to an LLM alongside a structured proof.
-
-Grounded recall enables `auto_reinforce` by default; set `"auto_reinforce": false` for read-only evaluation or benchmark runs.
-
-**Response** (example with Ed25519 signing configured):
-```json
-{
-  "verified_context": "[VERIFIED CONTEXT] (1) Fact... Rules:...",
-  "proof": {
-    "trace_id": "966579b1-...",
-    "selected": [...],
-    "excluded_top": [...]
-  },
-  "signature_alg": "ed25519",
-  "signature": "9b2d...",
-  "public_key": "ed25519:4f8c...",
-  "engine_latency_ms": 0.83
-}
-```
-
-### Signed Context (Immutable RAG)
-
-CueMap can sign grounded recall context so clients can verify that the `verified_context` block was produced by the configured CueMap server and was not modified in transit before it reaches an LLM.
-
-Preferred setup uses Ed25519 asymmetric signatures. Generate one 32-byte private seed, store it securely, and reuse it across restarts:
-
-```bash
-openssl rand -hex 32 > ~/.cuemap/signing_ed25519_seed.hex
-CUEMAP_SIGNING_PRIVATE_KEY="$(cat ~/.cuemap/signing_ed25519_seed.hex)" cuemap start
-```
-
-Or configure it in `~/.cuemap/server_config.toml`:
-
-```toml
-[security]
-signing_private_key = "ed25519:<32-byte-hex-seed>"
-```
-
-Grounded recall responses include the signature algorithm and public key:
-
-```json
-{
-  "verified_context": "...",
-  "signature_alg": "ed25519",
-  "signature": "9b2d...",
-  "public_key": "ed25519:4f8c..."
-}
-```
-
-Clients verify `signature` over the exact UTF-8 bytes of `verified_context` using the pinned Ed25519 public key. The signature is a lowercase hex-encoded 64-byte Ed25519 signature. The public key is `ed25519:` plus the lowercase hex-encoded raw 32-byte Ed25519 public key.
-
-Treat the response `public_key` as discovery metadata; production clients should pin the expected public key from deployment config rather than trusting a key delivered by the same response they are verifying.
-
-For compatibility, `CUEMAP_SECRET_KEY` still enables legacy `hmac-sha256` signatures. HMAC verification requires sharing the same secret with verifiers, so Ed25519 is recommended for client-side or third-party verification.
+The website docs are the source of truth for endpoint behavior and are kept aligned with the checked-in Rust router. This README stays focused on building, operating, and understanding the engine; use the CLI and MCP sections above for the fastest local workflows.
 
 ## System Architecture
 
@@ -802,7 +418,7 @@ graph TB
     
     subgraph "Intelligence"
         NL[NL Tokenizer<br/>Lemmatization + RAKE]
-        PACKS[CuePacks<br/>Facet + Intent Rules]
+        STRUCT[Structural Facets<br/>Evidence + Metadata]
     end
     
     subgraph "Persistence"
@@ -821,7 +437,6 @@ graph TB
     AXUM --> SESSION
     
     QUEUE --> LEX
-    AXUM --> PACKS
     
     MAIN <-.-> PERSIST
     LEX <-.-> PERSIST
@@ -832,18 +447,18 @@ graph TB
     style QUEUE fill:#9C27B0
 ```
 
-### 2. Write Flow (POST /memories)
+### 2. Write Flow
 
 ```mermaid
 sequenceDiagram
     participant C as Client
-    participant API as API Handler
+    participant API as HTTP Handler
     participant NL as NL Tokenizer
     participant Norm as Normalizer
     participant Tax as Taxonomy
     participant Main as CueMap Engine
     
-    C->>API: POST /memories<br/>{content, cues[]}
+    C->>API: Memory write request<br/>{content, cues[]}
     
     alt cues[] is empty
         API->>NL: tokenize_to_cues(content)
@@ -865,19 +480,19 @@ sequenceDiagram
     Note over API,Main: Cue extraction and indexing happen synchronously
 ```
 
-### 3. Read Flow (POST /recall)
+### 3. Read Flow
 
 ```mermaid
 sequenceDiagram
     participant C as Client
-    participant API as API Handler
+    participant API as HTTP Handler
     participant Lex as Lexicon
     participant Alias as Alias Engine
     participant Art as CueBridge Artifacts
     participant Main as CueMap Engine
     participant Q as Job Queue
     
-    C->>API: POST /recall<br/>{query_text?, cues[], limit}
+    C->>API: Recall request<br/>{query_text?, cues[], limit}
     
     alt query_text provided
         API->>Lex: resolve_cues_from_text(query)
@@ -915,8 +530,8 @@ sequenceDiagram
 ```mermaid
 graph TB
     subgraph "Job Sources"
-        INGEST[Ingest API]
-        RECALL[POST /recall]
+        INGEST[Ingestion]
+        RECALL[Recall]
         AGENT[Self-Learning Agent]
         TIMER[60s Heatmap Tick]
     end
@@ -973,23 +588,22 @@ The agent transforms your local filesystem into a deterministic structural knowl
     *   **Documents**: PDF (text extraction), Word (DOCX), Excel (XLSX).
     *   **Data**: CSV (row-aware), JSON (key-aware), YAML, XML.
 *   **Tree-sitter Powered Chunking**: Smartly splits code into functions, classes, and modules while preserving context.
-*   **Deterministic Knowledge Extraction**: Uses tree-sitter structure, document parsers, metadata facets, token normalization, and CuePack rules; no runtime model call is required.
+*   **Deterministic Knowledge Extraction**: Uses tree-sitter structure, document parsers, metadata facets, and token normalization; no runtime model call is required.
 *   **Idempotent Updates**: Uses content-aware hashing (`file:<path>:<hash>`) to prevent memory duplication and ensure stale memories are pruned.
 *   **Background Verification Loop**: Continuously verifies that memories in the engine still exist on disk, pruning stale references automatically.
 
 ### 2. Deterministic Natural Language Engine
 
-CueMap bridges unstructured text to sparse deterministic recall without vector search, runtime models, or background semantic expansion.
+CueMap bridges unstructured text to sparse deterministic recall without vector search, runtime models, or background semantic expansion by default. Optional vector retrieval can add externally computed semantic candidates without changing the structural extraction path.
 
 #### How It Works
 
 At add-time, CueMap extracts cues synchronously from real structure:
 
 - normalized lexical cues
-- entity, quote, model-like, and quantity-object cues
+- surface entity, quote, model-like, and structural evidence cues
 - evidence facets such as numbers, money, dates, durations, and lists
 - source facets from metadata such as role, channel, session, and order
-- CuePack-derived deterministic facet and intent cues
 
 At query-time, CueMap uses the same deterministic normalization path, then applies only bounded in-memory expansions:
 
@@ -1000,9 +614,8 @@ At query-time, CueMap uses the same deterministic normalization path, then appli
 
 #### Semantic Boundary
 
-CueMap Core does not try to infer broad semantic relationships from local co-occurrence. That keeps recall fast, deterministic, and inspectable. Semantic gap closure belongs in explicit artifacts:
+CueMap Core does not try to infer broad semantic relationships from local co-occurrence or ontology rules. That keeps the default recall fast, deterministic, and inspectable. Semantic gap closure can come from externally precomputed vectors or explicit artifacts:
 
-- **CuePacks**: deterministic domain rules, facets, aliases, and query intent policies.
 - **Manual Lexicon Wiring**: explicit token-to-canonical cue connections for project owners.
 - **CueBridge Artifacts**: offline-compiled GapPack/AliasPack files generated by CueBridge Local or Cloud and loaded into CueMap.
 
