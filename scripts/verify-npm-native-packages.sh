@@ -14,7 +14,7 @@ mkdir -p "${VERIFY_DIR}"
   shasum -a 256 -c SHA256SUMS
 )
 
-for platform in darwin-arm64 darwin-x64 linux-x64; do
+for platform in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
   tarball="$(find "${DIST_DIR}/tarballs" -maxdepth 1 -name "cuemap-dev-engine-${platform}-*.tgz" -print -quit)"
   if [[ -z "${tarball}" ]]; then
     echo "Missing tarball for ${platform}" >&2
@@ -56,5 +56,11 @@ docker run --rm --platform linux/amd64 \
   -v "${ROOT_DIR}/scripts/verify-npm-native-runtime.cjs:/verify-runtime.cjs:ro" \
   node:20-trixie-slim \
   node /verify-runtime.cjs /package/bin/cuemap linux-x64
+
+docker run --rm --platform linux/arm64 \
+  -v "${VERIFY_DIR}/linux-arm64/package:/package:ro" \
+  -v "${ROOT_DIR}/scripts/verify-npm-native-runtime.cjs:/verify-runtime.cjs:ro" \
+  node:20-trixie-slim \
+  node /verify-runtime.cjs /package/bin/cuemap linux-arm64
 
 echo "Native package structure, checksums, tokenizer, ingestion, and recall checks passed"

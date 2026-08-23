@@ -47,7 +47,7 @@ The container runs as the unprivileged `cuemap` user. Ensure a bind-mounted data
 
 ### Native npm packages
 
-Build the Darwin ARM64, Darwin x64, and Linux x64 native packages without publishing them:
+Build the Darwin ARM64, Darwin x64, Linux x64, and Linux ARM64 native packages without publishing them:
 
 ```bash
 ./scripts/build-npm-native-packages.sh

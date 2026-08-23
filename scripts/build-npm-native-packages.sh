@@ -59,6 +59,16 @@ docker buildx build \
 cp "${linux_output}/cuemap" "${DIST_DIR}/binaries/cuemap-linux-x64"
 rm -rf "${linux_output}"
 
+echo "Building Linux ARM64 binary on Debian Trixie"
+linux_arm64_output="${DIST_DIR}/linux-arm64-output"
+docker buildx build \
+  --platform linux/arm64 \
+  --target native-binary \
+  --output "type=local,dest=${linux_arm64_output}" \
+  "${ROOT_DIR}"
+cp "${linux_arm64_output}/cuemap" "${DIST_DIR}/binaries/cuemap-linux-arm64"
+rm -rf "${linux_arm64_output}"
+
 write_package_json() {
   local output_path="$1"
   local package_name="$2"
@@ -110,6 +120,7 @@ stage_package() {
 stage_package "darwin-arm64" "darwin" "arm64"
 stage_package "darwin-x64" "darwin" "x64"
 stage_package "linux-x64" "linux" "x64"
+stage_package "linux-arm64" "linux" "arm64"
 
 (
   cd "${DIST_DIR}/tarballs"
