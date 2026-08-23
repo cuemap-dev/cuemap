@@ -57,9 +57,13 @@ impl OnnxSemanticEncoder {
         #[cfg(any(target_os = "ios", target_os = "macos"))]
         if config.coreml_enabled {
             builder = builder
-                .with_execution_providers([ort::ep::CoreML::default()
-                    .with_compute_units(ort::ep::coreml::ComputeUnits::CPUAndNeuralEngine)
-                    .build()])
+                .with_execution_providers([
+                    ort::execution_providers::CoreMLExecutionProvider::default()
+                        .with_compute_units(
+                            ort::execution_providers::coreml::CoreMLComputeUnits::CPUAndNeuralEngine,
+                        )
+                        .build(),
+                ])
                 .map_err(|error| format!("failed to configure CoreML execution provider: {error}"))?;
         }
 

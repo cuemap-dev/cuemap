@@ -98,8 +98,11 @@ base64 = "0.21"
 ahash = "0.8"
 toml = "1.0.3"
 quick-xml = "0.39.2"
-ort = { version = "2.0.0-rc.13", optional = true, features = ["coreml", "lax-feature-matching"] }
 tokenizers = { version = "0.23.1", optional = true }
+
+# ort rc.11+ no longer ships an Intel macOS distribution. Pin to rc.10,
+# which covers Intel macOS and the other release targets.
+ort = { version = "=2.0.0-rc.10", optional = true, features = ["coreml"] }
 
 [features]
 default = ["semantic-encoder"]
