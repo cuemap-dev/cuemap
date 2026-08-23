@@ -54,7 +54,7 @@ fi
 docker run --rm --platform linux/amd64 \
   -v "${VERIFY_DIR}/linux-x64/package:/package:ro" \
   -v "${ROOT_DIR}/scripts/verify-npm-native-runtime.cjs:/verify-runtime.cjs:ro" \
-  node:20-bookworm-slim \
+  node:20-trixie-slim \
   node /verify-runtime.cjs /package/bin/cuemap linux-x64
 
 echo "Native package structure, checksums, tokenizer, ingestion, and recall checks passed"

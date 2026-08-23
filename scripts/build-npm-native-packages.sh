@@ -49,7 +49,7 @@ echo "Building Darwin x64 binary"
 cargo build --manifest-path "${ROOT_DIR}/Cargo.toml" --locked --release --target x86_64-apple-darwin
 cp "${ROOT_DIR}/target/x86_64-apple-darwin/release/cuemap" "${DIST_DIR}/binaries/cuemap-darwin-x64"
 
-echo "Building Linux x64 binary on Debian Bookworm"
+echo "Building Linux x64 binary on Debian Trixie"
 linux_output="${DIST_DIR}/linux-x64-output"
 docker buildx build \
   --platform linux/amd64 \

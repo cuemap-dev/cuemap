@@ -54,7 +54,7 @@ Build the Darwin ARM64, Darwin x64, and Linux x64 native packages without publis
 ./scripts/verify-npm-native-packages.sh
 ```
 
-The packager builds Linux on Debian Bookworm for an older glibc baseline, bundles the checksum-pinned tokenizer, and writes package tarballs plus `SHA256SUMS` under `dist/npm-native/tarballs`.
+The packager builds Linux on Debian Trixie, bundles the checksum-pinned tokenizer, and writes package tarballs plus `SHA256SUMS` under `dist/npm-native/tarballs`.
 
 ### CLI Commands
 

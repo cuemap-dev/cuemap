@@ -1,8 +1,12 @@
 # syntax=docker/dockerfile:1
 
-FROM rust:1.93-slim-bookworm AS builder
+FROM rust:1.93-slim-trixie AS builder
 
 WORKDIR /build
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
@@ -19,7 +23,7 @@ FROM scratch AS native-binary
 
 COPY --from=builder /build/cuemap /cuemap
 
-FROM debian:bookworm-slim AS tokenizer
+FROM debian:trixie-slim AS tokenizer
 
 ARG TOKENIZER_URL="https://cuemap.dev/assets/en_tokenizer.bin.gz"
 ARG TOKENIZER_SHA256="f54fd31ec463f8646d0239bb531a64e0210ed1ae02bf5e3b42aeeb9bff8305ba"
@@ -32,7 +36,7 @@ RUN apt-get update \
     && gzip -dc /tmp/en_tokenizer.bin.gz > /en_tokenizer.bin \
     && rm /tmp/en_tokenizer.bin.gz
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:trixie-slim AS runtime
 
 ARG VERSION=0.7.2
 ARG REVISION=""
