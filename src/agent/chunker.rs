@@ -503,6 +503,7 @@ impl Chunker {
                 "lang:python",
                 ChunkCategory::Code,
                 Some(PYTHON_QUERY),
+                false,
             )
         })
     }
@@ -529,6 +530,7 @@ impl Chunker {
                 "lang:rust",
                 ChunkCategory::Code,
                 Some(RUST_QUERY),
+                true,
             )
         })
     }
@@ -559,6 +561,7 @@ impl Chunker {
                 "lang:typescript",
                 ChunkCategory::Code,
                 Some(TS_JS_QUERY),
+                false,
             )
         })
     }
@@ -586,6 +589,7 @@ impl Chunker {
                 "lang:javascript",
                 ChunkCategory::Code,
                 Some(TS_JS_QUERY),
+                false,
             )
         })
     }
@@ -609,6 +613,7 @@ impl Chunker {
                 "lang:go",
                 ChunkCategory::Code,
                 Some(GO_QUERY),
+                false,
             )
         })
     }
@@ -723,6 +728,7 @@ impl Chunker {
                 "lang:css",
                 ChunkCategory::Code,
                 None,
+                false,
             )
         })
     }
@@ -749,6 +755,7 @@ impl Chunker {
                 "lang:php",
                 ChunkCategory::Code,
                 Some(PHP_QUERY),
+                false,
             )
         })
     }
@@ -774,6 +781,7 @@ impl Chunker {
                 "lang:java",
                 ChunkCategory::Code,
                 Some(JAVA_QUERY),
+                false,
             )
         })
     }
@@ -785,6 +793,7 @@ impl Chunker {
         lang_tag: &str,
         category: ChunkCategory,
         query_str: Option<&str>,
+        include_comments: bool,
     ) -> Vec<Chunk> {
         let mut chunks = Vec::new();
         tracing::info!(
@@ -849,7 +858,19 @@ impl Chunker {
                 category,
                 max_chars,
                 &extracted_cues,
+                include_comments,
             );
+            if include_comments {
+                Self::append_uncovered_comment_chunks(
+                    tree.root_node(),
+                    content,
+                    &mut chunks,
+                    lang_tag,
+                    category,
+                    max_chars,
+                );
+                chunks.sort_by_key(|chunk| (chunk.start_line, chunk.end_line));
+            }
             tracing::info!("[CHUNKER DEBUG] After visit: {} chunks", chunks.len());
         }
 
@@ -892,9 +913,15 @@ impl Chunker {
         category: ChunkCategory,
         max_chars: usize,
         extracted_cues: &[(usize, usize, String)],
+        include_comments: bool,
     ) {
         let kind = node.kind();
-        let start_row = node.start_position().row;
+        let (source_start_byte, source_start_row) = if include_comments {
+            Self::leading_comment_start(node, content)
+        } else {
+            (node.start_byte(), node.start_position().row)
+        };
+        let start_row = source_start_row;
         let end_row = node.end_position().row;
         // let line_count = end_row - start_row;
 
@@ -954,7 +981,10 @@ impl Chunker {
                     }
                 });
 
-            let text = node.utf8_text(content.as_bytes()).unwrap_or("").to_string();
+            let text = content
+                .get(source_start_byte..node.end_byte())
+                .unwrap_or_else(|| node.utf8_text(content.as_bytes()).unwrap_or(""))
+                .to_string();
 
             let type_cue = kind
                 .replace("_declaration", "")
@@ -978,7 +1008,7 @@ impl Chunker {
                 byte_len
             );
 
-            let chunk_start_byte = node.start_byte();
+            let chunk_start_byte = source_start_byte;
             let chunk_end_byte = node.end_byte();
 
             let mut chunk_cues = vec![
@@ -1028,6 +1058,7 @@ impl Chunker {
                     category,
                     max_chars,
                     extracted_cues,
+                    include_comments,
                 );
             }
 
@@ -1075,9 +1106,141 @@ impl Chunker {
                     category,
                     max_chars,
                     extracted_cues,
+                    include_comments,
                 );
             }
         }
+    }
+
+    fn is_comment_node(kind: &str) -> bool {
+        matches!(kind, "comment" | "line_comment" | "block_comment")
+    }
+
+    fn leading_comment_start(node: tree_sitter::Node, content: &str) -> (usize, usize) {
+        let mut start_byte = node.start_byte();
+        let mut start_row = node.start_position().row;
+        let mut previous = node.prev_named_sibling();
+
+        while let Some(comment) = previous {
+            if !Self::is_comment_node(comment.kind()) {
+                break;
+            }
+            let only_whitespace_between = content
+                .get(comment.end_byte()..start_byte)
+                .map(|between| between.trim().is_empty())
+                .unwrap_or(false);
+            let directly_precedes_item = start_row <= comment.end_position().row.saturating_add(1);
+            if !only_whitespace_between || !directly_precedes_item {
+                break;
+            }
+            start_byte = comment.start_byte();
+            start_row = comment.start_position().row;
+            previous = comment.prev_named_sibling();
+        }
+
+        (start_byte, start_row)
+    }
+
+    fn append_uncovered_comment_chunks(
+        root: tree_sitter::Node,
+        content: &str,
+        chunks: &mut Vec<Chunk>,
+        lang_tag: &str,
+        category: ChunkCategory,
+        max_chars: usize,
+    ) {
+        let mut comments = Vec::new();
+        Self::collect_comment_ranges(root, &mut comments);
+        comments.sort_by_key(|comment| comment.0);
+
+        let uncovered: Vec<(usize, usize, usize, usize)> = comments
+            .into_iter()
+            .filter(|(_, _, start_row, end_row)| {
+                let start_line = start_row + 1;
+                let end_line = end_row + 1;
+                !chunks.iter().any(|chunk| {
+                    chunk.start_line <= start_line && chunk.end_line >= end_line
+                })
+            })
+            .collect();
+
+        let mut group: Option<(usize, usize, usize, usize)> = None;
+        for comment in uncovered {
+            let should_merge = group
+                .as_ref()
+                .map(|(start_byte, _, _, end_row)| {
+                    comment.2 <= end_row.saturating_add(1)
+                        && comment.1.saturating_sub(*start_byte) <= max_chars
+                })
+                .unwrap_or(false);
+
+            if should_merge {
+                if let Some((_, end_byte, _, end_row)) = group.as_mut() {
+                    *end_byte = comment.1;
+                    *end_row = comment.3;
+                }
+            } else {
+                if let Some(previous) = group.take() {
+                    Self::push_comment_chunk(
+                        content,
+                        chunks,
+                        previous,
+                        lang_tag,
+                        category,
+                    );
+                }
+                group = Some(comment);
+            }
+        }
+
+        if let Some(previous) = group {
+            Self::push_comment_chunk(content, chunks, previous, lang_tag, category);
+        }
+    }
+
+    fn collect_comment_ranges(
+        node: tree_sitter::Node,
+        comments: &mut Vec<(usize, usize, usize, usize)>,
+    ) {
+        if Self::is_comment_node(node.kind()) {
+            comments.push((
+                node.start_byte(),
+                node.end_byte(),
+                node.start_position().row,
+                node.end_position().row,
+            ));
+            return;
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            Self::collect_comment_ranges(child, comments);
+        }
+    }
+
+    fn push_comment_chunk(
+        content: &str,
+        chunks: &mut Vec<Chunk>,
+        comment: (usize, usize, usize, usize),
+        lang_tag: &str,
+        category: ChunkCategory,
+    ) {
+        let Some(text) = content.get(comment.0..comment.1) else {
+            return;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+
+        chunks.push(Chunk {
+            content: text.to_string(),
+            start_line: comment.2 + 1,
+            end_line: comment.3 + 1,
+            context: "comment:block".to_string(),
+            structural_cues: vec![lang_tag.to_string(), "type:comment_block".to_string()],
+            category,
+        });
     }
 
     fn chunk_markdown(content: &str) -> Vec<Chunk> {

@@ -88,6 +88,61 @@ fn test_detect_type() {
 }
 
 #[test]
+fn rust_chunking_keeps_comments_in_source_neighborhoods() {
+    let content = r#"//! Module-level explanation kept as searchable context.
+
+use std::fmt;
+
+/// Keeps lexical discovery bounded before local reranking.
+/// This belongs with the function it explains.
+fn rerank_candidates() {
+    // Internal implementation notes are already inside the function chunk.
+    let limit = 200;
+}
+
+// Standalone architecture note.
+// The encoder never downloads models at runtime.
+
+const DEFAULT_LIMIT: usize = 200;
+"#;
+
+    let chunks = Chunker::chunk_file(std::path::Path::new("semantic.rs"), content);
+    let function = chunks
+        .iter()
+        .find(|chunk| chunk.context == "function_item:rerank_candidates")
+        .expect("function chunk");
+
+    assert!(function
+        .content
+        .starts_with("/// Keeps lexical discovery bounded"));
+    assert!(function.content.contains("Internal implementation notes"));
+    assert_eq!(
+        chunks
+            .iter()
+            .filter(|chunk| chunk.content.contains("Internal implementation notes"))
+            .count(),
+        1,
+        "comments already inside code chunks must not be duplicated"
+    );
+
+    assert!(chunks.iter().any(|chunk| {
+        chunk.context == "comment:block"
+            && chunk.content.contains("Module-level explanation")
+            && chunk
+                .structural_cues
+                .iter()
+                .any(|cue| cue == "type:comment_block")
+    }));
+    assert!(chunks.iter().any(|chunk| {
+        chunk.context == "comment:block"
+            && chunk.content.contains("encoder never downloads models")
+    }));
+    assert!(chunks
+        .windows(2)
+        .all(|pair| pair[0].start_line <= pair[1].start_line));
+}
+
+#[test]
 fn logical_block_chunking_keeps_paragraph_and_list_structure() {
     let content = "\
 Intro paragraph with the project context. It has a second sentence.
