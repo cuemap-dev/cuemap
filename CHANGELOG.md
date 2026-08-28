@@ -2,6 +2,16 @@
 
 All notable changes to the CueMap Rust Engine will be documented in this file.
 
+## [0.7.3] - 2026-08-27
+
+### Added
+- **Mobile-language ingestion**: Added Tree-sitter-backed chunking and structural cues for Swift, Dart, Objective-C, and Kotlin files, including uppercase extensions and code-fence routing.
+- **Broader source ingestion**: Added Tree-sitter-backed chunking for C, C++, C#, and Bash, plus structured TOML ingestion. Ambiguous `.h` files use source syntax and Apple-project markers to distinguish Objective-C from C/C++.
+- **Language-aware cue filtering**: Added keyword sets for the new mobile languages so code ingestion does not pollute lexical cues with language syntax.
+
+### Fixed
+- **Lemmatization correctness**: Corrected common false lemmas, with regression coverage for truncated and wrong-part-of-speech outputs.
+
 ## [0.7.2] - 2026-08-04
 
 ### Added

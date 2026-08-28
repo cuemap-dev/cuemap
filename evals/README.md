@@ -1,6 +1,6 @@
-# CueMap v0.7.2 Evaluation Pack
+# CueMap v0.7.3 Evaluation Pack
 
-CueMap is a deterministic memory engine with an embedding-free, vector-database-free, LLM-free recall hot path. These reports document the v0.7.2 retrieval runs used to calibrate release readiness across LongMemEval, LoCoMo, and BEAM.
+CueMap is a deterministic memory engine with an embedding-free, vector-database-free, LLM-free recall hot path. These reports document the v0.7.3 retrieval runs used to calibrate release readiness across LongMemEval, LoCoMo, and BEAM.
 
 The short version: CueMap is already very strong on compact long-memory retrieval, competitive on LoCoMo when adjacent context expansion is enabled, and shows strong candidate discovery at BEAM 10M scale. The latest raw BEAM 128K, 1M, and 10M runs reach 84.2%, 80.3%, and 67.0% Hit@20, with 4,702, 2,934, and 1,749 average top-20 context tokens respectively. The separate historical CueBridge question-oracle run improved Hit@20 by 10 questions; it is reported independently from the latest raw baselines.
 

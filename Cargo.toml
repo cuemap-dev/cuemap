@@ -1,6 +1,6 @@
 [package]
 name = "cuemap"
-version = "0.7.2"
+version = "0.7.3"
 edition = "2021"
 autobins = false
 license = "BSL-1.1"
@@ -63,6 +63,15 @@ tree-sitter-html = "0.23.1"
 tree-sitter-css = "0.23.1"
 tree-sitter-java = "0.23.0"
 tree-sitter-php = "0.23.0"
+tree-sitter-swift = "0.7.3"
+tree-sitter-dart = "0.2.0"
+tree-sitter-objc = "3.0.2"
+brokk-tree-sitter-kotlin = "0.4.0"
+tree-sitter-c = "0.24.2"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-c-sharp = "0.23.5"
+tree-sitter-bash = "0.25.1"
+tree-sitter-toml-ng = "0.7.0"
 csv = "1.3"
 serde_yaml = "0.9"
 half = { version = "1.8.3", features = ["serde"] }

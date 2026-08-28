@@ -1,7 +1,18 @@
-# CueMap Rust Engine
+<p align="center">
+  <img src="https://raw.githubusercontent.com/cuemap-dev/cuemap/main/landing-pagev3/public/cuemap-social-mark-v1.png" alt="CueMap" width="120">
+</p>
 
-[![CI](https://github.com/cuemap-dev/cuemap/actions/workflows/coverage.yml/badge.svg?branch=v0.7.2)](https://github.com/cuemap-dev/cuemap/actions/workflows/coverage.yml)
-[![Coverage](https://codecov.io/github/cuemap-dev/cuemap/branch/v0.7.2/graph/badge.svg?flag=rust-engine)](https://app.codecov.io/github/cuemap-dev/cuemap)
+<h1 align="center">CueMap Rust Engine</h1>
+
+<p align="center">Fast, accurate, and explainable temporal-associative memory for agents.</p>
+
+<p align="center">
+  <a href="https://github.com/cuemap-dev/cuemap/actions/workflows/coverage.yml"><img src="https://github.com/cuemap-dev/cuemap/actions/workflows/coverage.yml/badge.svg?branch=v0.7.3" alt="CI"></a>
+  <a href="https://app.codecov.io/github/cuemap-dev/cuemap"><img src="https://codecov.io/github/cuemap-dev/cuemap/branch/v0.7.3/graph/badge.svg?flag=rust-engine" alt="Coverage"></a>
+  <a href="https://crates.io/crates/cuemap"><img src="https://img.shields.io/crates/v/cuemap?logo=rust" alt="Crates.io"></a>
+  <a href="https://docs.rs/cuemap"><img src="https://img.shields.io/docsrs/cuemap?logo=docs.rs" alt="docs.rs"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSL--1.1-5e5ce6" alt="License"></a>
+</p>
 
 **High-performance temporal-associative memory store** designed for dynamic contextual retrieval.
 
@@ -15,9 +26,9 @@ CueMap implements a **Continuous Gradient Algorithm** optimized for associative 
 4.  **Reinforcement (Access-based Learning)**: Frequently accessed memories gain signal strength, remaining highly accessible even as they age.
 5.  **Sparse Recall**: Uses normalized lexical cues, structural facets, recency, salience, and bounded deterministic reranking.
 
-As of v0.7.2, CueMap's default core path is deterministic and ontology-free. GloVe/Ollama cue generation, WordNet/POS expansion, semantic bridges, pattern completion, external lexicon graphs, context expansion/speculation endpoints, and autonomous consolidation have been removed from the default engine path. v0.7.2 bundles a qint8 `all-MiniLM-L3-v2` vector layer for semantic reranking, intent classification, and query embeddings; the `edge` profile selects a q4 build of the same model. The encoder can still be disabled for constrained builds or deployments.
+As of v0.7.2+, CueMap's default core path is deterministic and ontology-free. GloVe/Ollama cue generation, WordNet/POS expansion, semantic bridges, pattern completion, external lexicon graphs, context expansion/speculation endpoints, and autonomous consolidation have been removed from the default engine path. v0.7.2+ bundles a qint8 `all-MiniLM-L3-v2` vector layer for semantic reranking, intent classification, and query embeddings; the `edge` profile selects a q4 build of the same model. The encoder can still be disabled for constrained builds or deployments.
 
-v0.7.2 also uses numeric per-project memory IDs everywhere. If callers need deterministic upsert/dedupe identity, pass `source_key`; memory IDs remain compact runtime addresses.
+v0.7.2+ also uses numeric per-project memory IDs everywhere. If callers need deterministic upsert/dedupe identity, pass `source_key`; memory IDs remain compact runtime addresses. Tree-sitter-backed ingestion now covers Swift, Dart, Objective-C, Kotlin, C, C++, C#, and Bash source files, plus structured TOML files.
 
 Built with Rust for maximum performance and reliability.
 
@@ -39,8 +50,8 @@ CueMap treats the nlprule tokenizer as a runtime asset, not a build artifact. Se
 ### Docker
 
 ```bash
-docker build -t cuemap/engine:0.7.2 .
-docker run -p 8080:8080 -v "$(pwd)/local_snapshot_dir:/app/data" cuemap/engine:0.7.2
+docker build -t cuemap/engine:0.7.3 .
+docker run -p 8080:8080 -v "$(pwd)/local_snapshot_dir:/app/data" cuemap/engine:0.7.3
 ```
 
 The container runs as the unprivileged `cuemap` user. Ensure a bind-mounted data directory is writable by UID/GID `10001`, or use a Docker-managed volume. Runtime defaults can be overridden with `CUEMAP_PORT`, `CUEMAP_DATA_DIR`, `CUEMAP_SNAPSHOT_INTERVAL_SECONDS`, `TOKENIZER_PATH`, and `RUST_LOG`.
@@ -188,7 +199,7 @@ Snapshots are automatically managed:
 - **Disabled**: `--disable-snapshots` turns off periodic and shutdown snapshot saves.
 - **Location**: `~/.cuemap/data/snapshots/` by default, or `<--data-dir>/snapshots` when `--data-dir` is set. Older installs may also be discovered under the legacy sibling `snapshots/` directory.
 - **Format**: zstd-compressed JSON inside `.bin` files. This preserves arbitrary metadata reliably while keeping snapshots compact; older uncompressed bincode snapshots remain readable when their metadata can be decoded.
-- **Migration note**: Some pre-v0.7.2 bincode snapshots that contain dynamic JSON metadata cannot be decoded by bincode's `deserialize_any` limitation. Those projects are reported at startup and must be reingested or exported from a compatible older binary before upgrading.
+- **Migration note**: Some pre-v0.7.3 bincode snapshots that contain dynamic JSON metadata cannot be decoded by bincode's `deserialize_any` limitation. Those projects are reported at startup and must be reingested or exported from a compatible older binary before upgrading.
 - **Files**: `{project-id}.bin`, `{project-id}_lexicon.bin`, `{project-id}_aliases.bin`
 
 ### Cloud Backup
@@ -277,11 +288,11 @@ To optimize storage efficiency, especially for large textual memories, CueMap em
 
 ## Performance
 
-### Benchmark Results (v0.7.2)
+### Benchmark Results (v0.7.3)
 
 Tests performed on **Real-World Data** (Wikipedia Articles), processing full natural language sentences with the complete NLP pipeline.
 
-**Hardware:** MacBook Pro M-series, 64GB RAM, single node. The v0.7.2 release table below records completed lexical and hybrid runs at 10K, 100K, and 1M memories. Lexical runs isolate the sparse core with the semantic encoder disabled; hybrid runs include the bundled local encoder. P95 is the release headline percentile, while P99 remains available in the JSON diagnostics.
+**Hardware:** MacBook Pro M-series, 64GB RAM, single node. The v0.7.3 release table below records completed lexical and hybrid runs at 10K, 100K, and 1M memories. Lexical runs isolate the sparse core with the semantic encoder disabled; hybrid runs include the bundled local encoder. P95 is the release headline percentile, while P99 remains available in the JSON diagnostics.
 
 #### Benchmark Methodology
 
@@ -315,7 +326,7 @@ same command with `--semantic-mode hybrid` to produce the hybrid comparison. The
 dataset is downloaded only once and reused from the local cache on subsequent
 runs.
 
-#### v0.7.2 latency comparison
+#### v0.7.3 latency comparison
 
 The lexical release rerun now covers 10K, 100K, and 1M writes plus lean recall
 queries. The compact comparison below records the 10K, 100K, and 1M hybrid
@@ -356,9 +367,9 @@ Write latency remains mostly flat with project size; the dominant cost is per-me
 | **1,000,000** | 2.63 ms | 2.06 ms | 3.72 ms | 378 ops/s |
 
 **Key Metrics**:
-- **Low-latency recall:** The lexical v0.7.2 1M run measured 2.63ms average with 3.72ms p95; hybrid measurements remain separate because they include bundled encoder work.
+- **Low-latency recall:** The lexical v0.7.3 1M run measured 2.63ms average with 3.72ms p95; hybrid measurements remain separate because they include bundled encoder work.
 - **Numeric ID memory reduction:** 1M in-memory footprint dropped from about 5.25GB to about 1.93GB after the v0.7 numeric memory-ID refactor.
-- **Controlled hot path:** the release benchmark disables the local semantic encoder, LLMs, network services, and disk scans; normal v0.7.2 hybrid recall can use the bundled local encoder for bounded reranking.
+- **Controlled hot path:** the release benchmark disables the local semantic encoder, LLMs, network services, and disk scans; normal v0.7.3 hybrid recall can use the bundled local encoder for bounded reranking.
 
 ## Architecture
 
@@ -584,9 +595,9 @@ graph TB
 The agent transforms your local filesystem into a deterministic structural knowledge base with zero manual effort.
 
 *   **Universal Format Support**: Deeply integrates with dozens of formats:
-    *   **Languages**: Rust, Python, TypeScript, Go, Java, PHP, HTML, CSS (via Tree-sitter).
+    *   **Languages**: Rust, Python, TypeScript, JavaScript, Go, Java, PHP, HTML, CSS, Swift, Dart, Objective-C, Kotlin, C, C++, C#, and Bash (via Tree-sitter).
     *   **Documents**: PDF (text extraction), Word (DOCX), Excel (XLSX).
-    *   **Data**: CSV (row-aware), JSON (key-aware), YAML, XML.
+    *   **Data**: CSV (row-aware), JSON (key-aware), YAML, XML, TOML.
 *   **Tree-sitter Powered Chunking**: Smartly splits code into functions, classes, and modules while preserving context.
 *   **Deterministic Knowledge Extraction**: Uses tree-sitter structure, document parsers, metadata facets, and token normalization; no runtime model call is required.
 *   **Idempotent Updates**: Uses content-aware hashing (`file:<path>:<hash>`) to prevent memory duplication and ensure stale memories are pruned.

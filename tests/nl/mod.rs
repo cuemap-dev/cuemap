@@ -30,6 +30,21 @@ fn test_normalize_text() {
 }
 
 #[test]
+fn test_new_language_contexts_are_supported() {
+    assert_eq!(Language::from("lang:c"), Language::C);
+    assert_eq!(Language::from("lang:cpp"), Language::Cpp);
+    assert_eq!(Language::from("lang:csharp"), Language::CSharp);
+    assert_eq!(Language::from("lang:bash"), Language::Bash);
+    assert_eq!(Language::from("lang:toml"), Language::Toml);
+
+    assert!(get_language_stopwords(Language::C).contains("struct"));
+    assert!(get_language_stopwords(Language::Cpp).contains("namespace"));
+    assert!(get_language_stopwords(Language::CSharp).contains("foreach"));
+    assert!(get_language_stopwords(Language::Bash).contains("function"));
+    assert!(get_language_stopwords(Language::Toml).contains("true"));
+}
+
+#[test]
 fn test_product_case_boundaries_emit_component_cues() {
     let cues = tokenize_to_cues("My iPhone 13 Pro syncs with GitHub and PowerPoint.");
 
@@ -166,6 +181,63 @@ fn test_multiword_verb_exceptions_do_not_rewrite_component_words() {
             expected,
             "{word} should stem to {expected}"
         );
+    }
+}
+
+#[test]
+fn test_common_lemmas_do_not_use_truncated_or_wrong_pos_forms() {
+    let cases = [
+        ("analyzes", "analyze"),
+        ("arises", "arise"),
+        ("arses", "arse"),
+        ("bodies", "body"),
+        ("bridges", "bridge"),
+        ("buzzes", "buzz"),
+        ("canvasses", "canvass"),
+        ("churches", "church"),
+        ("coaxes", "coax"),
+        ("companies", "company"),
+        ("compasses", "compass"),
+        ("carouses", "carouse"),
+        ("delves", "delve"),
+        ("divvies", "divvy"),
+        ("fishing", "fish"),
+        ("frizzes", "frizz"),
+        ("getting", "get"),
+        ("glasses", "glass"),
+        ("imagines", "imagine"),
+        ("interleaves", "interleave"),
+        ("judges", "judge"),
+        ("paralyzes", "paralyze"),
+        ("pasting", "paste"),
+        ("phases", "phase"),
+        ("phantasies", "phantasy"),
+        ("pickaxes", "pickaxe"),
+        ("pledges", "pledge"),
+        ("premiered", "premiere"),
+        ("programming", "program"),
+        ("putting", "put"),
+        ("raises", "raise"),
+        ("reaches", "reach"),
+        ("sasses", "sass"),
+        ("sexes", "sex"),
+        ("sises", "sise"),
+        ("stories", "story"),
+        ("taxes", "tax"),
+        ("teaches", "teach"),
+        ("tawses", "tawse"),
+        ("tries", "try"),
+        ("using", "use"),
+        ("uses", "use"),
+        ("wishes", "wish"),
+        ("witnesses", "witness"),
+        ("curries", "curry"),
+        ("curtsies", "curtsy"),
+        ("overemphasises", "overemphasise"),
+    ];
+
+    for (word, expected) in cases {
+        assert_eq!(stem_word(word), expected, "{word} should stem to {expected}");
     }
 }
 
