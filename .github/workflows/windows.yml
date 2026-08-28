@@ -1,0 +1,37 @@
+name: Windows Compatibility
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows x64 build and tests
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check all targets with the default feature set
+        run: cargo check --locked --all-targets
+
+      - name: Run Windows-compatible tests without the optional encoder
+        run: cargo test --locked --no-default-features --all-targets -- --test-threads=1
+
+      - name: Build the release executable
+        run: cargo build --locked --release
+
+      - name: Verify the Windows executable
+        run: .\target\release\cuemap.exe --version
