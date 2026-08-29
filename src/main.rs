@@ -58,6 +58,43 @@ mod tests {
         format!("http://{address}")
     }
 
+    fn shell_command(command: &str) -> (PathBuf, Vec<String>) {
+        #[cfg(windows)]
+        {
+            let shell = std::env::var_os("COMSPEC")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("cmd.exe"));
+            return (shell, vec!["/C".to_string(), command.to_string()]);
+        }
+
+        #[cfg(not(windows))]
+        {
+            (
+                PathBuf::from("/bin/sh"),
+                vec!["-c".to_string(), command.to_string()],
+            )
+        }
+    }
+
+    fn long_running_command() -> std::process::Command {
+        #[cfg(windows)]
+        {
+            let shell = std::env::var_os("COMSPEC")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("cmd.exe"));
+            let mut command = std::process::Command::new(shell);
+            command.args(["/C", "ping 127.0.0.1 -n 31 > NUL"]);
+            command
+        }
+
+        #[cfg(not(windows))]
+        {
+            let mut command = std::process::Command::new("sleep");
+            command.arg("30");
+            command
+        }
+    }
+
     fn add_args(url: String) -> AddArgs {
         AddArgs {
             content: "cli memory".to_string(),
@@ -380,12 +417,13 @@ mod tests {
         .is_err());
 
         let spawned_log = root.path().join("spawned.log");
-        let shell_args = vec![
-            "-c".to_string(),
-            "printf 'Unstable sorting for speed\\n'".to_string(),
-        ];
+        let (shell, shell_args) = shell_command(if cfg!(windows) {
+            "echo Unstable sorting for speed"
+        } else {
+            "printf 'Unstable sorting for speed\\n'"
+        });
         assert!(spawn_detached_process(
-            Path::new("/bin/sh"),
+            &shell,
             &shell_args,
             &spawned_log,
             "Unstable sorting for speed",
@@ -394,9 +432,13 @@ mod tests {
         .await
         .unwrap());
 
-        let timeout_args = vec!["-c".to_string(), "true".to_string()];
+        let (shell, timeout_args) = shell_command(if cfg!(windows) {
+            "exit 0"
+        } else {
+            "true"
+        });
         assert!(!spawn_detached_process(
-            Path::new("/bin/sh"),
+            &shell,
             &timeout_args,
             &root.path().join("spawn-timeout.log"),
             "never appears",
@@ -404,8 +446,9 @@ mod tests {
         )
         .await
         .unwrap());
+        let missing_executable = root.path().join("definitely-missing-cuemap-child");
         assert!(spawn_detached_process(
-            Path::new("/definitely/missing/cuemap-child"),
+            &missing_executable,
             &[],
             &root.path().join("spawn-error.log"),
             "ready",
@@ -502,10 +545,7 @@ mod tests {
         let missing_path = root.path().join("missing.pid");
         handle_stop_at(missing_path).await;
 
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
+        let mut child = long_running_command().spawn().unwrap();
         let pid_path = root.path().join("running.pid");
         std::fs::write(&pid_path, child.id().to_string()).unwrap();
         handle_stop_at(pid_path.clone()).await;
@@ -2977,6 +3017,7 @@ async fn handle_stop_at(pid_path: PathBuf) {
         use std::process::Command;
         let res = Command::new("taskkill")
             .arg("/F")
+            .arg("/T")
             .arg("/PID")
             .arg(pid.to_string())
             .status();

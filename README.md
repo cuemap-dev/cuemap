@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/cuemap-dev/cuemap/main/landing-pagev3/public/cuemap-social-mark-v1.png" alt="CueMap" width="120">
+  <img src="https://cuemap.dev/cuemap-logo.PNG" alt="CueMap" width="120">
 </p>
 
 <h1 align="center">CueMap Rust Engine</h1>
@@ -9,8 +9,6 @@
 <p align="center">
   <a href="https://github.com/cuemap-dev/cuemap/actions/workflows/coverage.yml"><img src="https://github.com/cuemap-dev/cuemap/actions/workflows/coverage.yml/badge.svg?branch=v0.7.3" alt="CI"></a>
   <a href="https://app.codecov.io/github/cuemap-dev/cuemap"><img src="https://codecov.io/github/cuemap-dev/cuemap/branch/v0.7.3/graph/badge.svg?flag=rust-engine" alt="Coverage"></a>
-  <a href="https://crates.io/crates/cuemap"><img src="https://img.shields.io/crates/v/cuemap?logo=rust" alt="Crates.io"></a>
-  <a href="https://docs.rs/cuemap"><img src="https://img.shields.io/docsrs/cuemap?logo=docs.rs" alt="docs.rs"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSL--1.1-5e5ce6" alt="License"></a>
 </p>
 

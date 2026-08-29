@@ -41,6 +41,12 @@ jobs:
             npm_os: darwin
             npm_arch: arm64
             pkg_name: engine-darwin-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            arch: x64
+            npm_os: win32
+            npm_arch: x64
+            pkg_name: engine-win32-x64
 
     steps:
       - name: Checkout Repository
@@ -67,26 +73,35 @@ jobs:
         shell: bash
         run: |
           package_dir="npm-packages/${{ matrix.pkg_name }}"
-          mkdir -p "${package_dir}/bin" "${package_dir}/assets"
-          
-          cp target/${{ matrix.target }}/release/cuemap "${package_dir}/bin/cuemap-native"
-          cp scripts/npm-native-wrapper.cjs "${package_dir}/bin/cuemap"
-          cp scripts/npm-native-README.md "${package_dir}/README.md"
-          cp LICENSE "${package_dir}/LICENSE"
-          chmod +x "${package_dir}/bin/cuemap" "${package_dir}/bin/cuemap-native"
+          mkdir -p "$package_dir/bin" "$package_dir/assets"
+
+          if [[ "${{ matrix.npm_os }}" == "win32" ]]; then
+            native_binary="cuemap.exe"
+            packaged_binary="cuemap-native.exe"
+          else
+            native_binary="cuemap"
+            packaged_binary="cuemap-native"
+          fi
+          cp "target/${{ matrix.target }}/release/$native_binary" "$package_dir/bin/$packaged_binary"
+          cp scripts/npm-native-wrapper.cjs "$package_dir/bin/cuemap"
+          cp scripts/npm-native-README.md "$package_dir/README.md"
+          cp LICENSE "$package_dir/LICENSE"
+          if [[ "${{ matrix.npm_os }}" != "win32" ]]; then
+            chmod +x "$package_dir/bin/cuemap" "$package_dir/bin/$packaged_binary"
+          fi
 
           tokenizer_url="https://cuemap.dev/assets/en_tokenizer.bin.gz"
           tokenizer_sha256="f54fd31ec463f8646d0239bb531a64e0210ed1ae02bf5e3b42aeeb9bff8305ba"
-          curl -fsSL --retry 3 "${tokenizer_url}" -o "${package_dir}/assets/en_tokenizer.bin.gz"
+          curl -fsSL --retry 3 "$tokenizer_url" -o "$package_dir/assets/en_tokenizer.bin.gz"
           node -e '
             const fs = require("node:fs");
             const crypto = require("node:crypto");
             const [file, expected] = process.argv.slice(1);
             const actual = crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
             if (actual !== expected) throw new Error(`Tokenizer checksum mismatch: ${actual}`);
-          ' "${package_dir}/assets/en_tokenizer.bin.gz" "${tokenizer_sha256}"
-          gzip -dc "${package_dir}/assets/en_tokenizer.bin.gz" > "${package_dir}/assets/en_tokenizer.bin"
-          rm "${package_dir}/assets/en_tokenizer.bin.gz"
+          ' "$package_dir/assets/en_tokenizer.bin.gz" "$tokenizer_sha256"
+          gzip -dc "$package_dir/assets/en_tokenizer.bin.gz" > "$package_dir/assets/en_tokenizer.bin"
+          rm "$package_dir/assets/en_tokenizer.bin.gz"
           
           version="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
           node -e '
@@ -108,14 +123,18 @@ jobs:
             };
             if (os === "linux") manifest.libc = ["glibc"];
             fs.writeFileSync(output, `${JSON.stringify(manifest, null, 2)}\n`);
-          ' "${package_dir}/package.json" "${version}" "${{ matrix.npm_os }}" "${{ matrix.npm_arch }}" "${{ matrix.pkg_name }}"
+          ' "$package_dir/package.json" "$version" "${{ matrix.npm_os }}" "${{ matrix.npm_arch }}" "${{ matrix.pkg_name }}"
 
       - name: Verify NPM package contents
         working-directory: npm-packages/${{ matrix.pkg_name }}
         shell: bash
         run: |
-          test -x bin/cuemap
-          test -x bin/cuemap-native
+          test -f bin/cuemap
+          if [[ "${{ matrix.npm_os }}" == "win32" ]]; then
+            test -f bin/cuemap-native.exe
+          else
+            test -f bin/cuemap-native
+          fi
           test -s assets/en_tokenizer.bin
           npm pack --dry-run
 

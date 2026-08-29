@@ -560,19 +560,36 @@ pub async fn setup_shutdown_handler<T>(
         + 'static,
 {
     tokio::spawn(async move {
-        // Wait for SIGINT (Ctrl+C) or SIGTERM
-        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        // Unix supports both Ctrl+C and SIGTERM (for example, from Docker).
+        #[cfg(unix)]
+        {
+            let mut sigint = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::interrupt(),
+            )
             .expect("Failed to create SIGINT handler");
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            let mut sigterm = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::terminate(),
+            )
             .expect("Failed to create SIGTERM handler");
 
-        tokio::select! {
-            _ = sigint.recv() => {
-                info!("Received SIGINT, shutting down gracefully...");
+            tokio::select! {
+                _ = sigint.recv() => {
+                    info!("Received SIGINT, shutting down gracefully...");
+                }
+                _ = sigterm.recv() => {
+                    info!("Received SIGTERM, shutting down gracefully...");
+                }
             }
-            _ = sigterm.recv() => {
-                info!("Received SIGTERM, shutting down gracefully...");
-            }
+        }
+
+        // Windows does not expose Unix signal streams through Tokio; Ctrl+C is
+        // the portable console shutdown signal there.
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("Failed to create Ctrl+C handler");
+            info!("Received Ctrl+C, shutting down gracefully...");
         }
 
         // Save final snapshot
