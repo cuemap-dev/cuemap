@@ -12,6 +12,9 @@ All notable changes to the CueMap Rust Engine will be documented in this file.
 ### Fixed
 - **Lemmatization correctness**: Corrected common false lemmas, with regression coverage for truncated and wrong-part-of-speech outputs.
 
+### Changed
+- **License**: The CueMap Rust Engine and native engine packages are licensed under Apache-2.0 from v0.7.3 onward. Earlier releases remain under BSL-1.1.
+
 ## [0.7.2] - 2026-08-04
 
 ### Added

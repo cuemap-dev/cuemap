@@ -71,9 +71,14 @@ async function stopChild() {
 async function main() {
   const port = await findFreePort();
   const baseUrl = `http://127.0.0.1:${port}`;
+  const runThroughNode = process.platform === "win32"
+    && path.extname(executable).toLowerCase() !== ".exe";
+  const spawnExecutable = runThroughNode ? process.execPath : executable;
+  const spawnArgs = runThroughNode ? [executable] : [];
   child = spawn(
-    executable,
+    spawnExecutable,
     [
+      ...spawnArgs,
       "start",
       "--port",
       String(port),

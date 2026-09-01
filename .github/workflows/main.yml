@@ -86,6 +86,7 @@ jobs:
           cp scripts/npm-native-wrapper.cjs "$package_dir/bin/cuemap"
           cp scripts/npm-native-README.md "$package_dir/README.md"
           cp LICENSE "$package_dir/LICENSE"
+          cp NOTICE "$package_dir/NOTICE"
           if [[ "${{ matrix.npm_os }}" != "win32" ]]; then
             chmod +x "$package_dir/bin/cuemap" "$package_dir/bin/$packaged_binary"
           fi
@@ -115,10 +116,10 @@ jobs:
               os: [os],
               cpu: [cpu],
               bin: { cuemap: "bin/cuemap" },
-              files: ["bin", "assets", "README.md", "LICENSE"],
+              files: ["bin", "assets", "README.md", "LICENSE", "NOTICE"],
               repository: { type: "git", url: "https://github.com/cuemap-dev/cuemap.git" },
               author: "Kaan Demirel",
-              license: "BSL-1.1",
+              license: "Apache-2.0",
               publishConfig: { access: "public" },
             };
             if (os === "linux") manifest.libc = ["glibc"];

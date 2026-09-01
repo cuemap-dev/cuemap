@@ -9,7 +9,7 @@
 <p align="center">
   <a href="https://github.com/cuemap-dev/cuemap/actions/workflows/coverage.yml"><img src="https://github.com/cuemap-dev/cuemap/actions/workflows/coverage.yml/badge.svg?branch=v0.7.3" alt="CI"></a>
   <a href="https://app.codecov.io/github/cuemap-dev/cuemap"><img src="https://codecov.io/github/cuemap-dev/cuemap/branch/v0.7.3/graph/badge.svg?flag=rust-engine" alt="Coverage"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSL--1.1-5e5ce6" alt="License"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-5e5ce6" alt="License"></a>
 </p>
 
 **High-performance temporal-associative memory store** designed for dynamic contextual retrieval.
@@ -26,7 +26,9 @@ CueMap implements a **Continuous Gradient Algorithm** optimized for associative 
 
 As of v0.7.2+, CueMap's default core path is deterministic and ontology-free. GloVe/Ollama cue generation, WordNet/POS expansion, semantic bridges, pattern completion, external lexicon graphs, context expansion/speculation endpoints, and autonomous consolidation have been removed from the default engine path. v0.7.2+ bundles a qint8 `all-MiniLM-L3-v2` vector layer for semantic reranking, intent classification, and query embeddings; the `edge` profile selects a q4 build of the same model. The encoder can still be disabled for constrained builds or deployments.
 
-v0.7.2+ also uses numeric per-project memory IDs everywhere. If callers need deterministic upsert/dedupe identity, pass `source_key`; memory IDs remain compact runtime addresses. Tree-sitter-backed ingestion now covers Swift, Dart, Objective-C, Kotlin, C, C++, C#, and Bash source files, plus structured TOML files.
+v0.7.2+ also uses numeric per-project memory IDs everywhere. If callers need deterministic upsert/dedupe identity, pass `source_key`; memory IDs remain compact runtime addresses.
+
+v0.7.3 adds Tree-sitter-backed ingestion for Swift, Dart, Objective-C, Kotlin, C, C++, C#, and Bash source files, plus structured TOML files.
 
 Built with Rust for maximum performance and reliability.
 
@@ -56,14 +58,18 @@ The container runs as the unprivileged `cuemap` user. Ensure a bind-mounted data
 
 ### Native npm packages
 
-Build the Darwin ARM64, Darwin x64, Linux x64, and Linux ARM64 native packages without publishing them:
+Build the Darwin ARM64, Darwin x64, Linux x64, and Linux ARM64 native packages locally without publishing them:
 
 ```bash
 ./scripts/build-npm-native-packages.sh
 ./scripts/verify-npm-native-packages.sh
 ```
 
-The packager builds Linux on Debian Trixie, bundles the checksum-pinned tokenizer, and writes package tarballs plus `SHA256SUMS` under `dist/npm-native/tarballs`.
+The local packager builds Linux on Debian Trixie, bundles the checksum-pinned tokenizer, and writes package tarballs plus `SHA256SUMS` under `dist/npm-native/tarballs`. The Windows x64 package is built and published by the GitHub Actions release workflow.
+
+### Release validation
+
+Run the local consumer preflight on macOS and Windows before publishing, then run the read-only public-registry smoke test from GitHub Actions after publishing. See [RELEASE.md](RELEASE.md) for the exact commands and release order.
 
 ### CLI Commands
 
@@ -125,7 +131,7 @@ On startup, if `--agent-dir` is provided, CueMap initializes the **Self-Learning
 ./target/release/cuemap start --agent-dir ~/projects/my-app
 
 # The agent will automatically:
-# 1. Supercharged Structural Ingestion (Rust, Python, Go, JS/TS, PHP, Java).
+# 1. Supercharged Structural Ingestion (Rust, Python, Go, JS/TS, PHP, Java, Swift, Dart, Objective-C, Kotlin, C/C++, C#, Bash, and TOML).
 #    - Native tree-sitter queries capture definitions, calls, and imports as grounded cues.
 # 2. Document & Data Parsing (PDF, Word, Excel, JSON, CSV, YAML, XML).
 #    - Extracts headers, keys, and metadata as structural metadata.
@@ -197,7 +203,7 @@ Snapshots are automatically managed:
 - **Disabled**: `--disable-snapshots` turns off periodic and shutdown snapshot saves.
 - **Location**: `~/.cuemap/data/snapshots/` by default, or `<--data-dir>/snapshots` when `--data-dir` is set. Older installs may also be discovered under the legacy sibling `snapshots/` directory.
 - **Format**: zstd-compressed JSON inside `.bin` files. This preserves arbitrary metadata reliably while keeping snapshots compact; older uncompressed bincode snapshots remain readable when their metadata can be decoded.
-- **Migration note**: Some pre-v0.7.3 bincode snapshots that contain dynamic JSON metadata cannot be decoded by bincode's `deserialize_any` limitation. Those projects are reported at startup and must be reingested or exported from a compatible older binary before upgrading.
+- **Migration note**: Some pre-v0.7.2 bincode snapshots that contain dynamic JSON metadata cannot be decoded by bincode's `deserialize_any` limitation. Those projects are reported at startup and must be reingested or exported from a compatible older binary before upgrading.
 - **Files**: `{project-id}.bin`, `{project-id}_lexicon.bin`, `{project-id}_aliases.bin`
 
 ### Cloud Backup
@@ -399,192 +405,9 @@ The website docs are the source of truth for endpoint behavior and are kept alig
 
 ## System Architecture
 
-### 1. High-Level Overview
+The system diagrams are maintained separately to keep this README focused:
 
-```mermaid
-graph TB
-    subgraph "Clients"
-        SDK[Python/TS SDKs]
-        CURL[HTTP Clients]
-    end
-    
-    subgraph "API Layer"
-        AXUM[Axum HTTP Server]
-        AUTH[Auth Middleware]
-    end
-    
-    subgraph "Multi-Tenant Core"
-        MT[MultiTenantEngine]
-        MAIN[CueMap Engine<br/>DashMap + aHash]
-        LEX[Lexicon Engine<br/>Token → Cue]
-        ALIAS[Alias Engine<br/>Synonyms]
-    end
-    
-    subgraph "Background Processing"
-        QUEUE[Job Queue<br/>Reinforcement + Agent Jobs]
-        SESSION[Session Manager<br/>Ingest Progress]
-    end
-    
-    subgraph "Intelligence"
-        NL[NL Tokenizer<br/>Lemmatization + RAKE]
-        STRUCT[Structural Facets<br/>Evidence + Metadata]
-    end
-    
-    subgraph "Persistence"
-        PERSIST[Snapshots<br/>Zstd + ChaCha20]
-    end
-    
-    SDK --> AXUM
-    CURL --> AXUM
-    AXUM --> AUTH --> MT
-    
-    MT --> MAIN
-    MT --> LEX
-    MT --> ALIAS
-    
-    AXUM --> QUEUE
-    AXUM --> SESSION
-    
-    QUEUE --> LEX
-    
-    MAIN <-.-> PERSIST
-    LEX <-.-> PERSIST
-    
-    style MAIN fill:#4CAF50
-    style LEX fill:#2196F3
-    style ALIAS fill:#FF9800
-    style QUEUE fill:#9C27B0
-```
-
-### 2. Write Flow
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant API as HTTP Handler
-    participant NL as NL Tokenizer
-    participant Norm as Normalizer
-    participant Tax as Taxonomy
-    participant Main as CueMap Engine
-    
-    C->>API: Memory write request<br/>{content, cues[]}
-    
-    alt cues[] is empty
-        API->>NL: tokenize_to_cues(content)
-        NL-->>API: ["payment", "timeout", ...]
-    end
-    
-    API->>Norm: normalize_cue(each)
-    Norm-->>API: normalized cues
-    
-    API->>Tax: validate_cues(cues)
-    Tax-->>API: {accepted[], rejected[]}
-    
-    API->>Main: add_memory(content, accepted)
-    Main-->>API: memory_id
-    
-    API-->>C: 200 {id, cues, latency_ms}
-    Note over C,API: ✅ Synchronous ~2ms
-    
-    Note over API,Main: Cue extraction and indexing happen synchronously
-```
-
-### 3. Read Flow
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant API as HTTP Handler
-    participant Lex as Lexicon
-    participant Alias as Alias Engine
-    participant Art as CueBridge Artifacts
-    participant Main as CueMap Engine
-    participant Q as Job Queue
-    
-    C->>API: Recall request<br/>{query_text?, cues[], limit}
-    
-    alt query_text provided
-        API->>Lex: resolve_cues_from_text(query)
-        Lex-->>API: resolved_cues[]
-    end
-    
-    API->>API: Merge & Normalize cues
-    
-    opt explicit aliases enabled
-        API->>Alias: apply_aliases(cues)
-        Alias-->>API: weighted_cues[(cue, weight)]
-    end
-
-    opt exact recall is weak and artifacts are enabled
-        API->>Art: lookup GapPack(query_signature)
-        Art-->>API: capped expansion cues
-    end
-    
-    API->>Main: recall_weighted(cues, limit, options)
-    Main->>Main: Salience Bias
-    Main->>Main: Score & Rank
-    
-    Main-->>API: RecallResult[]
-    
-    opt auto_reinforce = true
-        API->>Q: Enqueue ReinforceMemories
-        API->>Q: Enqueue ReinforceLexicon
-    end
-    
-    API-->>C: {results, explain?, latency_ms}
-```
-
-### 4. Background Job Pipeline
-
-```mermaid
-graph TB
-    subgraph "Job Sources"
-        INGEST[Ingestion]
-        RECALL[Recall]
-        AGENT[Self-Learning Agent]
-        TIMER[60s Heatmap Tick]
-    end
-    
-    subgraph "Job Types"
-        J4[ReinforceMemories]
-        J5[ReinforceLexicon]
-        J7[ExtractAndIngest]
-        J8[VerifyFile]
-        J10[DeleteMemory]
-        J9[UpdateMarketHeatmap]
-    end
-    
-    subgraph "Processing"
-        SESSION[Session Manager<br/>Tracks write completion]
-        QUEUE[MPSC Queue<br/>Async Worker]
-    end
-    
-    subgraph "Side Effects"
-        E1[Memories Reinforced]
-        E2[Lexicon Reinforced]
-        E4[Content Extracted]
-        E5[Stale File Memories Deleted]
-        E6[Market Heatmap Updated]
-    end
-    
-    RECALL --> J4 & J5
-    INGEST --> J7
-    AGENT --> J7 & J8 & J10
-    TIMER --> J9
-    
-    J7 --> SESSION
-    J4 & J5 --> QUEUE
-    J7 & J8 & J10 --> QUEUE
-    J9 --> QUEUE
-    
-    QUEUE --> E1 & E2 & E4 & E5 & E6
-    
-    style QUEUE fill:#9C27B0
-    style SESSION fill:#673AB7
-    style E1 fill:#2196F3
-    style E2 fill:#4CAF50
-    style E5 fill:#F44336
-```
+- [Architecture diagrams](ARCHITECTURE.md)
 
 ## Advanced Capabilities
 
@@ -654,9 +477,6 @@ These modes are off by default and are designed for diagnostics or workloads tha
 
 ## License
 
-BSL-1.1 (Business Source License 1.1) converting to Apache 2.0 after 4 years.
-See `LICENSE` for details.
-
-This allows full use for development, testing, and self-hosting, while preventing the software from being offered as a competing managed Database Service.
-
-For commercial licensing (closed-source SaaS or offering as a service), contact: hello@cuemap.dev
+CueMap Rust Engine and its native engine packages are licensed under
+Apache-2.0 from v0.7.3 onward. Earlier releases remain under BSL-1.1.
+See [LICENSE](LICENSE) and [NOTICE](NOTICE) for details.
