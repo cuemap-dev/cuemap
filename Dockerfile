@@ -62,16 +62,16 @@ COPY --from=tokenizer --chown=cuemap:cuemap /en_tokenizer.bin /app/assets/en_tok
 
 ENV HOME=/home/cuemap \
     RUST_LOG=info \
-    CUEMAP_PORT=8080 \
+    CUEMAP_PORT=8735 \
     CUEMAP_DATA_DIR=/app/data \
     CUEMAP_SNAPSHOT_INTERVAL_SECONDS=60 \
     TOKENIZER_PATH=/app/assets/en_tokenizer.bin
 
-EXPOSE 8080
+EXPOSE 8735
 STOPSIGNAL SIGTERM
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -fsS "http://127.0.0.1:${CUEMAP_PORT:-8080}/" || exit 1
+    CMD curl -fsS "http://127.0.0.1:${CUEMAP_PORT:-8735}/" || exit 1
 
 USER cuemap
 

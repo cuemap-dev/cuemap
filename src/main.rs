@@ -116,7 +116,7 @@ mod tests {
             semantic_mode: "lexical".to_string(),
             depth: 1,
             token_budget: 128,
-            port: 8080,
+            port: 8735,
             no_auto_reinforce: false,
             min_intersection: None,
             query_time: None,
@@ -1207,7 +1207,7 @@ mod tests {
         match cli.command {
             Commands::Ingest(IngestArgs {
                 type_: IngestType::File { url, .. },
-            }) => assert_eq!(url, "http://localhost:8080"),
+            }) => assert_eq!(url, "http://localhost:8735"),
             _ => panic!("expected file ingest command"),
         }
 
@@ -1216,7 +1216,7 @@ mod tests {
         match cli.command {
             Commands::Ingest(IngestArgs {
                 type_: IngestType::Url { server_url, .. },
-            }) => assert_eq!(server_url, "http://localhost:8080"),
+            }) => assert_eq!(server_url, "http://localhost:8735"),
             _ => panic!("expected URL ingest command"),
         }
 
@@ -1224,7 +1224,7 @@ mod tests {
         match cli.command {
             Commands::Lexicon(LexiconArgs {
                 cmd: LexiconCmd::Inspect { url, .. },
-            }) => assert_eq!(url, "http://localhost:8080"),
+            }) => assert_eq!(url, "http://localhost:8735"),
             _ => panic!("expected lexicon inspect command"),
         }
     }
@@ -1269,7 +1269,7 @@ enum Commands {
 #[derive(Parser, Debug)]
 struct StopArgs {
     /// Server URL (to find the PID via local config if possible)
-    #[arg(long, default_value = "http://localhost:8080")]
+    #[arg(long, default_value = "http://localhost:8735")]
     url: String,
 }
 
@@ -1304,7 +1304,7 @@ struct StatusArgs {
     #[arg(long)]
     json: bool,
     /// Server URL
-    #[arg(long, default_value = "http://localhost:8080")]
+    #[arg(long, default_value = "http://localhost:8735")]
     url: String,
 }
 
@@ -1416,7 +1416,7 @@ struct AddArgs {
     #[arg(long)]
     async_ingest: bool,
     /// Server URL
-    #[arg(long, default_value = "http://localhost:8080")]
+    #[arg(long, default_value = "http://localhost:8735")]
     url: String,
 }
 
@@ -1461,7 +1461,7 @@ enum IngestType {
         #[arg(long)]
         segment_max_chunk_chars: Option<usize>,
         /// Server URL
-        #[arg(long, default_value = "http://localhost:8080")]
+        #[arg(long, default_value = "http://localhost:8735")]
         url: String,
     },
     /// Ingest a file
@@ -1470,7 +1470,7 @@ enum IngestType {
         #[arg(short, long)]
         project: Option<String>,
         /// Server URL
-        #[arg(long, default_value = "http://localhost:8080")]
+        #[arg(long, default_value = "http://localhost:8735")]
         url: String,
     },
     /// Ingest a URL
@@ -1485,7 +1485,7 @@ enum IngestType {
         #[arg(long, default_value = "true")]
         same_domain_only: bool,
         /// Server URL
-        #[arg(long, default_value = "http://localhost:8080")]
+        #[arg(long, default_value = "http://localhost:8735")]
         server_url: String,
     },
 }
@@ -1514,7 +1514,7 @@ struct RecallArgs {
     token_budget: u32,
 
     /// Server port (overrides config)
-    #[arg(long, default_value = "8080")]
+    #[arg(long, default_value = "8735")]
     pub port: u16,
     /// Disable automatic reinforcement during recall
     #[arg(long)]
@@ -1583,7 +1583,7 @@ struct RecallArgs {
     #[arg(long)]
     trace_timing: bool,
     /// Server URL
-    #[arg(long, default_value = "http://localhost:8080")]
+    #[arg(long, default_value = "http://localhost:8735")]
     url: String,
 
     /// Enable web recall mode
@@ -1613,7 +1613,7 @@ enum LexiconCmd {
         #[arg(short, long)]
         project: Option<String>,
         /// Server URL
-        #[arg(long, default_value = "http://localhost:8080")]
+        #[arg(long, default_value = "http://localhost:8735")]
         url: String,
     },
 }
@@ -1640,7 +1640,7 @@ struct MemoriesArgs {
     project: Option<String>,
 
     /// Server URL
-    #[arg(long, default_value = "http://localhost:8080")]
+    #[arg(long, default_value = "http://localhost:8735")]
     url: String,
 }
 
@@ -1658,7 +1658,7 @@ struct AliasArgs {
     #[arg(short, long)]
     weight: Option<f64>,
     /// Server URL
-    #[arg(long, default_value = "http://localhost:8080")]
+    #[arg(long, default_value = "http://localhost:8735")]
     url: String,
 }
 
@@ -1672,14 +1672,14 @@ struct ProjectArgs {
 enum ProjectCmd {
     /// List all projects
     List {
-        #[arg(long, default_value = "http://localhost:8080")]
+        #[arg(long, default_value = "http://localhost:8735")]
         url: String,
     },
     /// Create a new project
     Create {
         #[arg(short, long)]
         name: String,
-        #[arg(long, default_value = "http://localhost:8080")]
+        #[arg(long, default_value = "http://localhost:8735")]
         url: String,
     },
     /// Set watch directory for a project
@@ -1688,7 +1688,7 @@ enum ProjectCmd {
         project: String,
         /// Path to watch directory
         path: String,
-        #[arg(long, default_value = "http://localhost:8080")]
+        #[arg(long, default_value = "http://localhost:8735")]
         url: String,
     },
 }

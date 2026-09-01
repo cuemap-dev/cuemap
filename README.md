@@ -39,7 +39,7 @@ Built with Rust for maximum performance and reliability.
 ```bash
 # Production (optimized)
 cargo build --release
-./target/release/cuemap start --port 8080
+./target/release/cuemap start --port 8735
 
 # Development
 cargo run -- start
@@ -51,7 +51,7 @@ CueMap treats the nlprule tokenizer as a runtime asset, not a build artifact. Se
 
 ```bash
 docker build -t cuemap/engine:0.7.3 .
-docker run -p 8080:8080 -v "$(pwd)/local_snapshot_dir:/app/data" cuemap/engine:0.7.3
+docker run -p 8735:8735 -v "$(pwd)/local_snapshot_dir:/app/data" cuemap/engine:0.7.3
 ```
 
 The container runs as the unprivileged `cuemap` user. Ensure a bind-mounted data directory is writable by UID/GID `10001`, or use a Docker-managed volume. Runtime defaults can be overridden with `CUEMAP_PORT`, `CUEMAP_DATA_DIR`, `CUEMAP_SNAPSHOT_INTERVAL_SECONDS`, `TOKENIZER_PATH`, and `RUST_LOG`.
@@ -157,7 +157,7 @@ Add the MCP server to your AI agent's configuration (e.g., Claude Desktop, Curso
         "cuemap-mcp"
       ],
       "env": {
-        "CUEMAP_PORT": "8080"
+        "CUEMAP_PORT": "8735"
       }
     }
   }
@@ -183,7 +183,7 @@ CueMap runs in multi-tenant mode by default. Select a project for CLI commands w
 
 ```bash
 # Start the server
-./target/release/cuemap start --port 8080
+./target/release/cuemap start --port 8735
 
 # Choose a project and use the local CLI
 cuemap set-project my-project
@@ -241,10 +241,10 @@ Set an API key via environment variable:
 
 ```bash
 # Single API key
-CUEMAP_API_KEY=your-secret-key ./target/release/cuemap start --port 8080
+CUEMAP_API_KEY=your-secret-key ./target/release/cuemap start --port 8735
 
 # Multiple API keys (comma-separated)
-CUEMAP_API_KEYS=key1,key2,key3 ./target/release/cuemap start --port 8080
+CUEMAP_API_KEYS=key1,key2,key3 ./target/release/cuemap start --port 8735
 ```
 
 Or configure keys in `~/.cuemap/server_config.toml`:
@@ -259,7 +259,7 @@ Clients send the configured key in the `X-API-Key` header. See the [HTTP API ref
 ### Docker with Authentication
 
 ```bash
-docker run -p 8080:8080 -v "$(pwd)/local_snapshot_dir:/app/data" \
+docker run -p 8735:8735 -v "$(pwd)/local_snapshot_dir:/app/data" \
   -e CUEMAP_API_KEY=your-secret-key \
   cuemap/engine
 ```

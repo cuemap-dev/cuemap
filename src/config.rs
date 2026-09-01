@@ -252,7 +252,7 @@ pub struct ServerSettings {
 impl Default for ServerSettings {
     fn default() -> Self {
         Self {
-            port: 8080,
+            port: 8735,
             host: "0.0.0.0".to_string(),
             data_dir: get_base_dir().join("data").to_string_lossy().to_string(),
             assets_dir: None,
@@ -407,7 +407,7 @@ mod tests {
         assert_eq!(benchmark.server.log_level, "warn");
 
         let default = ServerConfig::default_for_profile("unknown");
-        assert_eq!(default.server.port, 8080);
+        assert_eq!(default.server.port, 8735);
     }
 
     #[test]
@@ -490,6 +490,6 @@ mod tests {
             Some(value) => std::env::set_var(key, value),
             None => std::env::remove_var(key),
         }
-        assert_eq!(loaded.server.port, 8080);
+        assert_eq!(loaded.server.port, 8735);
     }
 }

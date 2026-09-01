@@ -14,6 +14,7 @@ All notable changes to the CueMap Rust Engine will be documented in this file.
 
 ### Changed
 - **License**: The CueMap Rust Engine and native engine packages are licensed under Apache-2.0 from v0.7.3 onward. Earlier releases remain under BSL-1.1.
+- **Default port**: Changed the local HTTP server default from `8080` to `8735`; `CUEMAP_PORT` and the CLI `--port` option remain available for overrides.
 
 ## [0.7.2] - 2026-08-04
 
