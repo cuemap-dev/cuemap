@@ -1228,6 +1228,80 @@ mod tests {
             _ => panic!("expected lexicon inspect command"),
         }
     }
+
+    #[test]
+    fn cli_project_package_commands_and_alias_parse() {
+        let cli = Cli::try_parse_from([
+            "cuemap",
+            "project",
+            "pack",
+            "demo-project",
+            "--offline",
+            "--output",
+            "demo.cuemap",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Projects(ProjectArgs {
+                cmd:
+                    ProjectCmd::Pack {
+                        project,
+                        output,
+                        offline,
+                        ..
+                    },
+            }) => {
+                assert_eq!(project, "demo-project");
+                assert_eq!(output, Some(PathBuf::from("demo.cuemap")));
+                assert!(offline);
+            }
+            _ => panic!("expected project pack command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "cuemap",
+            "projects",
+            "pull",
+            "s3://example-bucket/demo.cuemap",
+            "--data-dir",
+            "/tmp/cuemap-package-test",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Projects(ProjectArgs {
+                cmd: ProjectCmd::Pull { .. }
+            })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "cuemap",
+            "project",
+            "sync",
+            "demo-project",
+            "s3://example-bucket/team",
+            "--offline",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Projects(ProjectArgs {
+                cmd: ProjectCmd::Sync {
+                    project,
+                    remote,
+                    offline: true,
+                    ..
+                }
+            }) if project == "demo-project" && remote == "s3://example-bucket/team"
+        ));
+
+        assert_eq!(
+            project_package::s3_destination("s3://example-bucket/team/", "demo-project").unwrap(),
+            "s3://example-bucket/team/demo-project.cuemap"
+        );
+        assert!(project_package::validate_s3_uri("https://example.com/file", false).is_err());
+        assert!(project_package::validate_s3_uri("s3://example-bucket", false).is_err());
+    }
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -1253,7 +1327,8 @@ enum Commands {
     /// Manage individual memories (get/reinforce/delete)
     Memories(MemoriesArgs),
 
-    /// Manage projects
+    /// Manage projects and portable project packages
+    #[command(name = "project", visible_alias = "projects")]
     Projects(ProjectArgs),
 
     /// Set default project for CLI commands
@@ -1691,6 +1766,86 @@ enum ProjectCmd {
         #[arg(long, default_value = "http://localhost:8735")]
         url: String,
     },
+    /// Package a saved project index as a portable .cuemap file
+    Pack {
+        /// Project ID to package
+        project: String,
+        /// Output path (defaults to <project>.cuemap)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// CueMap data directory (defaults to configured data directory)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Server URL used to flush a current snapshot before packaging
+        #[arg(long, default_value = "http://localhost:8735")]
+        url: String,
+        /// Package the existing on-disk snapshot without contacting the server
+        #[arg(long)]
+        offline: bool,
+        /// Replace an existing output file
+        #[arg(long)]
+        force: bool,
+    },
+    /// Install a portable .cuemap package into the local data directory
+    Load {
+        /// Package path
+        package: PathBuf,
+        /// CueMap data directory (defaults to configured data directory)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Running server to warm after installing a new project
+        #[arg(long, default_value = "http://localhost:8735")]
+        url: String,
+        /// Replace an existing offline project
+        #[arg(long)]
+        force: bool,
+    },
+    /// Package a project and upload it with the configured AWS CLI
+    Push {
+        /// Project ID to package
+        project: String,
+        /// S3 object or prefix, for example s3://bucket/team/
+        destination: String,
+        /// CueMap data directory (defaults to configured data directory)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Server URL used to flush a current snapshot before packaging
+        #[arg(long, default_value = "http://localhost:8735")]
+        url: String,
+        /// Package the existing on-disk snapshot without contacting the server
+        #[arg(long)]
+        offline: bool,
+    },
+    /// Download a .cuemap package with the configured AWS CLI and install it
+    Pull {
+        /// S3 object URI, for example s3://bucket/team/project.cuemap
+        source: String,
+        /// CueMap data directory (defaults to configured data directory)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Running server to warm after installing a new project
+        #[arg(long, default_value = "http://localhost:8735")]
+        url: String,
+        /// Replace an existing offline project
+        #[arg(long)]
+        force: bool,
+    },
+    /// Fast-forward a project through immutable package history on S3
+    Sync {
+        /// Project ID to synchronize
+        project: String,
+        /// S3 sync root, for example s3://bucket/team
+        remote: String,
+        /// CueMap data directory (used with --offline)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Running CueMap server
+        #[arg(long, default_value = "http://localhost:8735")]
+        url: String,
+        /// Synchronize the saved on-disk project without contacting a server
+        #[arg(long)]
+        offline: bool,
+    },
 }
 
 fn apply_start_overrides(
@@ -1996,8 +2151,26 @@ async fn run_server_with_pid_path(
             mt_engine.start_periodic_snapshots(Duration::from_secs(
                 config.persistence.snapshot_interval_seconds,
             ));
+            if config.project_lifecycle.inactivity_timeout_seconds > 0
+                && config.project_lifecycle.unload_check_interval_seconds > 0
+            {
+                info!(
+                    "Project auto-unloading enabled: inactive after {}s, checked every {}s",
+                    config.project_lifecycle.inactivity_timeout_seconds,
+                    config.project_lifecycle.unload_check_interval_seconds
+                );
+                mt_engine.start_project_unloader(
+                    Duration::from_secs(
+                        config.project_lifecycle.unload_check_interval_seconds,
+                    ),
+                    Duration::from_secs(config.project_lifecycle.inactivity_timeout_seconds),
+                );
+            } else {
+                info!("Project auto-unloading disabled by configuration");
+            }
         } else {
             warn!("Periodic snapshots and shutdown save are DISABLED.");
+            warn!("Project auto-unloading is disabled because persistence is disabled.");
         }
     }
 
@@ -2710,6 +2883,324 @@ async fn handle_projects(args: ProjectArgs) {
                 Err(e) => eprintln!("✗ Failed: {}", e),
             }
         }
+        ProjectCmd::Pack {
+            project,
+            output,
+            data_dir,
+            url,
+            offline,
+            force,
+        } => {
+            let output = output.unwrap_or_else(|| PathBuf::from(format!("{project}.cuemap")));
+            match prepare_project_package(
+                &client,
+                &project,
+                &output,
+                data_dir,
+                &url,
+                offline,
+                force,
+            )
+            .await
+            {
+                Ok(summary) => println!(
+                    "✓ Packed project '{}' into {} ({} files, {})",
+                    summary.project_id,
+                    summary.path.display(),
+                    summary.file_count,
+                    human_bytes(summary.size_bytes)
+                ),
+                Err(error) => eprintln!("✗ Failed to pack project: {error}"),
+            }
+        }
+        ProjectCmd::Load {
+            package,
+            data_dir,
+            url,
+            force,
+        } => match install_project_package(&client, &package, data_dir, &url, force).await {
+            Ok(summary) => println!(
+                "✓ Loaded project '{}' from {} ({} files, {})",
+                summary.project_id,
+                summary.path.display(),
+                summary.file_count,
+                human_bytes(summary.size_bytes)
+            ),
+            Err(error) => eprintln!("✗ Failed to load package: {error}"),
+        },
+        ProjectCmd::Push {
+            project,
+            destination,
+            data_dir,
+            url,
+            offline,
+        } => {
+            let destination = match project_package::s3_destination(&destination, &project) {
+                Ok(destination) => destination,
+                Err(error) => {
+                    eprintln!("✗ Failed to push project: {error}");
+                    return;
+                }
+            };
+            let temp = std::env::temp_dir().join(format!(
+                "cuemap-push-{}-{}.cuemap",
+                project,
+                uuid::Uuid::new_v4()
+            ));
+            let result = async {
+                let summary = prepare_project_package(
+                    &client,
+                    &project,
+                    &temp,
+                    data_dir,
+                    &url,
+                    offline,
+                    false,
+                )
+                .await?;
+                project_package::upload_s3(&temp, &destination)?;
+                Ok::<_, String>(summary)
+            }
+            .await;
+            let _ = std::fs::remove_file(&temp);
+            match result {
+                Ok(summary) => println!(
+                    "✓ Pushed project '{}' to {} ({})",
+                    summary.project_id,
+                    destination,
+                    human_bytes(summary.size_bytes)
+                ),
+                Err(error) => eprintln!("✗ Failed to push project: {error}"),
+            }
+        }
+        ProjectCmd::Pull {
+            source,
+            data_dir,
+            url,
+            force,
+        } => {
+            if let Err(error) = project_package::validate_s3_uri(&source, false) {
+                eprintln!("✗ Failed to pull project: {error}");
+                return;
+            }
+            let temp = std::env::temp_dir().join(format!(
+                "cuemap-pull-{}.cuemap",
+                uuid::Uuid::new_v4()
+            ));
+            let result = async {
+                project_package::download_s3(&source, &temp)?;
+                install_project_package(&client, &temp, data_dir, &url, force).await
+            }
+            .await;
+            let _ = std::fs::remove_file(&temp);
+            match result {
+                Ok(summary) => println!(
+                    "✓ Pulled and loaded project '{}' from {} ({} files, {})",
+                    summary.project_id,
+                    source,
+                    summary.file_count,
+                    human_bytes(summary.size_bytes)
+                ),
+                Err(error) => eprintln!("✗ Failed to pull project: {error}"),
+            }
+        }
+        ProjectCmd::Sync {
+            project,
+            remote,
+            data_dir,
+            url,
+            offline,
+        } => {
+            if offline {
+                let data_dir = match configured_project_data_dir(data_dir) {
+                    Ok(data_dir) => data_dir,
+                    Err(error) => {
+                        eprintln!("✗ Failed to sync project: {error}");
+                        return;
+                    }
+                };
+                match project_sync::sync_project(&data_dir, &project, &remote, true).await {
+                    Ok(project_sync::SyncRun::Complete(result)) => print_sync_result(&result),
+                    Ok(project_sync::SyncRun::PullRequired(_)) => {
+                        eprintln!("✗ Failed to sync project: offline pull was not applied")
+                    }
+                    Err(error) => eprintln!("✗ Failed to sync project: {error}"),
+                }
+            } else {
+                let response = client
+                    .post(format!("{url}/projects/{project}/sync"))
+                    .json(&serde_json::json!({ "remote": remote }))
+                    .send()
+                    .await;
+                match response {
+                    Ok(response) if response.status().is_success() => {
+                        match response.json::<project_sync::SyncResult>().await {
+                            Ok(result) => print_sync_result(&result),
+                            Err(error) => eprintln!("✗ Invalid sync response: {error}"),
+                        }
+                    }
+                    Ok(response) => {
+                        let status = response.status();
+                        let body = response.text().await.unwrap_or_default();
+                        eprintln!("✗ Failed to sync project (HTTP {status}): {body}");
+                    }
+                    Err(error) => eprintln!("✗ Failed to sync project: {error}"),
+                }
+            }
+        }
+    }
+}
+
+fn print_sync_result(result: &project_sync::SyncResult) {
+    let action = match &result.action {
+        project_sync::SyncAction::Pushed => "pushed",
+        project_sync::SyncAction::Pulled => "pulled",
+        project_sync::SyncAction::UpToDate => "up to date",
+        project_sync::SyncAction::Adopted => "adopted existing remote state",
+    };
+    println!(
+        "✓ Project '{}' {} at generation {} ({})",
+        result.project_id,
+        action,
+        result.generation,
+        &result.commit_sha256[..12]
+    );
+}
+
+async fn prepare_project_package(
+    client: &reqwest::Client,
+    project: &str,
+    output: &Path,
+    data_dir: Option<PathBuf>,
+    url: &str,
+    offline: bool,
+    force: bool,
+) -> Result<project_package::ProjectPackageSummary, String> {
+    if !multi_tenant::validate_project_id(project) {
+        return Err(format!(
+            "Invalid project ID '{project}'; use 3-64 letters, numbers, '-' or '_'"
+        ));
+    }
+    if !offline {
+        flush_project_snapshot(client, project, url).await?;
+    }
+    let data_dir = configured_project_data_dir(data_dir)?;
+    project_package::pack_project(&data_dir, project, output, force)
+}
+
+async fn flush_project_snapshot(
+    client: &reqwest::Client,
+    project: &str,
+    url: &str,
+) -> Result<(), String> {
+    let response = client
+        .post(format!("{url}/projects/{project}/save"))
+        .send()
+        .await
+        .map_err(|error| {
+            format!(
+                "Could not ask the server to save the project: {error}. If the server is stopped and the snapshot is current, retry with --offline"
+            )
+        })?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    Err(format!("Server snapshot save failed with HTTP {status}: {body}"))
+}
+
+async fn install_project_package(
+    client: &reqwest::Client,
+    package: &Path,
+    data_dir: Option<PathBuf>,
+    url: &str,
+    force: bool,
+) -> Result<project_package::ProjectPackageSummary, String> {
+    let manifest = project_package::inspect_project_package(package)?;
+    let server_has_project = server_project_state(client, url, &manifest.project_id).await;
+    if force && server_has_project.is_some() {
+        return Err(format!(
+            "Refusing to replace project '{}' while a server is reachable at {}. Stop that server and retry, or load into a clean data directory",
+            manifest.project_id, url
+        ));
+    }
+    if matches!(server_has_project, Some(true)) {
+        return Err(format!(
+            "Project '{}' already exists in the running server",
+            manifest.project_id
+        ));
+    }
+
+    let data_dir = configured_project_data_dir(data_dir)?;
+    let summary = project_package::load_project_package(&data_dir, package, force)?;
+
+    if server_has_project == Some(false) {
+        let response = client
+            .post(format!("{url}/projects/{}/load", summary.project_id))
+            .send()
+            .await;
+        match response {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                return Err(format!(
+                    "Package was installed, but the running server could not load it (HTTP {status}: {body}). Restart the server with --data-dir {}",
+                    data_dir.display()
+                ));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Package was installed, but the running server could not load it: {error}"
+                ));
+            }
+        }
+    }
+    Ok(summary)
+}
+
+/// `Some(true)` means the server knows this project, `Some(false)` means a
+/// server is reachable but the project is new, and `None` means no server was
+/// reachable. Authentication failures count as a reachable server so forceful
+/// replacement is still refused.
+async fn server_project_state(
+    client: &reqwest::Client,
+    url: &str,
+    project: &str,
+) -> Option<bool> {
+    let response = client.get(format!("{url}/projects")).send().await.ok()?;
+    if !response.status().is_success() {
+        return Some(false);
+    }
+    let projects: Vec<serde_json::Value> = response.json().await.ok()?;
+    Some(projects.iter().any(|value| {
+        value.get("project_id").and_then(|id| id.as_str()) == Some(project)
+    }))
+}
+
+fn configured_project_data_dir(explicit: Option<PathBuf>) -> Result<PathBuf, String> {
+    if let Some(path) = explicit {
+        return Ok(path);
+    }
+    config::ServerConfig::load(None, None)
+        .map(|config| PathBuf::from(config.server.data_dir))
+        .map_err(|error| format!("Failed to resolve CueMap data directory: {error}"))
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes_f = bytes as f64;
+    if bytes_f >= GIB {
+        format!("{:.2} GiB", bytes_f / GIB)
+    } else if bytes_f >= MIB {
+        format!("{:.2} MiB", bytes_f / MIB)
+    } else if bytes_f >= KIB {
+        format!("{:.2} KiB", bytes_f / KIB)
+    } else {
+        format!("{bytes} B")
     }
 }
 

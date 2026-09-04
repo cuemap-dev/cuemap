@@ -2,23 +2,35 @@ use crate::auth::AuthConfig;
 use crate::jobs::{Job, JobQueue};
 use crate::intent::IntentTarget;
 use crate::metrics::MetricsCollector;
-use crate::multi_tenant::{validate_project_id, MultiTenantEngine};
+use crate::multi_tenant::{
+    validate_project_id, MultiTenantEngine, ProjectReplaceResult, ProjectUnloadResult,
+};
 use crate::normalization::normalize_cue;
 use crate::persistence::CloudBackupManager;
+use crate::project_package;
+use crate::project_sync::{self, SyncAction, SyncRun};
 use crate::structures::{LexiconStats, MainStats, MemoryId, MemoryStats};
 use crate::taxonomy::validate_cues;
 use axum::{
+    body::Body,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     middleware,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
     Json, Router,
 };
+use futures::StreamExt;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::io;
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
+use tokio_util::io::ReaderStream;
 use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -3725,6 +3737,21 @@ pub struct CreateProjectRequest {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+pub struct ProjectPackagePushRequest {
+    pub destination: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ProjectPackagePullRequest {
+    pub source: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ProjectSyncRequest {
+    pub remote: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub struct SetWatchDirRequest {
     pub watch_dir: String,
     #[serde(default)]
@@ -3805,7 +3832,15 @@ pub fn routes(
         .route("/stats", get(get_stats))
         .route("/projects", get(list_projects).post(create_project))
         .route("/recall/grounded", post(recall_grounded))
+        .route("/projects/load", post(load_project_package_endpoint))
+        .route("/projects/pull", post(pull_project_package_endpoint))
         .route("/projects/:id", delete(delete_project))
+        .route("/projects/:id/pack", post(pack_project_endpoint))
+        .route("/projects/:id/push", post(push_project_package_endpoint))
+        .route("/projects/:id/sync", post(sync_project_endpoint))
+        .route("/projects/:id/save", post(save_project_endpoint))
+        .route("/projects/:id/load", post(load_project_endpoint))
+        .route("/projects/:id/unload", post(unload_project_endpoint))
         .route(
             "/projects/:id/artifacts",
             get(project_artifacts).post(reload_project_artifacts),
@@ -3866,7 +3901,10 @@ async fn root() -> impl IntoResponse {
             "semantic_retrieval_v1",
             "chunk_embeddings_v1",
             "intent_classification_v1",
-            "intent_job_status_v1"
+            "intent_job_status_v1",
+            "project_lifecycle_v1",
+            "project_packages_v1",
+            "project_sync_v1"
         ]
     }))
 }
@@ -6003,6 +6041,581 @@ async fn delete_project(
     }
 }
 
+async fn load_project_endpoint(
+    State(state): State<EngineState>,
+    Path(project_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !validate_project_id(&project_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid project ID format"})),
+        );
+    }
+
+    match state.mt_engine.load_project(&project_id) {
+        Ok(context) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "loaded",
+                "project_id": project_id,
+                "loaded": true,
+                "total_memories": context.total_memories(),
+            })),
+        ),
+        Err(error) => {
+            let status = if error.starts_with("Snapshot for project") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(serde_json::json!({"error": error})))
+        }
+    }
+}
+
+async fn save_project_endpoint(
+    State(state): State<EngineState>,
+    Path(project_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !validate_project_id(&project_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid project ID format"})),
+        );
+    }
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "Read-only mode"})),
+        );
+    }
+
+    match state.mt_engine.save_project(&project_id) {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "saved",
+                "project_id": project_id,
+            })),
+        ),
+        Err(error) => {
+            let status = if error.starts_with("Project '") && error.ends_with("' not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(serde_json::json!({"error": error})))
+        }
+    }
+}
+
+type PackageApiResult<T> = Result<T, (StatusCode, String)>;
+
+struct RemoveOnDropReader {
+    file: tokio::fs::File,
+    path: PathBuf,
+}
+
+impl AsyncRead for RemoveOnDropReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.file).poll_read(cx, buffer)
+    }
+}
+
+impl Drop for RemoveOnDropReader {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn package_error(status: StatusCode, message: impl Into<String>) -> Response {
+    (status, Json(serde_json::json!({"error": message.into()}))).into_response()
+}
+
+fn package_temp_path(operation: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "cuemap-api-{operation}-{}.cuemap",
+        uuid::Uuid::new_v4()
+    ))
+}
+
+async fn create_current_project_package(
+    state: &EngineState,
+    project_id: &str,
+) -> PackageApiResult<(project_package::ProjectPackageSummary, PathBuf)> {
+    if !validate_project_id(project_id) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid project ID format".to_string()));
+    }
+    if state.read_only {
+        return Err((StatusCode::FORBIDDEN, "Read-only mode".to_string()));
+    }
+    state.mt_engine.save_project(&project_id.to_string()).map_err(|error| {
+        let status = if error.starts_with("Project '") && error.ends_with("' not found") {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        (status, error)
+    })?;
+
+    let data_dir = PathBuf::from(&state.data_dir);
+    let output = package_temp_path("pack");
+    let package_output = output.clone();
+    let project = project_id.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        project_package::pack_project(&data_dir, &project, &package_output, false)
+    })
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Package task failed: {error}"),
+        )
+    })?;
+    match result {
+        Ok(summary) => Ok((summary, output)),
+        Err(error) => {
+            let _ = std::fs::remove_file(&output);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, error))
+        }
+    }
+}
+
+async fn pack_project_endpoint(
+    State(state): State<EngineState>,
+    Path(project_id): Path<String>,
+) -> Response {
+    let (summary, package_path) = match create_current_project_package(&state, &project_id).await {
+        Ok(package) => package,
+        Err((status, error)) => return package_error(status, error),
+    };
+    let file = match tokio::fs::File::open(&package_path).await {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = std::fs::remove_file(&package_path);
+            return package_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to open generated package: {error}"),
+            );
+        }
+    };
+    let stream = ReaderStream::new(RemoveOnDropReader {
+        file,
+        path: package_path,
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/vnd.cuemap.project")
+        .header(header::CONTENT_LENGTH, summary.size_bytes.to_string())
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}.cuemap\"", summary.project_id),
+        )
+        .header("X-CueMap-Project-ID", summary.project_id)
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|error| {
+            package_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to build package response: {error}"),
+            )
+        })
+}
+
+async fn write_package_body(body: Body) -> Result<PathBuf, String> {
+    let path = package_temp_path("load");
+    let result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .await
+            .map_err(|error| format!("Failed to create package upload: {error}"))?;
+        let mut stream = body.into_data_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| format!("Failed to read package upload: {error}"))?;
+            file.write_all(&chunk)
+                .await
+                .map_err(|error| format!("Failed to store package upload: {error}"))?;
+        }
+        file.sync_all()
+            .await
+            .map_err(|error| format!("Failed to sync package upload: {error}"))?;
+        Ok::<(), String>(())
+    }
+    .await;
+    if let Err(error) = result {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(error);
+    }
+    Ok(path)
+}
+
+async fn install_project_package_from_path(
+    state: &EngineState,
+    package_path: &std::path::Path,
+) -> PackageApiResult<project_package::ProjectPackageSummary> {
+    let inspect_path = package_path.to_path_buf();
+    let manifest = tokio::task::spawn_blocking(move || {
+        project_package::inspect_project_package(&inspect_path)
+    })
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Package inspection task failed: {error}"),
+        )
+    })?
+    .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+
+    if state
+        .mt_engine
+        .list_projects()
+        .iter()
+        .any(|project| project.project_id == manifest.project_id)
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("Project '{}' already exists", manifest.project_id),
+        ));
+    }
+
+    let data_dir = PathBuf::from(&state.data_dir);
+    let load_path = package_path.to_path_buf();
+    let summary = tokio::task::spawn_blocking(move || {
+        project_package::load_project_package(&data_dir, &load_path, false)
+    })
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Package install task failed: {error}"),
+        )
+    })?
+    .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+
+    let engine = state.mt_engine.clone();
+    let project_id = summary.project_id.clone();
+    tokio::task::spawn_blocking(move || engine.load_project(&project_id).map(|_| ()))
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Project load task failed: {error}"),
+            )
+        })?
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Package was installed but could not be loaded: {error}"),
+            )
+        })?;
+    Ok(summary)
+}
+
+async fn load_project_package_endpoint(
+    State(state): State<EngineState>,
+    body: Body,
+) -> Response {
+    if state.read_only {
+        return package_error(StatusCode::FORBIDDEN, "Read-only mode");
+    }
+    let package_path = match write_package_body(body).await {
+        Ok(path) => path,
+        Err(error) => return package_error(StatusCode::BAD_REQUEST, error),
+    };
+    let result = install_project_package_from_path(&state, &package_path).await;
+    let _ = tokio::fs::remove_file(&package_path).await;
+    match result {
+        Ok(summary) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "loaded",
+                "project_id": summary.project_id,
+                "loaded": true,
+                "file_count": summary.file_count,
+                "size_bytes": summary.size_bytes,
+            })),
+        )
+            .into_response(),
+        Err((status, error)) => package_error(status, error),
+    }
+}
+
+async fn push_project_package_endpoint(
+    State(state): State<EngineState>,
+    Path(project_id): Path<String>,
+    Json(request): Json<ProjectPackagePushRequest>,
+) -> Response {
+    let destination = match project_package::s3_destination(&request.destination, &project_id) {
+        Ok(destination) => destination,
+        Err(error) => return package_error(StatusCode::BAD_REQUEST, error),
+    };
+    let (summary, package_path) = match create_current_project_package(&state, &project_id).await {
+        Ok(package) => package,
+        Err((status, error)) => return package_error(status, error),
+    };
+    let upload_path = package_path.clone();
+    let upload_destination = destination.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let result = project_package::upload_s3(&upload_path, &upload_destination);
+        let _ = std::fs::remove_file(upload_path);
+        result
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "pushed",
+                "project_id": summary.project_id,
+                "destination": destination,
+                "file_count": summary.file_count,
+                "size_bytes": summary.size_bytes,
+            })),
+        )
+            .into_response(),
+        Ok(Err(error)) => package_error(StatusCode::BAD_GATEWAY, error),
+        Err(error) => {
+            let _ = std::fs::remove_file(package_path);
+            package_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Package upload task failed: {error}"),
+            )
+        }
+    }
+}
+
+async fn pull_project_package_endpoint(
+    State(state): State<EngineState>,
+    Json(request): Json<ProjectPackagePullRequest>,
+) -> Response {
+    if state.read_only {
+        return package_error(StatusCode::FORBIDDEN, "Read-only mode");
+    }
+    if let Err(error) = project_package::validate_s3_uri(&request.source, false) {
+        return package_error(StatusCode::BAD_REQUEST, error);
+    }
+    let package_path = package_temp_path("pull");
+    let download_path = package_path.clone();
+    let source = request.source.clone();
+    let download = tokio::task::spawn_blocking(move || {
+        project_package::download_s3(&source, &download_path)
+    })
+    .await;
+    match download {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let _ = std::fs::remove_file(package_path);
+            return package_error(StatusCode::BAD_GATEWAY, error);
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(package_path);
+            return package_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Package download task failed: {error}"),
+            );
+        }
+    }
+
+    let result = install_project_package_from_path(&state, &package_path).await;
+    let _ = tokio::fs::remove_file(&package_path).await;
+    match result {
+        Ok(summary) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "pulled",
+                "project_id": summary.project_id,
+                "source": request.source,
+                "loaded": true,
+                "file_count": summary.file_count,
+                "size_bytes": summary.size_bytes,
+            })),
+        )
+            .into_response(),
+        Err((status, error)) => package_error(status, error),
+    }
+}
+
+fn sync_error_status(error: &str) -> StatusCode {
+    if error.starts_with("Invalid S3 URI") || error.starts_with("Invalid project ID") {
+        StatusCode::BAD_REQUEST
+    } else if error.contains("diverged")
+        || error.contains("already linked")
+        || error.contains("changed while sync")
+        || error.contains("Remote head changed")
+    {
+        StatusCode::CONFLICT
+    } else if error.contains("does not exist locally") && error.contains("no head") {
+        StatusCode::NOT_FOUND
+    } else if error.contains("AWS")
+        || error.contains("S3")
+        || error.contains("sync object")
+        || error.contains("remote sync head")
+    {
+        StatusCode::BAD_GATEWAY
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+async fn sync_project_endpoint(
+    State(state): State<EngineState>,
+    Path(project_id): Path<String>,
+    Json(request): Json<ProjectSyncRequest>,
+) -> Response {
+    if !validate_project_id(&project_id) {
+        return package_error(StatusCode::BAD_REQUEST, "Invalid project ID format");
+    }
+    if state.read_only {
+        return package_error(StatusCode::FORBIDDEN, "Read-only mode");
+    }
+    if let Err(error) = project_package::validate_s3_uri(&request.remote, true) {
+        return package_error(StatusCode::BAD_REQUEST, error);
+    }
+
+    if state
+        .mt_engine
+        .list_loaded_project_ids()
+        .iter()
+        .any(|loaded| loaded == &project_id)
+    {
+        let engine = state.mt_engine.clone();
+        let save_project_id = project_id.clone();
+        let save = tokio::task::spawn_blocking(move || engine.save_project(&save_project_id)).await;
+        match save {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => return package_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+            Err(error) => {
+                return package_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Project save task failed: {error}"),
+                )
+            }
+        }
+    }
+
+    let data_dir = PathBuf::from(&state.data_dir);
+    let run = match project_sync::sync_project(&data_dir, &project_id, &request.remote, false).await {
+        Ok(run) => run,
+        Err(error) => return package_error(sync_error_status(&error), error),
+    };
+
+    let result = match run {
+        SyncRun::Complete(result) => {
+            if result.action == SyncAction::Pulled {
+                let engine = state.mt_engine.clone();
+                let load_project_id = project_id.clone();
+                let load = tokio::task::spawn_blocking(move || {
+                    engine.load_project(&load_project_id).map(|_| ())
+                })
+                .await;
+                match load {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        return package_error(StatusCode::INTERNAL_SERVER_ERROR, error)
+                    }
+                    Err(error) => {
+                        return package_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Project load task failed: {error}"),
+                        )
+                    }
+                }
+            }
+            result
+        }
+        SyncRun::PullRequired(prepared) => {
+            let result = prepared.result().clone();
+            let engine = state.mt_engine.clone();
+            let replace_project_id = project_id.clone();
+            let replace_data_dir = data_dir.clone();
+            let replace = tokio::task::spawn_blocking(move || {
+                engine.replace_project_snapshot(&replace_project_id, || {
+                    project_sync::complete_prepared_pull(&replace_data_dir, &prepared, true)
+                })
+            })
+            .await;
+            match replace {
+                Ok(Ok(ProjectReplaceResult::Reloaded)) => result,
+                Ok(Ok(ProjectReplaceResult::Busy)) => {
+                    return package_error(
+                        StatusCode::CONFLICT,
+                        "Project is active; no local state was replaced. Retry sync after current work completes",
+                    )
+                }
+                Ok(Err(error)) => return package_error(sync_error_status(&error), error),
+                Err(error) => {
+                    return package_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Project replacement task failed: {error}"),
+                    )
+                }
+            }
+        }
+    };
+
+    (StatusCode::OK, Json(result)).into_response()
+}
+
+async fn unload_project_endpoint(
+    State(state): State<EngineState>,
+    Path(project_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !validate_project_id(&project_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid project ID format"})),
+        );
+    }
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "Read-only mode"})),
+        );
+    }
+
+    match state.mt_engine.unload_project(&project_id) {
+        Ok(ProjectUnloadResult::Unloaded) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "unloaded",
+                "project_id": project_id,
+                "loaded": false,
+            })),
+        ),
+        Ok(ProjectUnloadResult::AlreadyUnloaded) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "already_unloaded",
+                "project_id": project_id,
+                "loaded": false,
+            })),
+        ),
+        Ok(ProjectUnloadResult::Busy) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "Project is active; retry unload after current work completes",
+                "project_id": project_id,
+                "loaded": true,
+            })),
+        ),
+        Err(error) => {
+            let status = if error.starts_with("Project '") && error.ends_with("' not found") {
+                StatusCode::NOT_FOUND
+            } else if error.starts_with("Project unloading requires") {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(serde_json::json!({"error": error})))
+        }
+    }
+}
+
 async fn project_artifacts(
     State(state): State<EngineState>,
     Path(project_id): Path<String>,
@@ -6055,11 +6668,14 @@ async fn export_project(
         );
     }
 
-    let Some(ctx) = state.mt_engine.get_project(&project_id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Project not found"})),
-        );
+    let ctx = match state.mt_engine.get_or_create_project(project_id.clone()) {
+        Ok(context) => context,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": error})),
+            )
+        }
     };
 
     let limit = query.limit.clamp(1, 10_000);

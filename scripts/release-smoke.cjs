@@ -151,7 +151,13 @@ function textOf(result) {
     await client.connect(transport);
     const listed = await client.listTools();
     const names = new Set(listed.tools.map((tool) => tool.name));
-    for (const required of ["cuemap_add", "cuemap_recall", "cuemap_stats"]) {
+    for (const required of [
+      "cuemap_add",
+      "cuemap_recall",
+      "cuemap_stats",
+      "cuemap_project_load",
+      "cuemap_project_unload",
+    ]) {
       assert.ok(names.has(required), required + " missing from published MCP server");
     }
 
@@ -177,6 +183,18 @@ function textOf(result) {
       },
     });
     assert.match(textOf(recalled), /Release smoke test stored this memory successfully/);
+
+    const unloaded = await client.callTool({
+      name: "cuemap_project_unload",
+      arguments: { project },
+    });
+    assert.match(textOf(unloaded), /"loaded": false/);
+
+    const loaded = await client.callTool({
+      name: "cuemap_project_load",
+      arguments: { project },
+    });
+    assert.match(textOf(loaded), /"loaded": true/);
     console.log("MCP published-install smoke passed");
   } finally {
     await client.close().catch(() => undefined);

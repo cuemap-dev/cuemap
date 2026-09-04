@@ -31,6 +31,8 @@ pub struct ServerConfig {
     pub tuning: TuningConfig,
     #[serde(default)]
     pub semantic: SemanticConfig,
+    #[serde(default)]
+    pub project_lifecycle: ProjectLifecycleConfig,
 }
 
 impl Default for ServerConfig {
@@ -44,6 +46,7 @@ impl Default for ServerConfig {
             search: SearchConfig::default(),
             tuning: TuningConfig::default(),
             semantic: SemanticConfig::default(),
+            project_lifecycle: ProjectLifecycleConfig::default(),
         }
     }
 }
@@ -98,6 +101,16 @@ impl ServerConfig {
         if let Ok(snapshot_interval) = env::var("CUEMAP_SNAPSHOT_INTERVAL_SECONDS") {
             if let Ok(seconds) = snapshot_interval.parse() {
                 config.persistence.snapshot_interval_seconds = seconds;
+            }
+        }
+        if let Ok(inactivity_timeout) = env::var("CUEMAP_PROJECT_INACTIVITY_TIMEOUT_SECONDS") {
+            if let Ok(seconds) = inactivity_timeout.parse() {
+                config.project_lifecycle.inactivity_timeout_seconds = seconds;
+            }
+        }
+        if let Ok(check_interval) = env::var("CUEMAP_PROJECT_UNLOAD_CHECK_INTERVAL_SECONDS") {
+            if let Ok(seconds) = check_interval.parse() {
+                config.project_lifecycle.unload_check_interval_seconds = seconds;
             }
         }
         if let Ok(key) = env::var("CUEMAP_SECRET_KEY") {
@@ -281,6 +294,28 @@ pub struct PersistenceConfig {
     pub cloud: CloudConfig,
 }
 
+/// Runtime policy for keeping project contexts resident in memory.
+///
+/// A zero inactivity timeout disables automatic unloading. Explicit load and
+/// unload endpoints remain available regardless of the automatic policy.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProjectLifecycleConfig {
+    /// Number of seconds without project activity before an unload is attempted.
+    pub inactivity_timeout_seconds: u64,
+    /// How often the engine checks loaded projects for inactivity.
+    pub unload_check_interval_seconds: u64,
+}
+
+impl Default for ProjectLifecycleConfig {
+    fn default() -> Self {
+        Self {
+            inactivity_timeout_seconds: 24 * 60 * 60,
+            unload_check_interval_seconds: 60,
+        }
+    }
+}
+
 impl Default for PersistenceConfig {
     fn default() -> Self {
         Self {
@@ -411,6 +446,14 @@ mod tests {
     }
 
     #[test]
+    fn default_project_lifecycle_timeout_is_one_day() {
+        assert_eq!(
+            ProjectLifecycleConfig::default().inactivity_timeout_seconds,
+            24 * 60 * 60
+        );
+    }
+
+    #[test]
     fn load_reads_toml_and_applies_environment_overrides() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("server.toml");
@@ -423,6 +466,8 @@ mod tests {
             ("CUEMAP_PORT", "9123"),
             ("CUEMAP_DATA_DIR", "/tmp/cuemap-test-data"),
             ("CUEMAP_SNAPSHOT_INTERVAL_SECONDS", "7"),
+            ("CUEMAP_PROJECT_INACTIVITY_TIMEOUT_SECONDS", "11"),
+            ("CUEMAP_PROJECT_UNLOAD_CHECK_INTERVAL_SECONDS", "3"),
             ("CUEMAP_SECRET_KEY", "secret"),
             ("CUEMAP_SIGNING_PRIVATE_KEY", "signing"),
             ("CUEMAP_MASTER_KEY", "master"),
@@ -457,6 +502,8 @@ mod tests {
         assert_eq!(loaded.server.port, 9123);
         assert_eq!(loaded.server.data_dir, "/tmp/cuemap-test-data");
         assert_eq!(loaded.persistence.snapshot_interval_seconds, 7);
+        assert_eq!(loaded.project_lifecycle.inactivity_timeout_seconds, 11);
+        assert_eq!(loaded.project_lifecycle.unload_check_interval_seconds, 3);
         assert_eq!(loaded.security.secret_key.as_deref(), Some("secret"));
         assert_eq!(loaded.security.signing_private_key.as_deref(), Some("signing"));
         assert_eq!(loaded.security.master_key.as_deref(), Some("master"));

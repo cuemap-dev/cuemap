@@ -5,9 +5,12 @@ All notable changes to the CueMap Rust Engine will be documented in this file.
 ## [0.7.3] - 2026-08-27
 
 ### Added
+- **Portable project packages**: Added checksummed `.cuemap` packages that carry ready-to-query project snapshots, disk-backed content, and CueBridge artifacts without replaying ingestion. Matching CLI and HTTP operations support local pack/load and S3 push/pull through an already-configured AWS CLI. Imports validate paths, payload hashes, and snapshots before staged installation.
+- **Project sync protocol**: Added Git-like S3 sync with immutable content-addressed package commits, local base tracking, fast-forward push/pull, conditional head updates, and explicit divergence refusal across CLI and HTTP.
 - **Mobile-language ingestion**: Added Tree-sitter-backed chunking and structural cues for Swift, Dart, Objective-C, and Kotlin files, including uppercase extensions and code-fence routing.
 - **Broader source ingestion**: Added Tree-sitter-backed chunking for C, C++, C#, and Bash, plus structured TOML ingestion. Ambiguous `.h` files use source syntax and Apple-project markers to distinguish Objective-C from C/C++.
 - **Language-aware cue filtering**: Added keyword sets for the new mobile languages so code ingestion does not pollute lexical cues with language syntax.
+- **Project memory residency**: Added configurable inactivity-based unloading, transparent demand-loading for requests targeting unloaded projects, explicit `POST /projects/{project_id}/load` and `POST /projects/{project_id}/unload` endpoints, and loaded-state reporting in project summaries. The default inactivity period is one day.
 
 ### Fixed
 - **Lemmatization correctness**: Corrected common false lemmas, with regression coverage for truncated and wrong-part-of-speech outputs.

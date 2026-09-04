@@ -54,7 +54,7 @@ docker build -t cuemap/engine:0.7.3 .
 docker run -p 8735:8735 -v "$(pwd)/local_snapshot_dir:/app/data" cuemap/engine:0.7.3
 ```
 
-The container runs as the unprivileged `cuemap` user. Ensure a bind-mounted data directory is writable by UID/GID `10001`, or use a Docker-managed volume. Runtime defaults can be overridden with `CUEMAP_PORT`, `CUEMAP_DATA_DIR`, `CUEMAP_SNAPSHOT_INTERVAL_SECONDS`, `TOKENIZER_PATH`, and `RUST_LOG`.
+The container runs as the unprivileged `cuemap` user. Ensure a bind-mounted data directory is writable by UID/GID `10001`, or use a Docker-managed volume. Runtime defaults can be overridden with `CUEMAP_PORT`, `CUEMAP_DATA_DIR`, `CUEMAP_SNAPSHOT_INTERVAL_SECONDS`, `CUEMAP_PROJECT_INACTIVITY_TIMEOUT_SECONDS`, `CUEMAP_PROJECT_UNLOAD_CHECK_INTERVAL_SECONDS`, `TOKENIZER_PATH`, and `RUST_LOG`.
 
 ### Native npm packages
 
@@ -96,7 +96,7 @@ cuemap <COMMAND> [OPTIONS]
 - **`add`**: Add a memory via natural language.
 - **`recall`**: Search memories (supports Grounded Recall and Web Recall).
 - **`ingest`**: Ingest data from files or URLs.
-- **`projects`**: Create and list projects.
+- **`project`**: Manage projects, portable packages, and sync (`projects` remains an alias).
 - **`set-project`**: Set the default project for the current session.
 - **`set-watch-dir`**: Set a watch directory for a project (enables agent).
 
@@ -175,6 +175,7 @@ CueMap provides complete project isolation with automatic persistence:
 - **Project Isolation**: Each project has its own memory space, identified by `X-Project-ID` header.
 - **Auto-Save on Shutdown**: All projects are saved on graceful shutdown when persistence is enabled.
 - **Auto-Load on Startup**: Snapshots are restored from the configured data directory when persistence is enabled.
+- **Memory-Aware Residency**: Loaded project contexts are automatically unloaded after a configurable inactivity period while their snapshots remain available on disk. A request for an unloaded project transparently loads it again.
 - **Zero Configuration**: Works out of the box
 
 ### Usage
@@ -194,6 +195,89 @@ cuemap recall "What is important?"
 # Restart server - loads persisted snapshots
 # Data persists across restarts unless snapshots are disabled.
 ```
+
+### Project memory residency
+
+By default, the engine checks loaded projects every 60 seconds and unloads
+projects that have had no activity for one day. Configure this in
+`server_config.toml`:
+
+```toml
+[project_lifecycle]
+inactivity_timeout_seconds = 86400
+unload_check_interval_seconds = 60
+```
+
+Set `inactivity_timeout_seconds = 0` to disable automatic unloading. Project
+snapshots are written before an unload, and ordinary recall, ingestion, and
+other project requests demand-load the project when needed. The first request
+after a reload can therefore have additional snapshot/index reconstruction
+latency. Use `POST /projects/{project_id}/load` to warm a project explicitly
+or `POST /projects/{project_id}/unload` to persist and release it immediately.
+`GET /projects` includes `loaded: true|false` for each project. Explicit
+unload returns a conflict while active work still holds the project context.
+
+### Memory optimization
+
+CueMap has two complementary ways to reduce memory usage. Choose between them
+based on whether the memory pressure comes from large content payloads or from
+having many inactive projects loaded at once.
+
+#### Content-level optimization: `--disk-content`
+
+Start the engine with `--disk-content` to keep memory content on disk instead
+of retaining the raw content bytes in RAM:
+
+```bash
+./target/release/cuemap start --disk-content
+```
+
+The project’s cues, metadata, indexes, and semantic vectors remain loaded, so
+recall stays warm. CueMap reads the content from
+`<data-dir>/contents/<project-id>/` when it needs to return a result. This is
+useful for a frequently accessed project with many large memories, but content
+results incur disk I/O. It is not a project unload mechanism.
+
+#### Project-level optimization: load/unload
+
+Project unloading persists the project snapshot and releases the complete
+in-memory project context, including its indexes and metadata. It is useful
+when an instance contains many repositories but only a few are active. A
+request for an unloaded project loads it automatically; the first request can
+therefore have higher latency. See [Project memory residency](#project-memory-residency)
+for the inactivity policy and explicit endpoints.
+
+The two options can be enabled together: `--disk-content` reduces the RAM used
+by each loaded project, while project unloading reduces the number of loaded
+projects. Disk-backed content lives outside the project snapshots, so backups
+must include both the snapshots directory and `<data-dir>/contents/`.
+
+### Portable project packages
+
+A `.cuemap` file carries a ready-to-query project—snapshots, disk-backed content,
+and CueBridge artifacts—so another server can load it without re-ingestion.
+
+```bash
+cuemap project pack my-project --output my-project.cuemap
+cuemap project load my-project.cuemap
+cuemap project push my-project s3://my-bucket/cuemap/
+cuemap project pull s3://my-bucket/cuemap/my-project.cuemap
+cuemap project sync my-project s3://my-bucket/team
+```
+
+HTTP clients use the matching `POST /projects/{id}/pack`, `/projects/load`,
+`/projects/{id}/push`, and `/projects/pull` endpoints.
+
+`pack`/`push` flush the running server first; use `--offline` only for a current
+stopped instance. Imports verify SHA-256 checksums and snapshot compatibility and
+refuse overwrite unless `--force` is used while the server is stopped. Packages
+exclude machine-specific watch settings and are point-in-time, sensitive copies.
+Encrypted projects require the same master key on the target. S3 commands use
+the configured AWS CLI and incur normal AWS charges.
+
+`sync` adds immutable commits and a conditionally updated S3 head. It pushes or
+pulls only fast-forwards and refuses divergent or concurrently changed state.
+HTTP clients use `POST /projects/{id}/sync` with `{"remote":"s3://..."}`.
 
 ### Snapshot Management
 

@@ -1963,6 +1963,35 @@
         )
     }
 
+    fn test_router_for_packages(
+        data_dir: &std::path::Path,
+        read_only: bool,
+    ) -> axum::Router {
+        let snapshots = data_dir.join("snapshots");
+        let mt_engine = Arc::new(MultiTenantEngine::with_snapshots_dir(
+            &snapshots,
+            TuningConfig::default(),
+        ));
+        let metrics = Arc::new(MetricsCollector::new());
+        let provider: Arc<dyn crate::jobs::ProjectProvider> = mt_engine.clone();
+        let job_queue = Arc::new(JobQueue::new(provider, Some(metrics.clone()), true));
+        let agent_manager = Arc::new(crate::agent::manager::AgentManager::new(
+            job_queue.clone(),
+            mt_engine.clone(),
+        ));
+        routes(
+            mt_engine,
+            job_queue,
+            metrics,
+            AuthConfig::from_config(&crate::config::SecurityConfig::default()),
+            read_only,
+            data_dir.to_string_lossy().to_string(),
+            None,
+            None,
+            agent_manager,
+        )
+    }
+
     async fn test_router_with_local_backup() -> axum::Router {
         let root = std::env::temp_dir().join(format!("cuemap-api-backup-{}", uuid::Uuid::new_v4()));
         let data_dir = root.join("data");
@@ -2037,7 +2066,21 @@
             .await
             .unwrap();
         assert_eq!(root.status(), StatusCode::OK);
-        assert!(json_body(root).await["capabilities"].as_array().unwrap().len() >= 4);
+        assert!(json_body(root).await["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability == "project_packages_v1"));
+        let root = router
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(json_body(root).await["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability == "project_sync_v1"));
 
         let missing_project = router
             .clone()
@@ -2069,6 +2112,20 @@
             .await
             .unwrap();
         assert_eq!(stored.status(), StatusCode::OK);
+
+        let saved = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/projects/api-test/save")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), StatusCode::OK);
+        assert_eq!(json_body(saved).await["status"], "saved");
         let stored_json = json_body(stored).await;
         let id = stored_json["id"].as_u64().unwrap();
 
@@ -2333,6 +2390,326 @@
             .await
             .unwrap();
         assert_eq!(deleted_project.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn routes_cover_project_load_unload_and_demand_reload() {
+        let router = test_router();
+        let project_id = "api-lifecycle";
+
+        let created = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/projects")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"project_id":"{project_id}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        let stored = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories")
+                    .header("content-type", "application/json")
+                    .header("X-Project-ID", project_id)
+                    .body(Body::from(r#"{"content":"reload me","cues":["lifecycle"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored.status(), StatusCode::OK);
+
+        let unloaded = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{project_id}/unload"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unloaded.status(), StatusCode::OK);
+        assert_eq!(json_body(unloaded).await["loaded"], false);
+
+        let listed = router
+            .clone()
+            .oneshot(Request::builder().uri("/projects").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let listed_json = json_body(listed).await;
+        let listed_project = listed_json
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|project| project["project_id"] == project_id)
+            .unwrap();
+        assert_eq!(listed_project["loaded"], false);
+        assert_eq!(listed_project["total_memories"], 1);
+
+        // Recall is a normal project request and should transparently load
+        // the snapshot back into memory.
+        let recalled = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/recall")
+                    .header("content-type", "application/json")
+                    .header("X-Project-ID", project_id)
+                    .body(Body::from(r#"{"cues":["lifecycle"],"limit":5}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recalled.status(), StatusCode::OK);
+        assert_eq!(json_body(recalled).await["results"].as_array().unwrap().len(), 1);
+
+        let explicitly_unloaded = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{project_id}/unload"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(explicitly_unloaded.status(), StatusCode::OK);
+
+        let loaded = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{project_id}/load"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(loaded.status(), StatusCode::OK);
+        assert_eq!(json_body(loaded).await["loaded"], true);
+    }
+
+    #[tokio::test]
+    async fn project_unload_is_forbidden_in_read_only_mode_and_missing_load_is_not_found() {
+        let router = test_router_with_read_only(true);
+
+        let unload = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/projects/api-lifecycle/unload")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unload.status(), StatusCode::FORBIDDEN);
+
+        let save = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/projects/api-lifecycle/save")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(save.status(), StatusCode::FORBIDDEN);
+
+        let load = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/projects/api-lifecycle/load")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(load.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn routes_cover_portable_project_package_round_trip_and_guards() {
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let source_router = test_router_for_packages(source.path(), false);
+
+        let stored = source_router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories")
+                    .header("content-type", "application/json")
+                    .header("X-Project-ID", "api-package")
+                    .body(Body::from(
+                        r#"{"content":"portable API memory","cues":["package-roundtrip"]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored.status(), StatusCode::OK);
+
+        let packed = source_router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/projects/api-package/pack")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(packed.status(), StatusCode::OK);
+        assert_eq!(
+            packed.headers()["content-type"],
+            "application/vnd.cuemap.project"
+        );
+        let package = to_bytes(packed.into_body(), usize::MAX).await.unwrap();
+        assert!(package.starts_with(b"CUEMAP01"));
+
+        let target_router = test_router_for_packages(target.path(), false);
+        let loaded = target_router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/projects/load")
+                    .header("content-type", "application/vnd.cuemap.project")
+                    .body(Body::from(package.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(loaded.status(), StatusCode::OK);
+        assert_eq!(json_body(loaded).await["project_id"], "api-package");
+
+        let duplicate = target_router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/projects/load")
+                    .body(Body::from(package))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+
+        let recalled = target_router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/recall")
+                    .header("content-type", "application/json")
+                    .header("X-Project-ID", "api-package")
+                    .body(Body::from(
+                        r#"{"cues":["package-roundtrip"],"semantic_mode":"lexical"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recalled.status(), StatusCode::OK);
+        assert_eq!(json_body(recalled).await["results"][0]["content"], "portable API memory");
+
+        let invalid_push = target_router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/projects/api-package/push")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"destination":"https://example.test/file"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_push.status(), StatusCode::BAD_REQUEST);
+
+        let invalid_pull = target_router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/projects/pull")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"source":"s3://bucket-only"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_pull.status(), StatusCode::BAD_REQUEST);
+
+        let invalid_sync = target_router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/projects/api-package/sync")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"remote":"https://example.test/sync"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_sync.status(), StatusCode::BAD_REQUEST);
+
+        let read_only_root = tempfile::tempdir().unwrap();
+        let read_only = test_router_for_packages(read_only_root.path(), true);
+        let read_only_pack = read_only
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/projects/api-package/pack")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_only_pack.status(), StatusCode::FORBIDDEN);
+        let read_only_load = read_only
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/projects/load")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_only_load.status(), StatusCode::FORBIDDEN);
+        let read_only_sync = read_only
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/projects/api-package/sync")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"remote":"s3://example-bucket/team"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_only_sync.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

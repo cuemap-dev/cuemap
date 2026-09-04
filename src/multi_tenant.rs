@@ -12,11 +12,11 @@ use crate::taxonomy::Taxonomy;
 use ahash::RandomState;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub type ProjectId = String;
@@ -28,12 +28,28 @@ pub struct ProjectStats {
     pub total_cues: usize,
     pub created_at: f64,
     pub last_activity: f64,
+    pub loaded: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectUnloadResult {
+    Unloaded,
+    AlreadyUnloaded,
+    Busy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectReplaceResult {
+    Reloaded,
+    Busy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectMeta {
     pub project_id: ProjectId,
     pub created_at: u64,
+    #[serde(default)]
+    pub last_activity: u64,
     pub watch_dir: Option<String>,
     pub agent_enabled: bool,
     #[serde(default)]
@@ -49,6 +65,10 @@ impl ProjectMeta {
         Self {
             project_id,
             created_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            last_activity: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
@@ -69,6 +89,7 @@ pub struct MultiTenantEngine {
     tuning: Arc<TuningConfig>,
     config: crate::config::ServerConfig,
     semantic_encoder: Arc<OnceLock<Result<Option<Arc<dyn SemanticEncoder>>, String>>>,
+    lifecycle_lock: Arc<Mutex<()>>,
 }
 
 impl MultiTenantEngine {
@@ -95,6 +116,7 @@ impl MultiTenantEngine {
             tuning: Arc::new(tuning),
             config: crate::config::ServerConfig::default(),
             semantic_encoder: Arc::new(OnceLock::new()),
+            lifecycle_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -115,6 +137,7 @@ impl MultiTenantEngine {
             tuning: Arc::new(config.tuning.clone()),
             config,
             semantic_encoder: Arc::new(OnceLock::new()),
+            lifecycle_lock: Arc::new(Mutex::new(())),
         };
         if engine.config.semantic.encoder_enabled {
             if let Err(error) = engine.configured_semantic_encoder() {
@@ -141,9 +164,21 @@ impl MultiTenantEngine {
         &self,
         project_id: ProjectId,
     ) -> Result<Arc<ProjectContext>, String> {
+        // Serialize lookup, load, and insertion so an unload cannot race a
+        // demand-load and leave two live contexts for the same project.
+        let _lifecycle_guard = self
+            .lifecycle_lock
+            .lock()
+            .map_err(|_| "Project lifecycle lock poisoned".to_string())?;
+
         if let Some(ctx) = self.projects.get(&project_id) {
             ctx.touch();
             Ok(ctx.clone())
+        } else if self.main_snapshot_path(&project_id).exists() {
+            let ctx = self.load_project_from_disk(&project_id)?;
+            ctx.touch();
+            tracing::info!(project_id = %project_id, "Loaded project on demand");
+            Ok(ctx)
         } else {
             // Create new project with default config
             let semantic_encoder = match self.configured_semantic_encoder() {
@@ -183,7 +218,7 @@ impl MultiTenantEngine {
         }
     }
 
-    /// Spawns a background thread to periodically save all project snapshots
+    /// Spawns a background task to periodically save all loaded project snapshots.
     pub fn start_periodic_snapshots(&self, interval: Duration) {
         let engine = self.clone();
         tokio::spawn(async move {
@@ -204,53 +239,272 @@ impl MultiTenantEngine {
         });
     }
 
-    pub fn get_project(&self, project_id: &ProjectId) -> Option<Arc<ProjectContext>> {
-        self.projects.get(project_id).map(|e| e.clone())
+    /// Spawns a background task that unloads inactive project contexts.
+    ///
+    /// A zero timeout or check interval disables the task. Projects with an
+    /// active request/worker reference are left loaded and retried later.
+    pub fn start_project_unloader(&self, check_interval: Duration, inactivity_timeout: Duration) {
+        if check_interval.is_zero() || inactivity_timeout.is_zero() {
+            return;
+        }
+
+        let engine = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(check_interval);
+            loop {
+                ticker.tick().await;
+                let unloaded = engine.unload_inactive_projects(inactivity_timeout);
+                if !unloaded.is_empty() {
+                    tracing::info!(
+                        projects = ?unloaded,
+                        "Unloaded inactive projects"
+                    );
+                }
+            }
+        });
     }
 
-    pub fn list_projects(&self) -> Vec<ProjectStats> {
-        self.projects
-            .iter()
-            .map(|entry| {
-                let project_id = entry.key().clone();
-                let ctx = entry.value();
-                let stats = ctx.main.get_stats();
+    /// Unloads every loaded project whose last activity is older than the
+    /// supplied timeout. Returns the projects successfully unloaded.
+    pub fn unload_inactive_projects(&self, inactivity_timeout: Duration) -> Vec<ProjectId> {
+        if inactivity_timeout.is_zero() {
+            return Vec::new();
+        }
 
-                ProjectStats {
-                    project_id,
-                    total_memories: stats
-                        .get("total_memories")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as usize,
-                    total_cues: stats
-                        .get("total_cues")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as usize,
-                    created_at: SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs_f64(),
-                    last_activity: SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs_f64(),
-                }
+        let now = current_unix_seconds();
+        let timeout_seconds = inactivity_timeout.as_secs();
+        let project_ids = self
+            .projects
+            .iter()
+            .filter(|entry| {
+                now.saturating_sub(entry.value().get_last_activity()) >= timeout_seconds
+            })
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+
+        project_ids
+            .into_iter()
+            .filter(|project_id| {
+                matches!(
+                    self.unload_project(project_id),
+                    Ok(ProjectUnloadResult::Unloaded)
+                )
             })
             .collect()
     }
 
+    pub fn get_project(&self, project_id: &ProjectId) -> Option<Arc<ProjectContext>> {
+        let _lifecycle_guard = self.lifecycle_lock.lock().ok()?;
+        self.projects.get(project_id).map(|entry| {
+            entry.touch();
+            entry.clone()
+        })
+    }
+
+    pub fn list_projects(&self) -> Vec<ProjectStats> {
+        let _lifecycle_guard = self.lifecycle_lock.lock().ok();
+        let mut project_ids = self
+            .projects
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<HashSet<_>>();
+        project_ids.extend(self.list_snapshots());
+
+        let mut projects = project_ids
+            .into_iter()
+            .map(|project_id| {
+                let loaded_context = self.projects.get(&project_id).map(|entry| entry.clone());
+                let (total_memories, total_cues, loaded, last_activity) =
+                    if let Some(ctx) = loaded_context {
+                        let stats = ctx.main.get_stats();
+                        (
+                            stats
+                                .get("total_memories")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0) as usize,
+                            stats
+                                .get("total_cues")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0) as usize,
+                            true,
+                            ctx.get_last_activity() as f64,
+                        )
+                    } else {
+                        let (total_memories, total_cues) = self.snapshot_counts(&project_id);
+                        let persisted_meta = self.persisted_project_meta(&project_id);
+                        let last_activity = persisted_meta
+                            .as_ref()
+                            .map(|meta| meta.last_activity)
+                            .filter(|timestamp| *timestamp > 0)
+                            .or_else(|| self.snapshot_modified_at(&project_id))
+                            .unwrap_or(0) as f64;
+                        (total_memories, total_cues, false, last_activity)
+                    };
+                let created_at = self
+                    .persisted_project_meta(&project_id)
+                    .map(|meta| meta.created_at as f64)
+                    .unwrap_or_else(|| current_unix_seconds() as f64);
+
+                ProjectStats {
+                    project_id,
+                    total_memories,
+                    total_cues,
+                    created_at,
+                    last_activity,
+                    loaded,
+                }
+            })
+            .collect::<Vec<_>>();
+        projects.sort_by(|left, right| left.project_id.cmp(&right.project_id));
+        projects
+    }
+
+    /// Returns only project IDs whose contexts are currently resident in RAM.
+    /// Background schedulers use this to avoid reloading every snapshot just
+    /// because an unloaded project still exists on disk.
+    pub fn list_loaded_project_ids(&self) -> Vec<ProjectId> {
+        let _lifecycle_guard = self.lifecycle_lock.lock().ok();
+        let mut project_ids = self
+            .projects
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        project_ids.sort();
+        project_ids
+    }
+
     pub fn delete_project(&self, project_id: &ProjectId) -> bool {
-        self.projects.remove(project_id).is_some()
+        self.lifecycle_lock
+            .lock()
+            .ok()
+            .and_then(|_guard| self.projects.remove(project_id))
+            .is_some()
+    }
+
+    /// Unload a project after persisting its current state.
+    pub fn unload_project(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<ProjectUnloadResult, String> {
+        if !self.config.persistence.enabled {
+            return Err("Project unloading requires persistence to be enabled".to_string());
+        }
+
+        let _lifecycle_guard = self
+            .lifecycle_lock
+            .lock()
+            .map_err(|_| "Project lifecycle lock poisoned".to_string())?;
+
+        let ctx = match self.projects.get(project_id) {
+            Some(entry) => {
+                // The map owns one Arc. Any additional strong reference means
+                // a request, worker, or caller is still using the context.
+                if Arc::strong_count(entry.value()) > 1 {
+                    return Ok(ProjectUnloadResult::Busy);
+                }
+                entry.value().clone()
+            }
+            None => {
+                if self.main_snapshot_path(project_id).exists() {
+                    return Ok(ProjectUnloadResult::AlreadyUnloaded);
+                }
+                return Err(format!("Project '{}' not found", project_id));
+            }
+        };
+
+        self.save_project_context(project_id, &ctx)?;
+        self.persist_project_activity(project_id, &ctx)?;
+
+        self.projects.remove(project_id);
+        tracing::info!(project_id = %project_id, "Unloaded project");
+        Ok(ProjectUnloadResult::Unloaded)
+    }
+
+    /// Atomically replace an existing project's persisted files and reload it.
+    ///
+    /// The replacement closure should only perform local file work. The
+    /// lifecycle lock prevents demand loading between removal of the old
+    /// context and loading the replacement snapshot.
+    pub fn replace_project_snapshot<F>(
+        &self,
+        project_id: &ProjectId,
+        replace: F,
+    ) -> Result<ProjectReplaceResult, String>
+    where
+        F: FnOnce() -> Result<(), String>,
+    {
+        if !self.config.persistence.enabled {
+            return Err("Project replacement requires persistence to be enabled".to_string());
+        }
+
+        let _lifecycle_guard = self
+            .lifecycle_lock
+            .lock()
+            .map_err(|_| "Project lifecycle lock poisoned".to_string())?;
+        let previous = match self.projects.get(project_id) {
+            Some(entry) => {
+                if Arc::strong_count(entry.value()) > 1 {
+                    return Ok(ProjectReplaceResult::Busy);
+                }
+                let context = entry.value().clone();
+                self.save_project_context(project_id, &context)?;
+                self.persist_project_activity(project_id, &context)?;
+                Some(context)
+            }
+            None if self.main_snapshot_path(project_id).is_file() => None,
+            None => return Err(format!("Project '{}' not found", project_id)),
+        };
+
+        self.projects.remove(project_id);
+        if let Err(error) = replace() {
+            if let Some(context) = previous {
+                self.projects.insert(project_id.clone(), context);
+            }
+            return Err(error);
+        }
+
+        let context = self.load_project_from_disk(project_id)?;
+        context.touch();
+        tracing::info!(project_id = %project_id, "Replaced and reloaded project snapshot");
+        Ok(ProjectReplaceResult::Reloaded)
     }
 
     /// Save a project snapshot to disk (main, aliases, lexicon)
     pub fn save_project(&self, project_id: &ProjectId) -> Result<PathBuf, String> {
+        // Clone under the lifecycle lock, then perform disk I/O after
+        // releasing it. The temporary Arc prevents an unload from racing this
+        // save while allowing ordinary requests for other projects to proceed.
         let ctx = self
-            .get_project(project_id)
-            .ok_or_else(|| format!("Project '{}' not found", project_id))?;
+            .lifecycle_lock
+            .lock()
+            .map_err(|_| "Project lifecycle lock poisoned".to_string())
+            .and_then(|_guard| {
+                self.projects
+                    .get(project_id)
+                    .map(|entry| entry.clone())
+                    .ok_or_else(|| format!("Project '{}' not found", project_id))
+            })?;
+        let main_path = self.save_project_context(project_id, &ctx)?;
+        self.persist_project_activity(project_id, &ctx)?;
+        Ok(main_path)
+    }
 
-        // Save all 3 engines with suffixes
-        let main_path = self.snapshots_dir.join(format!("{}.bin", project_id));
+    fn persist_project_activity(
+        &self,
+        project_id: &ProjectId,
+        ctx: &ProjectContext,
+    ) -> Result<(), String> {
+        let mut meta = self.load_project_meta(project_id)?;
+        meta.last_activity = ctx.get_last_activity();
+        self.save_project_meta(&meta)
+    }
+
+    fn save_project_context(
+        &self,
+        project_id: &ProjectId,
+        ctx: &ProjectContext,
+    ) -> Result<PathBuf, String> {
+        let main_path = self.main_snapshot_path(project_id);
         let aliases_path = self
             .snapshots_dir
             .join(format!("{}_aliases.bin", project_id));
@@ -267,14 +521,62 @@ impl MultiTenantEngine {
         PersistenceManager::save_to_path(&ctx.lexicon, &lexicon_path)
             .map_err(|e| format!("Failed to save lexicon engine: {}", e))?;
 
-        tracing::info!("Saved project '{}' (main + aliases + lexicon)", project_id);
+        tracing::info!(project_id = %project_id, "Saved project (main + aliases + lexicon)");
 
         Ok(main_path)
     }
 
+    fn main_snapshot_path(&self, project_id: &ProjectId) -> PathBuf {
+        self.snapshots_dir.join(format!("{}.bin", project_id))
+    }
+
+    fn project_meta_path(&self, project_id: &ProjectId) -> PathBuf {
+        self.snapshots_dir.join(format!("{}.meta.json", project_id))
+    }
+
+    fn persisted_project_meta(&self, project_id: &ProjectId) -> Option<ProjectMeta> {
+        if self.project_meta_path(project_id).exists() {
+            self.load_project_meta(project_id).ok()
+        } else {
+            None
+        }
+    }
+
+    fn snapshot_counts(&self, project_id: &ProjectId) -> (usize, usize) {
+        let path = self.main_snapshot_path(project_id);
+        PersistenceManager::load_from_path::<MainStats>(&path)
+            .map(|(memories, _, cue_index, _, _)| (memories.len(), cue_index.len()))
+            .unwrap_or((0, 0))
+    }
+
+    fn snapshot_modified_at(&self, project_id: &ProjectId) -> Option<u64> {
+        fs::metadata(self.main_snapshot_path(project_id))
+            .ok()?
+            .modified()
+            .ok()?
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_secs())
+    }
+
     /// Load a project snapshot from disk (main, aliases, lexicon)
     pub fn load_project(&self, project_id: &ProjectId) -> Result<Arc<ProjectContext>, String> {
-        let main_path = self.snapshots_dir.join(format!("{}.bin", project_id));
+        let _lifecycle_guard = self
+            .lifecycle_lock
+            .lock()
+            .map_err(|_| "Project lifecycle lock poisoned".to_string())?;
+        if let Some(ctx) = self.projects.get(project_id) {
+            ctx.touch();
+            return Ok(ctx.clone());
+        }
+
+        let ctx = self.load_project_from_disk(project_id)?;
+        ctx.touch();
+        Ok(ctx)
+    }
+
+    fn load_project_from_disk(&self, project_id: &ProjectId) -> Result<Arc<ProjectContext>, String> {
+        let main_path = self.main_snapshot_path(project_id);
         let aliases_path = self
             .snapshots_dir
             .join(format!("{}_aliases.bin", project_id));
@@ -315,18 +617,12 @@ impl MultiTenantEngine {
         // Load aliases engine (optional - may not exist for older snapshots)
         let mut aliases_engine = if aliases_path.exists() {
             match PersistenceManager::load_from_path::<MainStats>(&aliases_path) {
-                Ok((
-                    memories,
-                    source_key_to_id,
-                    cue_index,
-                    next_memory_id,
-                    aliases_counts,
-                )) => {
+                Ok((memories, source_key_to_id, cue_index, next_memory_id, aliases_counts)) => {
                     tracing::debug!("Loaded aliases for project '{}'", project_id);
                     let mut local_config = self.config.clone();
                     local_config.server.store_content_on_disk = false;
                     local_config.semantic = crate::semantic::SemanticConfig::default();
-                    let engine = CueMapEngine::from_state(
+                    CueMapEngine::from_state(
                         memories,
                         source_key_to_id,
                         cue_index,
@@ -334,8 +630,7 @@ impl MultiTenantEngine {
                         aliases_counts,
                         local_config,
                         project_id.clone(),
-                    );
-                    engine
+                    )
                 }
                 Err(e) => {
                     tracing::warn!("Failed to load aliases for '{}': {}", project_id, e);
@@ -351,18 +646,12 @@ impl MultiTenantEngine {
         // Load lexicon engine (optional - may not exist for older snapshots)
         let mut lexicon_engine = if lexicon_path.exists() {
             match PersistenceManager::load_from_path::<LexiconStats>(&lexicon_path) {
-                Ok((
-                    memories,
-                    source_key_to_id,
-                    cue_index,
-                    next_memory_id,
-                    lex_counts,
-                )) => {
+                Ok((memories, source_key_to_id, cue_index, next_memory_id, lex_counts)) => {
                     tracing::debug!("Loaded lexicon for project '{}'", project_id);
                     let mut local_config = self.config.clone();
                     local_config.server.store_content_on_disk = false;
                     local_config.semantic = crate::semantic::SemanticConfig::default();
-                    let engine = CueMapEngine::from_state(
+                    CueMapEngine::from_state(
                         memories,
                         source_key_to_id,
                         cue_index,
@@ -370,8 +659,7 @@ impl MultiTenantEngine {
                         lex_counts,
                         local_config,
                         project_id.clone(),
-                    );
-                    engine
+                    )
                 }
                 Err(e) => {
                     tracing::warn!("Failed to load lexicon for '{}': {}", project_id, e);
@@ -384,6 +672,12 @@ impl MultiTenantEngine {
         lexicon_engine.set_master_key(self.master_key.clone());
         lexicon_engine.set_tuning_config(self.tuning.as_ref().clone());
 
+        let last_activity = self
+            .persisted_project_meta(project_id)
+            .map(|meta| meta.last_activity)
+            .filter(|timestamp| *timestamp > 0)
+            .or_else(|| self.snapshot_modified_at(project_id))
+            .unwrap_or_else(current_unix_seconds);
         let ctx = Arc::new(ProjectContext {
             main: main_engine,
             aliases: aliases_engine,
@@ -392,12 +686,7 @@ impl MultiTenantEngine {
             symbol_router_cache: RwLock::new(Default::default()),
             normalization: NormalizationConfig::default(),
             taxonomy: Taxonomy::default(),
-            last_activity: std::sync::atomic::AtomicU64::new(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-            ),
+            last_activity: std::sync::atomic::AtomicU64::new(last_activity),
             market_heatmap: Arc::new(RwLock::new(HashMap::new())),
             tuning: self.tuning.clone(),
             cuebridge_artifacts: RwLock::new(crate::cuebridge::CueBridgeArtifacts::load_for_project(
@@ -433,8 +722,16 @@ impl MultiTenantEngine {
 
         for project_id in snapshots {
             let result = self
-                .load_project(&project_id)
-                .map(|_| ())
+                .lifecycle_lock
+                .lock()
+                .map_err(|_| "Project lifecycle lock poisoned".to_string())
+                .and_then(|_guard| {
+                    if self.projects.contains_key(&project_id) {
+                        Ok(())
+                    } else {
+                        self.load_project_from_disk(&project_id).map(|_| ())
+                    }
+                })
                 .map_err(|e| format!("Failed to load: {}", e));
             results.insert(project_id, result);
         }
@@ -463,7 +760,7 @@ impl MultiTenantEngine {
 
     /// Load project metadata
     pub fn load_project_meta(&self, project_id: &ProjectId) -> Result<ProjectMeta, String> {
-        let meta_path = self.snapshots_dir.join(format!("{}.meta.json", project_id));
+        let meta_path = self.project_meta_path(project_id);
         if meta_path.exists() {
             let content = fs::read_to_string(&meta_path).map_err(|e| e.to_string())?;
             let meta: ProjectMeta = serde_json::from_str(&content).map_err(|e| e.to_string())?;
@@ -559,9 +856,7 @@ impl MultiTenantEngine {
         &self,
         project_id: &ProjectId,
     ) -> Result<crate::cuebridge::CueBridgeArtifactSummary, String> {
-        let ctx = self
-            .get_project(project_id)
-            .ok_or_else(|| format!("Project '{}' not found", project_id))?;
+        let ctx = self.get_or_create_project(project_id.clone())?;
         Ok(ctx.cuebridge_artifact_summary())
     }
 
@@ -572,6 +867,13 @@ impl MultiTenantEngine {
         let ctx = self.get_or_create_project(project_id.clone())?;
         Ok(ctx.reload_cuebridge_artifacts(&self.config.server.data_dir, project_id))
     }
+}
+
+fn current_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Validate project ID format
