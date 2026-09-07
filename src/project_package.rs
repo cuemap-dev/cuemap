@@ -1104,4 +1104,222 @@ mod tests {
             before
         );
     }
+
+    fn minimal_manifest() -> ProjectPackageManifest {
+        ProjectPackageManifest {
+            format: PACKAGE_FORMAT.to_string(),
+            version: PACKAGE_VERSION,
+            engine_version: "test".to_string(),
+            project_id: "safe_project".to_string(),
+            created_at: 0,
+            files: vec![ProjectPackageFile {
+                path: "snapshot/main.bin".to_string(),
+                size_bytes: 0,
+                sha256: "0".repeat(64),
+            }],
+        }
+    }
+
+    #[test]
+    fn manifest_validation_covers_format_version_identity_and_file_rules() {
+        let original = minimal_manifest();
+        let mut invalid = original.clone();
+        invalid.format = "other".to_string();
+        assert!(validate_manifest(&invalid).unwrap_err().contains("format"));
+        let mut invalid = original.clone();
+        invalid.version = 2;
+        assert!(validate_manifest(&invalid).unwrap_err().contains("version"));
+        let mut invalid = original.clone();
+        invalid.project_id = "bad project".to_string();
+        assert!(validate_manifest(&invalid).is_err());
+        let mut invalid = original.clone();
+        invalid.files.clear();
+        assert!(validate_manifest(&invalid).unwrap_err().contains("number of files"));
+        let mut invalid = original.clone();
+        invalid.files.push(invalid.files[0].clone());
+        assert!(validate_manifest(&invalid).unwrap_err().contains("duplicate"));
+        let mut invalid = original.clone();
+        invalid.files[0].path = "contents/sidecar.bin".to_string();
+        assert!(validate_manifest(&invalid).unwrap_err().contains("snapshot/main"));
+        let mut invalid = original.clone();
+        invalid.files[0].sha256 = "not-a-checksum".to_string();
+        assert!(validate_manifest(&invalid).unwrap_err().contains("checksum"));
+        let mut invalid = original.clone();
+        invalid.files[0].path = "other/file".to_string();
+        assert!(validate_manifest(&invalid).is_err());
+    }
+
+    #[test]
+    fn package_reader_and_path_helpers_reject_malformed_input() {
+        use std::io::Cursor;
+
+        assert!(read_manifest(&mut Cursor::new(Vec::<u8>::new())).is_err());
+        assert!(read_manifest(&mut Cursor::new(b"BADMAGIC".to_vec()))
+            .unwrap_err()
+            .contains("Not a CueMap"));
+        let mut zero_len = PACKAGE_MAGIC.to_vec();
+        zero_len.extend_from_slice(&0_u64.to_le_bytes());
+        assert!(read_manifest(&mut Cursor::new(zero_len)).unwrap_err().contains("length"));
+        let mut huge_len = PACKAGE_MAGIC.to_vec();
+        huge_len.extend_from_slice(&(MAX_MANIFEST_BYTES + 1).to_le_bytes());
+        assert!(read_manifest(&mut Cursor::new(huge_len)).is_err());
+        let mut truncated = PACKAGE_MAGIC.to_vec();
+        truncated.extend_from_slice(&4_u64.to_le_bytes());
+        truncated.extend_from_slice(b"{} ");
+        assert!(read_manifest(&mut Cursor::new(truncated)).is_err());
+        let mut invalid_json = PACKAGE_MAGIC.to_vec();
+        invalid_json.extend_from_slice(&3_u64.to_le_bytes());
+        invalid_json.extend_from_slice(b"bad");
+        assert!(read_manifest(&mut Cursor::new(invalid_json))
+            .unwrap_err()
+            .contains("manifest"));
+
+        assert!(logical_path("").is_err());
+        assert!(logical_path("snapshot\\main.bin").is_err());
+        assert!(logical_path("../escape").is_err());
+        assert!(logical_path("unsupported/file").is_err());
+        assert_eq!(logical_path("contents/nested/file.bin").unwrap(), PathBuf::from("contents/nested/file.bin"));
+        assert!(portable_relative_path(Path::new("")).is_err());
+        assert!(portable_relative_path(Path::new("../escape")).is_err());
+        assert_eq!(portable_relative_path(Path::new("nested/file.bin")).unwrap(), "nested/file.bin");
+    }
+
+    #[test]
+    fn payload_copy_and_size_helpers_cover_success_and_failures() {
+        use std::io::Cursor;
+
+        let dir = TempDir::new().unwrap();
+        let output_path = dir.path().join("out.bin");
+        let content = b"payload";
+        let entry = ProjectPackageFile {
+            path: "contents/payload.bin".to_string(),
+            size_bytes: content.len() as u64,
+            sha256: hex::encode(Sha256::digest(content)),
+        };
+        copy_exact_and_verify(
+            &mut Cursor::new(content.to_vec()),
+            File::create(&output_path).unwrap(),
+            &entry,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&output_path).unwrap(), content);
+
+        let short = ProjectPackageFile { size_bytes: 10, ..entry.clone() };
+        assert!(copy_exact_and_verify(
+            &mut Cursor::new(content.to_vec()),
+            File::create(dir.path().join("short.bin")).unwrap(),
+            &short,
+        )
+        .unwrap_err()
+        .contains("ended"));
+        let bad_hash = ProjectPackageFile { sha256: "f".repeat(64), ..entry.clone() };
+        assert!(copy_exact_and_verify(
+            &mut Cursor::new(content.to_vec()),
+            File::create(dir.path().join("bad.bin")).unwrap(),
+            &bad_hash,
+        )
+        .unwrap_err()
+        .contains("Checksum"));
+
+        let overflow = ProjectPackageManifest {
+            files: vec![
+                ProjectPackageFile { size_bytes: u64::MAX, ..entry.clone() },
+                ProjectPackageFile { path: "contents/second".to_string(), size_bytes: 1, ..entry },
+            ],
+            ..minimal_manifest()
+        };
+        assert!(total_payload_bytes(&overflow).unwrap_err().contains("overflow"));
+        assert!(file_sha256(&dir.path().join("missing")).is_err());
+        assert!(project_state_sha256(dir.path(), "safe_project").is_err());
+    }
+
+    #[test]
+    fn staged_project_validation_checks_snapshots_and_disk_backed_content() {
+        let stage = TempDir::new().unwrap();
+        fs::create_dir_all(stage.path().join("snapshot")).unwrap();
+        let mut engine = CueMapEngine::<MainStats>::new();
+        let mut config = engine.config.clone();
+        config.server.data_dir = stage.path().to_string_lossy().to_string();
+        config.server.store_content_on_disk = true;
+        engine.config = config;
+        engine.project_id = "staged_project".to_string();
+        let memory_id = engine.add_memory(
+            "disk content".to_string(),
+            vec!["disk".to_string()],
+            None,
+            MainStats::default(),
+            true,
+        );
+        PersistenceManager::save_to_path(
+            &engine,
+            &stage.path().join("snapshot/main.bin"),
+        )
+        .unwrap();
+        let error = validate_staged_project(stage.path()).unwrap_err();
+        assert!(error.contains("disk-backed content"));
+        let generated_content = stage
+            .path()
+            .join("contents/staged_project")
+            .join(format!("{memory_id}.bin"));
+        assert!(generated_content.is_file());
+        fs::rename(
+            &generated_content,
+            stage.path().join(format!("contents/{memory_id}.bin")),
+        )
+        .unwrap();
+        fs::remove_dir(stage.path().join("contents/staged_project")).unwrap();
+        assert!(validate_staged_project(stage.path()).is_ok());
+
+        let invalid_stage = TempDir::new().unwrap();
+        fs::create_dir_all(invalid_stage.path().join("snapshot")).unwrap();
+        fs::write(invalid_stage.path().join("snapshot/main.bin"), b"invalid").unwrap();
+        assert!(validate_staged_project(invalid_stage.path())
+            .unwrap_err()
+            .contains("Invalid main snapshot"));
+
+        let raw_json = TempDir::new().unwrap();
+        let raw_path = raw_json.path().join("snapshot.json");
+        fs::write(&raw_path, br#"{"saved_at": 123, "value": 1}"#).unwrap();
+        let normalized = normalized_snapshot_bytes(&raw_path).unwrap();
+        assert!(!String::from_utf8_lossy(&normalized).contains("saved_at"));
+        let raw_bytes = raw_json.path().join("raw.bin");
+        fs::write(&raw_bytes, b"not json").unwrap();
+        assert_eq!(normalized_snapshot_bytes(&raw_bytes).unwrap(), b"not json");
+    }
+
+    #[test]
+    fn package_and_s3_validation_cover_missing_and_unsafe_inputs() {
+        let data = TempDir::new().unwrap();
+        let output = data.path().join("package.cuemap");
+        assert!(pack_project(data.path(), "bad project", &output, false).is_err());
+        assert!(pack_project(data.path(), "safe_project", &output, false)
+            .unwrap_err()
+            .contains("snapshot"));
+        assert!(validate_s3_uri("s3://bucket/\u{7f}", true).is_err());
+        assert!(validate_s3_uri("s3://", true).is_err());
+        assert!(validate_s3_uri("s3://.", true).is_err());
+        assert!(validate_s3_uri("s3://..", true).is_err());
+        assert!(validate_s3_uri("s3://bucket///", false).is_err());
+        assert_eq!(
+            s3_destination("s3://bucket/existing/object.cuemap", "ignored").unwrap(),
+            "s3://bucket/existing/object.cuemap"
+        );
+        assert!(download_s3("https://bad", &data.path().join("x")).is_err());
+        assert!(upload_s3(data.path(), "https://bad").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packaging_refuses_symlinked_content() {
+        use std::os::unix::fs::symlink;
+        let root = TempDir::new().unwrap();
+        let target = root.path().join("target");
+        let link = root.path().join("link");
+        fs::write(&target, b"target").unwrap();
+        symlink(&target, &link).unwrap();
+        let mut paths = Vec::new();
+        assert!(collect_directory(root.path(), "contents", &mut paths)
+            .unwrap_err()
+            .contains("symlink"));
+    }
 }

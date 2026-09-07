@@ -366,6 +366,15 @@ pub async fn sync_project(
     let remote = tokio::task::spawn_blocking(move || S3SyncRemote::new(&remote_uri_owned))
         .await
         .map_err(|error| format!("Sync remote setup task failed: {error}"))??;
+    sync_project_with_remote(data_dir, project_id, remote, allow_local_replace).await
+}
+
+async fn sync_project_with_remote(
+    data_dir: &Path,
+    project_id: &str,
+    remote: S3SyncRemote,
+    allow_local_replace: bool,
+) -> Result<SyncRun, String> {
     let local_state = load_local_state(data_dir, project_id)?;
     if let Some(state) = &local_state {
         if state.remote != remote.canonical_uri {
@@ -879,6 +888,19 @@ fn unix_seconds() -> u64 {
 mod tests {
     use super::*;
 
+    fn test_remote() -> S3SyncRemote {
+        remote_with_store(Arc::new(object_store::memory::InMemory::new()))
+    }
+
+    fn remote_with_store(store: Arc<dyn ObjectStore>) -> S3SyncRemote {
+        S3SyncRemote {
+            canonical_uri: "s3://bucket/team".to_string(),
+            bucket: "bucket".to_string(),
+            prefix: "team".to_string(),
+            store,
+        }
+    }
+
     fn hash(value: char) -> String {
         value.to_string().repeat(64)
     }
@@ -1024,5 +1046,371 @@ mod tests {
                 "team".to_string()
             )
         );
+    }
+
+    fn remote_commit(remote: &S3SyncRemote, generation: u64, package: char, state: char) -> SyncCommit {
+        let mut value = commit(generation, package, state);
+        value.package_key = remote.package_key(&value.project_id, &value.package_sha256);
+        value.commit_sha256 = calculate_commit_hash(&value).unwrap();
+        value
+    }
+
+    #[tokio::test]
+    async fn in_memory_remote_publishes_immutable_commits_and_conditional_heads() {
+        let remote = test_remote();
+        assert!(remote.head("sync-project").await.unwrap().is_none());
+        let first = remote_commit(&remote, 1, 'a', '1');
+        remote.put_commit(&first).await.unwrap();
+        // Publishing the exact same immutable object is idempotent.
+        remote.put_commit(&first).await.unwrap();
+        let stored = remote
+            .commit("sync-project", &first.commit_sha256)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.commit, first);
+        remote.advance_head(&first, None).await.unwrap();
+        let head = remote.head("sync-project").await.unwrap().unwrap();
+        assert_eq!(head.commit, first);
+        assert!(head.e_tag.is_some());
+
+        let mut second = remote_commit(&remote, 2, 'b', '2');
+        second.parent_commit_sha256 = Some(first.commit_sha256.clone());
+        second.commit_sha256 = calculate_commit_hash(&second).unwrap();
+        remote.put_commit(&second).await.unwrap();
+        remote.advance_head(&second, Some(&head)).await.unwrap();
+        assert_eq!(remote.head("sync-project").await.unwrap().unwrap().commit, second);
+
+        let stale = remote
+            .advance_head(&first, Some(&head))
+            .await
+            .unwrap_err();
+        assert!(stale.contains("Remote head changed"));
+        let create_existing = remote.advance_head(&first, None).await.unwrap_err();
+        assert!(create_existing.contains("Remote head changed"));
+    }
+
+    #[tokio::test]
+    async fn remote_reader_rejects_missing_malformed_and_misplaced_objects() {
+        let remote = test_remote();
+        let missing = remote
+            .read_commit("missing.json", true)
+            .await
+            .unwrap();
+        assert!(missing.is_none());
+        let missing_error = remote
+            .read_commit("missing.json", false)
+            .await
+            .unwrap_err();
+        assert!(missing_error.contains("is missing"));
+
+        let head_key = remote.head_key("sync-project");
+        remote
+            .store
+            .put(
+                &ObjectPath::from(head_key.clone()),
+                PutPayload::from_bytes(Bytes::from_static(b"not json")),
+            )
+            .await
+            .unwrap();
+        let malformed = remote.read_commit(&head_key, true).await.unwrap_err();
+        assert!(malformed.contains("Invalid sync commit"));
+
+        let mut wrong_package = remote_commit(&remote, 1, 'c', '3');
+        wrong_package.package_key = "wrong/object.cuemap".to_string();
+        wrong_package.commit_sha256 = calculate_commit_hash(&wrong_package).unwrap();
+        remote
+            .store
+            .put(
+                &ObjectPath::from(remote.head_key("sync-project")),
+                PutPayload::from_bytes(Bytes::from(serde_json::to_vec(&wrong_package).unwrap())),
+            )
+            .await
+            .unwrap();
+        let wrong_package_error = remote
+            .read_commit(&remote.head_key("sync-project"), true)
+            .await
+            .unwrap_err();
+        assert!(wrong_package_error.contains("unexpected package key"));
+
+        let valid = remote_commit(&remote, 1, 'd', '4');
+        let misplaced_key = "team/.cuemap-sync/v1/projects/sync-project/wrong.json";
+        remote
+            .store
+            .put(
+                &ObjectPath::from(misplaced_key),
+                PutPayload::from_bytes(Bytes::from(serde_json::to_vec(&valid).unwrap())),
+            )
+            .await
+            .unwrap();
+        let misplaced = remote.read_commit(misplaced_key, true).await.unwrap_err();
+        assert!(misplaced.contains("stored under the wrong key"));
+    }
+
+    #[tokio::test]
+    async fn remote_ancestry_checks_fast_forward_and_history_integrity() {
+        let remote = test_remote();
+        let first = remote_commit(&remote, 1, 'a', '1');
+        remote.put_commit(&first).await.unwrap();
+        let mut second = remote_commit(&remote, 2, 'b', '2');
+        second.parent_commit_sha256 = Some(first.commit_sha256.clone());
+        second.commit_sha256 = calculate_commit_hash(&second).unwrap();
+        remote.put_commit(&second).await.unwrap();
+        let mut third = remote_commit(&remote, 3, 'c', '3');
+        third.parent_commit_sha256 = Some(second.commit_sha256.clone());
+        third.commit_sha256 = calculate_commit_hash(&third).unwrap();
+        remote.put_commit(&third).await.unwrap();
+
+        assert!(remote.is_descendant(&third, &first.commit_sha256).await.unwrap());
+        assert!(remote.is_descendant(&third, &third.commit_sha256).await.unwrap());
+        assert!(!remote.is_descendant(&third, &hash('f')).await.unwrap());
+
+        let mut missing_parent = remote_commit(&remote, 2, 'e', '5');
+        missing_parent.parent_commit_sha256 = Some(hash('9'));
+        missing_parent.commit_sha256 = calculate_commit_hash(&missing_parent).unwrap();
+        let error = remote.is_descendant(&missing_parent, &hash('0')).await.unwrap_err();
+        assert!(error.contains("missing"));
+
+        let mut invalid_generation = remote_commit(&remote, 9, 'f', '6');
+        invalid_generation.parent_commit_sha256 = Some(first.commit_sha256.clone());
+        invalid_generation.commit_sha256 = calculate_commit_hash(&invalid_generation).unwrap();
+        remote.put_commit(&invalid_generation).await.unwrap();
+        let error = remote
+            .is_descendant(&invalid_generation, &hash('0'))
+            .await
+            .unwrap_err();
+        assert!(error.contains("invalid generation"));
+    }
+
+    #[test]
+    fn local_state_and_writer_id_are_persistent_and_validate_corruption() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let remote = test_remote();
+        let commit = remote_commit(&remote, 1, 'a', '1');
+        assert!(load_local_state(data_dir.path(), "sync-project").unwrap().is_none());
+        save_local_state(data_dir.path(), &remote, &commit).unwrap();
+        let loaded = load_local_state(data_dir.path(), "sync-project").unwrap().unwrap();
+        assert_eq!(loaded.commit_sha256, commit.commit_sha256);
+        let writer = writer_id(data_dir.path()).unwrap();
+        assert_eq!(writer, writer_id(data_dir.path()).unwrap());
+
+        fs::write(state_path(data_dir.path(), "sync-project"), b"{").unwrap();
+        assert!(load_local_state(data_dir.path(), "sync-project")
+            .unwrap_err()
+            .contains("Invalid sync state"));
+        fs::write(data_dir.path().join("sync/writer-id"), b"not-a-uuid").unwrap();
+        assert!(writer_id(data_dir.path()).unwrap_err().contains("Invalid sync writer ID"));
+    }
+
+    #[test]
+    fn commit_and_remote_uri_validation_rejects_unsafe_values() {
+        let original = commit(1, 'a', '1');
+        let invalids: &[fn(&mut SyncCommit)] = &[
+            |value: &mut SyncCommit| value.format = "wrong".to_string(),
+            |value: &mut SyncCommit| value.version = 99,
+            |value: &mut SyncCommit| value.project_id = "no spaces".to_string(),
+            |value: &mut SyncCommit| value.generation = 0,
+            |value: &mut SyncCommit| value.commit_sha256 = "bad".to_string(),
+            |value: &mut SyncCommit| value.package_sha256 = "bad".to_string(),
+            |value: &mut SyncCommit| value.state_sha256 = "bad".to_string(),
+            |value: &mut SyncCommit| value.parent_commit_sha256 = Some("bad".to_string()),
+            |value: &mut SyncCommit| value.package_key = "/absolute".to_string(),
+            |value: &mut SyncCommit| value.package_key = "../escape".to_string(),
+            |value: &mut SyncCommit| value.writer_id = "not-a-uuid".to_string(),
+        ];
+        for mutate in invalids {
+            let mut value = original.clone();
+            mutate(&mut value);
+            assert!(validate_commit(&value).is_err());
+        }
+        assert!(parse_remote_uri("https://bucket/path").is_err());
+        assert!(parse_remote_uri("s3://").is_err());
+        assert_eq!(valid_hash(&hash('a')), true);
+        assert!(!valid_hash("short"));
+        assert!(!valid_hash(&"g".repeat(64)));
+    }
+
+    #[tokio::test]
+    async fn injected_remote_exercises_missing_adopt_uptodate_and_diverged_decisions() {
+        let data_dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(data_dir.path().join("snapshots")).unwrap();
+        let empty_store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let missing = sync_project_with_remote(
+            data_dir.path(),
+            "sync-project",
+            remote_with_store(empty_store),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(missing.contains("does not exist locally"));
+
+        fs::write(
+            data_dir.path().join("snapshots/sync-project.bin"),
+            b"local state",
+        )
+        .unwrap();
+        let local_hash = project_package::project_state_sha256(data_dir.path(), "sync-project")
+            .unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let remote = remote_with_store(store.clone());
+        let mut first = remote_commit(&remote, 1, 'a', '1');
+        first.state_sha256 = local_hash.clone();
+        first.commit_sha256 = calculate_commit_hash(&first).unwrap();
+        remote.put_commit(&first).await.unwrap();
+        remote.advance_head(&first, None).await.unwrap();
+
+        let adopted = sync_project_with_remote(
+            data_dir.path(),
+            "sync-project",
+            remote_with_store(store.clone()),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(adopted, SyncRun::Complete(SyncResult { action: SyncAction::Adopted, .. })));
+        let up_to_date = sync_project_with_remote(
+            data_dir.path(),
+            "sync-project",
+            remote_with_store(store.clone()),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(up_to_date, SyncRun::Complete(SyncResult { action: SyncAction::UpToDate, .. })));
+
+        fs::write(
+            data_dir.path().join("snapshots/sync-project.bin"),
+            b"local divergent state",
+        )
+        .unwrap();
+        let head = remote.head("sync-project").await.unwrap().unwrap();
+        let mut second = remote_commit(&remote, 2, 'b', '2');
+        second.parent_commit_sha256 = Some(first.commit_sha256.clone());
+        second.commit_sha256 = calculate_commit_hash(&second).unwrap();
+        remote.put_commit(&second).await.unwrap();
+        remote.advance_head(&second, Some(&head)).await.unwrap();
+        let diverged = sync_project_with_remote(
+            data_dir.path(),
+            "sync-project",
+            remote_with_store(store.clone()),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(diverged.contains("diverged"));
+
+        save_local_state_for_uri(data_dir.path(), "s3://other/team", &first).unwrap();
+        let linked_elsewhere = sync_project_with_remote(
+            data_dir.path(),
+            "sync-project",
+            remote_with_store(store),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(linked_elsewhere.contains("already linked"));
+    }
+
+    #[test]
+    fn sync_helpers_cover_prefixes_results_cleanup_and_public_errors() {
+        let empty_prefix = S3SyncRemote {
+            canonical_uri: "s3://bucket".to_string(),
+            bucket: "bucket".to_string(),
+            prefix: String::new(),
+            store: Arc::new(object_store::memory::InMemory::new()),
+        };
+        assert_eq!(
+            empty_prefix.project_root("sync-project"),
+            ".cuemap-sync/v1/projects/sync-project"
+        );
+        assert_eq!(
+            empty_prefix.object_uri("objects/demo.cuemap"),
+            "s3://bucket/objects/demo.cuemap"
+        );
+        let commit = remote_commit(&empty_prefix, 1, 'a', '1');
+        let result = sync_result(SyncAction::Pushed, &empty_prefix, &commit);
+        assert_eq!(result.action, SyncAction::Pushed);
+        assert_eq!(result.remote, "s3://bucket");
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let package_path = data_dir.path().join("prepared.cuemap");
+        fs::write(&package_path, b"temporary").unwrap();
+        let prepared = PreparedSyncPull {
+            result: result.clone(),
+            package_path: package_path.clone(),
+            commit,
+            remote_uri: result.remote.clone(),
+            expected_local_state_sha256: None,
+        };
+        assert_eq!(prepared.result(), &result);
+        drop(prepared);
+        assert!(!package_path.exists());
+    }
+
+    #[tokio::test]
+    async fn sync_project_reports_validation_and_local_filesystem_errors_before_aws() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let invalid_id = sync_project(data_dir.path(), "bad project", "s3://bucket", false)
+            .await
+            .unwrap_err();
+        assert!(invalid_id.contains("Invalid project ID"));
+        let invalid_uri = sync_project(data_dir.path(), "sync-project", "https://bucket", false)
+            .await
+            .unwrap_err();
+        assert!(invalid_uri.contains("s3://"));
+
+        let file_path = data_dir.path().join("not-a-directory");
+        fs::write(&file_path, b"file").unwrap();
+        let filesystem_error = sync_project(&file_path, "sync-project", "s3://bucket", false)
+            .await
+            .unwrap_err();
+        assert!(filesystem_error.contains("Failed to create"));
+    }
+
+    #[test]
+    fn complete_prepared_pull_installs_package_and_records_sync_base() {
+        use crate::engine::CueMapEngine;
+        use crate::persistence::PersistenceManager;
+        use crate::structures::MainStats;
+
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        fs::create_dir_all(source.path().join("snapshots")).unwrap();
+        let engine = CueMapEngine::<MainStats>::new();
+        engine.add_memory(
+            "prepared memory".to_string(),
+            vec!["prepared".to_string()],
+            None,
+            MainStats::default(),
+            true,
+        );
+        PersistenceManager::save_to_path(
+            &engine,
+            &source.path().join("snapshots/sync-project.bin"),
+        )
+        .unwrap();
+        let package = source.path().join("prepared.cuemap");
+        project_package::pack_project(source.path(), "sync-project", &package, false).unwrap();
+        let package_sha = project_package::file_sha256(&package).unwrap();
+        let state_sha = project_package::project_state_sha256(source.path(), "sync-project").unwrap();
+        let remote = test_remote();
+        let mut commit = remote_commit(&remote, 1, 'a', '1');
+        commit.package_sha256 = package_sha;
+        commit.state_sha256 = state_sha;
+        commit.package_key = remote.package_key("sync-project", &commit.package_sha256);
+        commit.commit_sha256 = calculate_commit_hash(&commit).unwrap();
+        let staged = target.path().join("staged.cuemap");
+        fs::copy(&package, &staged).unwrap();
+        let prepared = PreparedSyncPull {
+            result: sync_result(SyncAction::Pulled, &remote, &commit),
+            package_path: staged,
+            commit,
+            remote_uri: remote.canonical_uri,
+            expected_local_state_sha256: None,
+        };
+        complete_prepared_pull(target.path(), &prepared, false).unwrap();
+        assert!(target.path().join("snapshots/sync-project.bin").is_file());
+        assert!(load_local_state(target.path(), "sync-project").is_ok());
     }
 }

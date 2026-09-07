@@ -28,7 +28,6 @@ fn collect_files(dir: &str) -> Vec<PathBuf> {
     files
 }
 
-#[ignore]
 #[test]
 fn test_chunking_coverage_all_file_types() {
     let base_dir = "data/agent-test";
