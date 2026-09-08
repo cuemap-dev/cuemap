@@ -3992,3 +3992,90 @@
             .unwrap();
         assert_eq!(crawled.status(), StatusCode::OK);
     }
+
+    #[tokio::test]
+    async fn uploads_cannot_overwrite_or_delete_client_selected_paths() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let victim = sandbox.path().join("sentinel.txt");
+        std::fs::write(&victim, "original sentinel").unwrap();
+        let router = test_router();
+        let absolute = victim.to_string_lossy().to_string();
+        let traversal = format!("../{}/sentinel.txt", sandbox.path().file_name().unwrap().to_string_lossy());
+        let mut names = vec![absolute, traversal];
+        #[cfg(unix)] {
+            let link = sandbox.path().join("link.txt");
+            std::os::unix::fs::symlink(&victim, &link).unwrap();
+            names.push(link.to_string_lossy().to_string());
+        }
+        for filename in names {
+            let body = format!("--probe\r\nContent-Disposition: form-data; name=\"file\"; filename=\"normal.txt\"\r\n\r\nHarmless upload text.\r\n--probe\r\nContent-Disposition: form-data; name=\"filename\"\r\n\r\n{}\r\n--probe--\r\n", filename);
+            let upload = || router.clone().oneshot(Request::builder().method("POST").uri("/ingest/file")
+                .header("Content-Type", "multipart/form-data; boundary=probe")
+                .header("X-Project-ID", "upload-regression")
+                .body(Body::from(body.clone())).unwrap());
+            let (one, two) = tokio::join!(upload(), upload());
+            assert_eq!(one.unwrap().status(), StatusCode::OK);
+            assert_eq!(two.unwrap().status(), StatusCode::OK);
+            assert_eq!(std::fs::read_to_string(&victim).unwrap(), "original sentinel");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_blocks_all_mutating_route_families_before_extraction() {
+        let router = test_router_with_read_only(true);
+        for (method, path) in [
+            ("POST", "/memories"), ("POST", "/memories/batch"),
+            ("PATCH", "/memories/1/reinforce"), ("DELETE", "/memories/1"),
+            ("POST", "/projects"), ("DELETE", "/projects/demo"),
+            ("POST", "/projects/demo/watch-dir"), ("POST", "/projects/demo/artifacts"),
+            ("POST", "/projects/demo/save"),
+            ("POST", "/projects/demo/unload"), ("POST", "/projects/demo/pack"),
+            ("POST", "/projects/demo/push"), ("POST", "/projects/demo/sync"),
+            ("POST", "/projects/load"), ("POST", "/projects/pull"),
+            ("POST", "/aliases"), ("POST", "/aliases/merge"),
+            ("DELETE", "/lexicon/entry/1"), ("POST", "/lexicon/wire"),
+            ("POST", "/ingest/content"), ("POST", "/ingest/file"), ("POST", "/ingest/url"),
+            ("POST", "/backup/upload"), ("POST", "/backup/download"), ("DELETE", "/backup/demo"),
+        ] {
+            let response = router.clone().oneshot(Request::builder().method(method).uri(path)
+                .body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
+        }
+        let health = router.oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(health.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn browser_requests_are_rejected_even_without_json_preflight() {
+        let router = test_router();
+        for origin in ["https://attacker.example", "null", "http://localhost:3000"] {
+            let response = router.clone().oneshot(Request::builder().method("POST").uri("/memories")
+                .header("Origin", origin).header("Content-Type", "text/plain")
+                .body(Body::from("{}")).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        let response = router.oneshot(Request::builder().uri("/projects")
+            .header("Sec-Fetch-Site", "same-origin").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn oversized_uploads_are_rejected() {
+        let response = test_router().oneshot(Request::builder().method("POST").uri("/ingest/file")
+            .header("Content-Type", "multipart/form-data; boundary=probe")
+            .header("Content-Length", (64 * 1024 * 1024 + 1).to_string())
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn streaming_body_limits_reject_payloads_without_content_length() {
+        let payload = vec![b'x'; 1024 * 1024];
+        let stream = futures::stream::iter((0..65).map(move |_| {
+            Ok::<_, std::convert::Infallible>(bytes::Bytes::copy_from_slice(&payload))
+        }));
+        let response = test_router().oneshot(Request::builder().method("POST").uri("/ingest/content")
+            .header("Content-Type", "application/json")
+            .body(Body::from_stream(stream)).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }

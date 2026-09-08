@@ -3832,7 +3832,7 @@ pub fn routes(
         .route("/stats", get(get_stats))
         .route("/projects", get(list_projects).post(create_project))
         .route("/recall/grounded", post(recall_grounded))
-        .route("/projects/load", post(load_project_package_endpoint))
+
         .route("/projects/pull", post(pull_project_package_endpoint))
         .route("/projects/:id", delete(delete_project))
         .route("/projects/:id/pack", post(pack_project_endpoint))
@@ -3868,7 +3868,11 @@ pub fn routes(
         .route("/backup/download", post(backup_download))
         .route("/backup/list", get(backup_list))
         .route("/backup/:project_id", delete(backup_delete))
-        .layer(axum::extract::DefaultBodyLimit::disable())
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024 * 1024))
+        .route("/projects/load", post(load_project_package_endpoint)
+            .layer::<_, std::convert::Infallible>(axum::extract::DefaultBodyLimit::disable())
+            .layer(tower_http::limit::RequestBodyLimitLayer::new(1024 * 1024 * 1024)))
         .with_state(EngineState {
             mt_engine,
             read_only,
@@ -3883,12 +3887,30 @@ pub fn routes(
     // Add auth middleware if enabled
     if auth_config.is_enabled() {
         router = router.layer(middleware::from_fn_with_state(
-            auth_config,
+            auth_config.clone(),
             crate::auth::auth_middleware,
         ));
     }
 
-    router
+    let origins: Vec<axum::http::HeaderValue> = auth_config.allowed_origins.iter()
+        .filter_map(|origin| origin.parse().ok()).collect();
+    router.route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
+        .layer(tower_http::cors::CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods(tower_http::cors::Any)
+            .allow_headers(tower_http::cors::Any))
+        .layer(middleware::from_fn_with_state(auth_config, crate::auth::browser_origin_middleware))
+        .layer(middleware::from_fn(move |request: axum::extract::Request, next: middleware::Next| async move {
+            let path = request.uri().path();
+            let project_load = path.starts_with("/projects/") && path.ends_with("/load") && path.split('/').count() == 4;
+            let safe_post = project_load || matches!(path, "/recall" | "/recall/grounded" | "/recall/web"
+                | "/intent/classify" | "/debug/analyze-text" | "/ingest/directory/preview");
+            if read_only && !matches!(*request.method(), axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS)
+                && !(request.method() == axum::http::Method::POST && safe_post) {
+                return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "Read-only mode"}))).into_response();
+            }
+            next.run(request).await
+        }))
 }
 
 async fn root() -> impl IntoResponse {
@@ -4283,8 +4305,9 @@ async fn add_memories_batch(
 async fn recall(
     State(state): State<EngineState>,
     headers: HeaderMap,
-    Json(req): Json<RecallRequest>,
+    Json(mut req): Json<RecallRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    req.auto_reinforce = req.auto_reinforce && !state.read_only;
     use std::time::Instant;
     let start = Instant::now();
     let EngineState {
@@ -8136,17 +8159,23 @@ async fn ingest_file(
     let mut filename = String::new();
     let mut file_bytes: Vec<u8> = Vec::new();
 
-    while let Ok(Some(field)) = multipart.next_field().await {
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(error) => return (error.status(), Json(serde_json::json!({"error": error.to_string()}))),
+        };
         let name = field.name().unwrap_or("").to_string();
-
         if name == "file" {
             filename = field.file_name().unwrap_or("upload.bin").to_string();
-            if let Ok(bytes) = field.bytes().await {
-                file_bytes = bytes.to_vec();
+            match field.bytes().await {
+                Ok(bytes) => file_bytes = bytes.to_vec(),
+                Err(error) => return (error.status(), Json(serde_json::json!({"error": error.to_string()}))),
             }
         } else if name == "filename" {
-            if let Ok(text) = field.text().await {
-                filename = text;
+            match field.text().await {
+                Ok(text) => filename = text,
+                Err(error) => return (error.status(), Json(serde_json::json!({"error": error.to_string()}))),
             }
         }
     }
@@ -8160,37 +8189,23 @@ async fn ingest_file(
         );
     }
 
-    // Write to temp file
-    let temp_dir = std::env::temp_dir();
-    let temp_path = temp_dir.join(&filename);
-
-    let mut temp_file = match std::fs::File::create(&temp_path) {
-        Ok(f) => f,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": format!("Failed to create temp file: {}", e)
-                })),
-            )
-        }
+    // Only the extension influences parsing; client filenames never become filesystem paths.
+    let extension = filename.rsplit(['/', '\\']).next().unwrap_or("upload.bin")
+        .rsplit_once('.').map(|(_, ext)| ext)
+        .filter(|ext| ext.len() <= 16 && ext.chars().all(|c| c.is_ascii_alphanumeric()))
+        .unwrap_or("bin");
+    let mut temp_file = match tempfile::Builder::new().prefix("cuemap-upload-")
+        .suffix(&format!(".{}", extension)).tempfile() {
+        Ok(file) => file,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to create upload file: {}", e)}))),
     };
-
     if let Err(e) = temp_file.write_all(&file_bytes) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("Failed to write temp file: {}", e)
-            })),
-        );
+        return (StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to write upload file: {}", e)})));
     }
+    let chunks = Chunker::chunk_binary_file(temp_file.path());
     drop(temp_file);
-
-    // Chunk the file
-    let chunks = Chunker::chunk_binary_file(&temp_path);
-
-    // Clean up temp file
-    let _ = std::fs::remove_file(&temp_path);
 
     if chunks.is_empty() {
         return (

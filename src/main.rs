@@ -10,7 +10,6 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tower_http::cors::CorsLayer;
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::{self, fmt, prelude::*, Registry};
 
@@ -537,6 +536,40 @@ mod tests {
         assert!(live_ready, "live server did not bind its configured port");
         live_task.abort();
         let _ = live_task.await;
+    }
+
+    #[tokio::test]
+    async fn configured_read_only_ipv6_server_enforces_auth_and_keeps_health_public() {
+        let root = tempfile::tempdir().unwrap();
+        let port = std::net::TcpListener::bind(("::1", 0)).unwrap().local_addr().unwrap().port();
+        let mut config = config::ServerConfig::default();
+        config.server.host = "::1".into();
+        config.server.port = port;
+        config.server.read_only = true;
+        config.server.data_dir = root.path().join("data").to_string_lossy().into();
+        config.security.api_keys = vec!["test-key".into()];
+        config.security.allowed_origins = vec!["https://trusted.example".into()];
+        config.semantic.encoder_enabled = false;
+        config.semantic.enabled = false;
+        let task = tokio::spawn(run_server_with_pid_path(config, None, true, root.path().join("pid")));
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let url = format!("http://[::1]:{port}");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while client.get(format!("{url}/healthz")).send().await.is_err() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.unwrap();
+        assert_eq!(client.get(format!("{url}/healthz")).send().await.unwrap().status(), 204);
+        assert_eq!(client.get(format!("{url}/")).send().await.unwrap().status(), 401);
+        let trusted = client.get(format!("{url}/")).header("X-API-Key", "test-key")
+            .header("Origin", "https://trusted.example").send().await.unwrap();
+        assert_eq!(trusted.status(), 200);
+        assert_eq!(trusted.headers()["access-control-allow-origin"], "https://trusted.example");
+        assert_eq!(client.post(format!("{url}/memories")).header("X-API-Key", "test-key")
+            .json(&serde_json::json!({"content": "must not persist"})).send().await.unwrap().status(), 403);
+        assert!(!root.path().join("data/snapshots").exists());
+        task.abort();
+        let _ = task.await;
     }
 
     #[tokio::test]
@@ -2048,11 +2081,24 @@ async fn run_server(config: config::ServerConfig, load_static: Option<String>, _
 }
 
 async fn run_server_with_pid_path(
-    config: config::ServerConfig,
+    mut config: config::ServerConfig,
     load_static: Option<String>,
     _is_child: bool,
     pid_path: PathBuf,
 ) {
+    let read_only = load_static.is_some() || config.server.read_only;
+    if read_only {
+        config.server.read_only = true;
+        config.persistence.enabled = false;
+        config.jobs.background_processing = false;
+    }
+    let ip = match config.server.host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip,
+        Err(error) => {
+            eprintln!("Invalid server.host {:?}: {}", config.server.host, error);
+            return;
+        }
+    };
     // Extract commonly used configs
     let server_config = &config.server;
     let auth_config_struct = &config.security;
@@ -2145,7 +2191,7 @@ async fn run_server_with_pid_path(
     }
 
     // Setup shutdown handler
-    if !is_static {
+    if !read_only {
         if config.persistence.enabled {
             setup_multi_tenant_shutdown_handler(mt_engine.clone()).await;
             mt_engine.start_periodic_snapshots(Duration::from_secs(
@@ -2195,7 +2241,7 @@ async fn run_server_with_pid_path(
     // Auto-start agents for projects with watch directories configured
     for proj_stats in mt_engine.list_projects() {
         if let Ok(meta) = mt_engine.load_project_meta(&proj_stats.project_id) {
-            if meta.agent_enabled {
+            if !read_only && meta.agent_enabled {
                 if let Some(watch_dir) = meta.watch_dir {
                     let agent_config = agent::AgentConfig {
                         project_id: meta.project_id.clone(),
@@ -2246,15 +2292,14 @@ async fn run_server_with_pid_path(
             job_queue,
             metrics,
             auth_config,
-            is_static,
+            read_only,
             server_config.data_dir.clone(),
             cloud_backup,
             context_signer,
             agent_manager.clone(),
-        ))
-        .layer(CorsLayer::permissive());
+        ));
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], server_config.port));
+    let addr = SocketAddr::new(ip, server_config.port);
     info!("Server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();

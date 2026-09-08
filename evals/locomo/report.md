@@ -1,6 +1,6 @@
 # LoCoMo: Long Conversation Recall With Low Context
 
-`CueMap v0.7.2` `conversation memory` `context expansion`
+`CueMap v0.7.3` `conversation memory` `context expansion`
 
 LoCoMo stresses long conversations where the answer evidence is often near the recalled turn rather than exactly inside it. CueMap handles this best with engine-level expansion depth, which is a real product feature: return the matching memory plus adjacent conversation turns so an answer model receives the local neighborhood.
 
@@ -14,7 +14,7 @@ LoCoMo stresses long conversations where the answer evidence is often near the r
 The strong setting reaches 96.1% Hit@20 while still using far less context than many leaderboard-style RAG reports. As a reference point, public Agent Memory Benchmark views show some LoCoMo systems in the 14.7K to 36.2K context-token range. CueMap's lean run averages 3.2K tokens, and the stronger run averages 10.0K.
 
 Both reported runs use the wrapper's default **hybrid recall mode**
-(`SEMANTIC_MODE=hybrid`), combining lexical and semantic retrieval signals.
+(`SEMANTIC_MODE=hybrid`), combining lexical and semantic ranking signals.
 
 ## Strong Setting Metrics
 
@@ -100,7 +100,7 @@ Strong LoCoMo run:
 ```bash
 EXPANSION_DEPTH=10 \
 LIMIT=20 \
-bash evals/locomo/run_locomo.sh
+DATASET=/path/to/locomo10.json bash evals/locomo/run_locomo.sh
 ```
 
 Lean context run:
@@ -108,7 +108,7 @@ Lean context run:
 ```bash
 EXPANSION_DEPTH=3 \
 LIMIT=20 \
-bash evals/locomo/run_locomo.sh
+DATASET=/path/to/locomo10.json bash evals/locomo/run_locomo.sh
 ```
 
 Useful knobs:
@@ -120,4 +120,4 @@ Useful knobs:
 | `SEMANTIC_MODE` | `hybrid` | Retrieval mode: `lexical`, `semantic`, or `hybrid`. |
 | `DELETE_PROJECTS` | `1` | Delete temporary eval projects after each record. |
 
-The wrapper writes fresh output under `evals/locomo/results/` by default. The metrics above came from the full 1,986-question v0.7.2 rerun on 2026-08-15.
+The wrapper writes fresh output under `evals/locomo/results/` by default. The metrics above cover the full 1,986-question run on 2026-08-15.

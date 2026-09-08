@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM rust:1.93-slim-trixie AS builder
+FROM rust:1.93-slim-bookworm AS builder
 
 WORKDIR /build
 
@@ -23,7 +23,7 @@ FROM scratch AS native-binary
 
 COPY --from=builder /build/cuemap /cuemap
 
-FROM debian:trixie-slim AS tokenizer
+FROM debian:bookworm-slim AS tokenizer
 
 ARG TOKENIZER_URL="https://cuemap.dev/assets/en_tokenizer.bin.gz"
 ARG TOKENIZER_SHA256="f54fd31ec463f8646d0239bb531a64e0210ed1ae02bf5e3b42aeeb9bff8305ba"
@@ -36,7 +36,7 @@ RUN apt-get update \
     && gzip -dc /tmp/en_tokenizer.bin.gz > /en_tokenizer.bin \
     && rm /tmp/en_tokenizer.bin.gz
 
-FROM debian:trixie-slim AS runtime
+FROM debian:bookworm-slim AS runtime
 
 ARG VERSION=0.7.3
 ARG REVISION=""
@@ -57,12 +57,15 @@ RUN apt-get update \
         --home-dir /home/cuemap --shell /usr/sbin/nologin cuemap \
     && install -d -o cuemap -g cuemap /app/data /app/data/snapshots /app/assets
 
+COPY LICENSE NOTICE THIRD_PARTY_NOTICES.txt LGPL-2.1.txt ONNXRUNTIME-LICENSE.txt ONNXRUNTIME-NOTICES.txt /app/licenses/
+
 COPY --from=builder --chown=cuemap:cuemap /build/cuemap /app/cuemap
 COPY --from=tokenizer --chown=cuemap:cuemap /en_tokenizer.bin /app/assets/en_tokenizer.bin
 
 ENV HOME=/home/cuemap \
     RUST_LOG=info \
     CUEMAP_PORT=8735 \
+    CUEMAP_HOST=0.0.0.0 \
     CUEMAP_DATA_DIR=/app/data \
     CUEMAP_SNAPSHOT_INTERVAL_SECONDS=60 \
     TOKENIZER_PATH=/app/assets/en_tokenizer.bin
@@ -71,7 +74,7 @@ EXPOSE 8735
 STOPSIGNAL SIGTERM
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -fsS "http://127.0.0.1:${CUEMAP_PORT:-8735}/" || exit 1
+    CMD curl -fsS "http://127.0.0.1:${CUEMAP_PORT:-8735}/healthz" || exit 1
 
 USER cuemap
 

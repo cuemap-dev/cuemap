@@ -2,9 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CUEMAP_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 CUEMAP_ENGINE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-CUEMAP_EVALS_DIR="${CUEMAP_EVALS_DIR:-$CUEMAP_ROOT/evals}"
+CUEMAP_EVALS_DIR="${CUEMAP_EVALS_DIR:-$CUEMAP_ENGINE_ROOT/evals/harnesses}"
 HARNESS="$CUEMAP_EVALS_DIR/test_beam_settled.py"
 
 # Pin every subprocess in this evaluation to the release engine.  The
@@ -30,7 +29,7 @@ if [[ ! -f "$HARNESS" ]]; then
 fi
 
 CONTEXT="${CONTEXT:-128k}"
-CUEMAP_URL="${CUEMAP_URL:-http://127.0.0.1:8080}"
+CUEMAP_URL="${CUEMAP_URL:-http://127.0.0.1:8735}"
 LIMIT="${LIMIT:-100}"
 MODE="${MODE:-raw}"
 SEMANTIC_MODE="${SEMANTIC_MODE:-hybrid}"
@@ -72,7 +71,7 @@ if [[ "$TRACE_TIMING" == "1" ]]; then
 fi
 
 args=(
-  python "$HARNESS"
+  "${PYTHON:-python3}" "$HARNESS"
   --context "$CONTEXT"
   --url "$CUEMAP_URL"
   --limit "$LIMIT"
@@ -162,7 +161,7 @@ else
 fi
 
 if [[ "$TRACE_TIMING" == "1" && -s "$TIMING_FILE" ]]; then
-  python "$SCRIPT_DIR/report_timing.py" --input "$TIMING_FILE"
+  "${PYTHON:-python3}" "$CUEMAP_EVALS_DIR/report_timing.py" --input "$TIMING_FILE"
   echo "Timing samples: $TIMING_FILE"
 fi
 

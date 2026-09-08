@@ -29,6 +29,7 @@ name = "cuemap"
 path = "src/main.rs"
 
 [dependencies]
+tempfile = "3.8"
 axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1", features = ["full", "signal"] }
 tokio-util = { version = "0.7", features = ["io"] }
@@ -39,7 +40,7 @@ dashmap = "5.5"
 uuid = { version = "1.6", features = ["v4", "serde", "v5"] }
 rayon = "1.8"
 tower = "0.4"
-tower-http = { version = "0.5", features = ["cors"] }
+tower-http = { version = "0.5", features = ["cors", "limit"] }
 rand = "0.8"
 chrono = "0.4"
 indexmap = { version = "2.1", features = ["serde"] }
@@ -120,7 +121,6 @@ semantic-encoder = ["dep:ort", "dep:tokenizers"]
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["full", "test-util"] }
-tempfile = "3.8"
 tower = { version = "0.4", features = ["util"] }
 
 [profile.release]

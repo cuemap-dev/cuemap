@@ -2,28 +2,34 @@ name: Build and Publish Optional NPM Binaries
 
 on:
   push:
-    branches: [main]
-  workflow_dispatch: # Allow manual triggering
+    tags: ["v*"]
+  workflow_dispatch:
 
 jobs:
-  build-and-publish:
-    name: Build & Publish (${{ matrix.os }} - ${{ matrix.arch }})
+  coverage:
+    uses: ./.github/workflows/coverage.yml
+    secrets: inherit
+
+  build:
+    name: Build and verify (${{ matrix.os }} - ${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
     permissions:
       contents: read
-      id-token: write
     
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
+            container: rust:1.93-slim-bookworm
             target: x86_64-unknown-linux-gnu
             arch: x64
             npm_os: linux
             npm_arch: x64
             pkg_name: engine-linux-x64
           - os: ubuntu-24.04-arm
+            container: rust:1.93-slim-bookworm
             target: aarch64-unknown-linux-gnu
             arch: arm64
             npm_os: linux
@@ -49,6 +55,10 @@ jobs:
             pkg_name: engine-win32-x64
 
     steps:
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: apt-get update && apt-get install -y build-essential pkg-config libssl-dev ca-certificates curl git gzip
+
       - name: Checkout Repository
         uses: actions/checkout@v4
 
@@ -58,13 +68,23 @@ jobs:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Update npm
-        run: npm install -g npm@latest
+      - name: Validate release tag
+        shell: bash
+        run: |
+          version="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
+          test "${GITHUB_REF_TYPE}" = "tag"
+          test "${GITHUB_REF_NAME}" = "v${version}"
 
       - name: Setup Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.93.0
         with:
           targets: ${{ matrix.target }}
+
+      - name: Test publication guards
+        run: node --test scripts/publish-native-artifacts.test.cjs
+
+      - name: Test Rust Engine
+        run: cargo test --locked --all-targets -- --test-threads=1
 
       - name: Build Rust Engine
         run: cargo build --locked --release --target ${{ matrix.target }}
@@ -87,6 +107,11 @@ jobs:
           cp scripts/npm-native-README.md "$package_dir/README.md"
           cp LICENSE "$package_dir/LICENSE"
           cp NOTICE "$package_dir/NOTICE"
+          cp THIRD_PARTY_NOTICES.txt "$package_dir/THIRD_PARTY_NOTICES.txt"
+          cp LGPL-2.1.txt "$package_dir/LGPL-2.1.txt"
+          cp ONNXRUNTIME-LICENSE.txt "$package_dir/ONNXRUNTIME-LICENSE.txt"
+          cp ONNXRUNTIME-NOTICES.txt "$package_dir/ONNXRUNTIME-NOTICES.txt"
+
           if [[ "${{ matrix.npm_os }}" != "win32" ]]; then
             chmod +x "$package_dir/bin/cuemap" "$package_dir/bin/$packaged_binary"
           fi
@@ -116,7 +141,7 @@ jobs:
               os: [os],
               cpu: [cpu],
               bin: { cuemap: "bin/cuemap" },
-              files: ["bin", "assets", "README.md", "LICENSE", "NOTICE"],
+              files: ["bin", "assets", "README.md", "LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.txt", "LGPL-2.1.txt", "ONNXRUNTIME-LICENSE.txt", "ONNXRUNTIME-NOTICES.txt"],
               repository: { type: "git", url: "https://github.com/cuemap-dev/cuemap.git" },
               author: "Kaan Demirel",
               license: "Apache-2.0",
@@ -139,13 +164,116 @@ jobs:
           test -s assets/en_tokenizer.bin
           npm pack --dry-run
 
-      - name: Publish to NPM
+      - name: Exercise packaged engine
+        run: node scripts/native-package-smoke.cjs npm-packages/${{ matrix.pkg_name }}
+
+      - name: Pack verified artifact
         working-directory: npm-packages/${{ matrix.pkg_name }}
+        run: npm pack
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.pkg_name }}
+          path: npm-packages/${{ matrix.pkg_name }}/*.tgz
+          if-no-files-found: error
+
+  consumer-preflight:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            package: engine-linux-x64
+          - os: ubuntu-24.04-arm
+            package: engine-linux-arm64
+          - os: macos-15-intel
+            package: engine-darwin-x64
+          - os: macos-latest
+            package: engine-darwin-arm64
+          - os: windows-latest
+            package: engine-win32-x64
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: rust_engine
+      - uses: actions/checkout@v4
+        with:
+          repository: cuemap-dev/typescript-sdk
+          ref: ${{ github.ref_name }}
+          path: typescript-sdk
+      - uses: actions/checkout@v4
+        with:
+          repository: cuemap-dev/python-sdk
+          ref: ${{ github.ref_name }}
+          path: python-sdk
+      - uses: actions/checkout@v4
+        with:
+          repository: cuemap-dev/cuemap-mcp
+          ref: ${{ github.ref_name }}
+          path: mcp-server
+      - uses: actions/checkout@v4
+        with:
+          repository: cuemap-dev/agent-plugin
+          ref: ${{ github.ref_name }}
+          path: agent-plugin
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: npm ci
+        working-directory: typescript-sdk
+      - run: npm run build
+        working-directory: typescript-sdk
+      - run: npm install --ignore-scripts --omit=optional --no-save --package-lock=false ../typescript-sdk
+        working-directory: mcp-server
+      - run: python -m pip install -e './python-sdk[dev]' wheel
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.package }}
+          path: release-artifact
+      - name: Select tested native artifact
+        shell: bash
         run: |
-          package_name="$(node -p 'require("./package.json").name')"
-          package_version="$(node -p 'require("./package.json").version')"
-          if npm view "${package_name}@${package_version}" version --registry=https://registry.npmjs.org >/dev/null 2>&1; then
-            echo "${package_name}@${package_version} already exists; skipping publish"
-          else
-            npm publish --access public --provenance --verbose
-          fi
+          artifact="$(find "$GITHUB_WORKSPACE/release-artifact" -name '*.tgz' -print -quit)"
+          test -n "$artifact"
+          echo "CUEMAP_RELEASE_ENGINE_TARBALL=$artifact" >> "$GITHUB_ENV"
+      - run: node rust_engine/scripts/release-preflight.cjs
+
+  docker-runtime:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t cuemap-release-check .
+      - name: Check authenticated container
+        shell: bash
+        run: |
+          version="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
+          python3 scripts/verify-docker-runtime.py --image cuemap-release-check --version "$version"
+
+  publish:
+    needs: [build, coverage, consumer-preflight, docker-runtime]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: engine-*
+          path: packages
+          merge-multiple: true
+      - name: Publish exactly the tested tarballs
+        run: node scripts/publish-native-artifacts.cjs packages

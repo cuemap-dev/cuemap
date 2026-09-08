@@ -50,7 +50,7 @@ function pythonCommand(tempDir) {
     throw new Error("No usable Python interpreter found. Install Python 3.8+ or set PYTHON to a configured interpreter.");
   }
 
-  const buildProbe = spawnSync(usablePython, ["-c", "import build; import setuptools.build_meta"], {
+  const buildProbe = spawnSync(usablePython, ["-c", "import build; import setuptools.build_meta; import wheel; import pytest; import pytest_asyncio"], {
     cwd: probeDirectory,
     stdio: "ignore",
   });
@@ -69,8 +69,11 @@ function pythonCommand(tempDir) {
     "--disable-pip-version-check",
     "build>=1.0.0",
     "setuptools>=61.0",
+    "wheel",
+    "pytest",
+    "pytest-asyncio",
   ], { cwd: ENGINE_ROOT });
-  const environmentProbe = spawnSync(environmentPython, ["-c", "import build; import setuptools.build_meta"], {
+  const environmentProbe = spawnSync(environmentPython, ["-c", "import build; import setuptools.build_meta; import wheel; import pytest; import pytest_asyncio"], {
     cwd: probeDirectory,
     stdio: "ignore",
   });
@@ -79,6 +82,7 @@ function pythonCommand(tempDir) {
 }
 
 function run(command, args, options = {}) {
+  [command, args] = require("./node-command.cjs").commandFor(command, args);
   const result = spawnSync(command, args, {
     cwd: options.cwd,
     env: options.env,
@@ -200,6 +204,11 @@ async function createLocalEnginePackage(tempDir, version) {
   fs.copyFileSync(path.join(ENGINE_ROOT, "scripts", "npm-native-README.md"), path.join(packageRoot, "README.md"));
   fs.copyFileSync(path.join(ENGINE_ROOT, "LICENSE"), path.join(packageRoot, "LICENSE"));
   fs.copyFileSync(path.join(ENGINE_ROOT, "NOTICE"), path.join(packageRoot, "NOTICE"));
+  fs.copyFileSync(path.join(ENGINE_ROOT, "THIRD_PARTY_NOTICES.txt"), path.join(packageRoot, "THIRD_PARTY_NOTICES.txt"));
+  fs.copyFileSync(path.join(ENGINE_ROOT, "LGPL-2.1.txt"), path.join(packageRoot, "LGPL-2.1.txt"));
+  fs.copyFileSync(path.join(ENGINE_ROOT, "ONNXRUNTIME-LICENSE.txt"), path.join(packageRoot, "ONNXRUNTIME-LICENSE.txt"));
+  fs.copyFileSync(path.join(ENGINE_ROOT, "ONNXRUNTIME-NOTICES.txt"), path.join(packageRoot, "ONNXRUNTIME-NOTICES.txt"));
+
 
   fs.writeFileSync(path.join(packageRoot, "package.json"), `${JSON.stringify({
     name: `@cuemap-dev/engine-${packageLabel}`,
@@ -209,7 +218,7 @@ async function createLocalEnginePackage(tempDir, version) {
     os: [process.platform],
     cpu: [process.arch],
     bin: { cuemap: "bin/cuemap" },
-    files: ["bin", "assets", "README.md", "LICENSE", "NOTICE"],
+    files: ["bin", "assets", "README.md", "LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.txt", "LGPL-2.1.txt", "ONNXRUNTIME-LICENSE.txt", "ONNXRUNTIME-NOTICES.txt"],
     repository: { type: "git", url: "https://github.com/cuemap-dev/cuemap.git" },
     author: "Kaan Demirel",
     license: "Apache-2.0",
@@ -220,6 +229,7 @@ async function createLocalEnginePackage(tempDir, version) {
     fs.chmodSync(path.join(packageRoot, "bin", "cuemap"), 0o755);
     fs.chmodSync(path.join(packageRoot, "bin", nativeName), 0o755);
   }
+  run(process.execPath, [path.join(ENGINE_ROOT, "scripts", "native-package-smoke.cjs"), packageRoot]);
   return packDirectory(packageRoot, tempDir);
 }
 
@@ -237,16 +247,41 @@ async function main() {
 
   try {
     console.log(`Running CueMap ${expectedVersion} local release preflight`);
-    console.log("1/6 Building and testing the Rust engine");
-    run("cargo", ["build", "--locked", "--release"], { cwd: ENGINE_ROOT });
-    run("cargo", ["test", "--locked"], { cwd: ENGINE_ROOT });
+    const suppliedTarball = process.env.CUEMAP_RELEASE_ENGINE_TARBALL;
+    let suppliedPackageRoot;
+    if (suppliedTarball) {
+      console.log("1/6 Verifying the supplied native release artifact");
+      const extracted = path.join(runtimeTempDir, "native-artifact");
+      fs.mkdirSync(extracted);
+      run("tar", ["-xzf", suppliedTarball, "-C", extracted]);
+      suppliedPackageRoot = path.join(extracted, "package");
+      const manifest = readJson(path.join(suppliedPackageRoot, "package.json"));
+      assert.equal(manifest.version, expectedVersion);
+      assert.equal(manifest.name, `@cuemap-dev/engine-${process.platform}-${process.arch}`);
+      run(process.execPath, [path.join(ENGINE_ROOT, "scripts", "native-package-smoke.cjs"), suppliedPackageRoot]);
+    } else {
+      console.log("1/6 Building and testing the Rust engine");
+      run("cargo", ["build", "--locked", "--release"], { cwd: ENGINE_ROOT });
+      run("cargo", ["test", "--locked"], { cwd: ENGINE_ROOT });
+    }
+
+    process.env.CUEMAP_E2E = "1";
+    process.env.CUEMAP_BIN = suppliedPackageRoot
+      ? path.join(suppliedPackageRoot, "bin", process.platform === "win32" ? "cuemap-native.exe" : "cuemap-native")
+      : path.join(ENGINE_ROOT, "target", "release", process.platform === "win32" ? "cuemap.exe" : "cuemap");
+    process.env.CUEMAP_E2E_BIN = process.env.CUEMAP_BIN;
+    process.env.CUEMAP_HOME = path.join(runtimeTempDir, "engine-config");
+    process.env.TOKENIZER_PATH = suppliedPackageRoot
+      ? path.join(suppliedPackageRoot, "assets", "en_tokenizer.bin")
+      : await findTokenizer(runtimeTempDir);
 
     console.log("2/6 Building and testing the TypeScript SDK and MCP server");
     run(npmCommand(), ["test"], { cwd: REPOSITORIES.typescript });
     run(npmCommand(), ["test"], { cwd: REPOSITORIES.mcp });
 
     console.log("3/6 Verifying the Python SDK package");
-    run(pythonCommand(runtimeTempDir), ["scripts/verify_package.py"], { cwd: REPOSITORIES.python });
+    const python = pythonCommand(runtimeTempDir);
+    run(python, ["scripts/verify_package.py"], { cwd: REPOSITORIES.python });
 
     console.log("4/6 Verifying the Agent Plugin package");
     run(process.execPath, ["scripts/verify.cjs"], { cwd: REPOSITORIES.agent });
@@ -254,7 +289,7 @@ async function main() {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "cuemap-release-preflight-"));
     try {
       console.log("5/6 Packing local consumer artifacts");
-      const engineTarball = await createLocalEnginePackage(tempDir, expectedVersion);
+      const engineTarball = suppliedTarball || await createLocalEnginePackage(tempDir, expectedVersion);
       const sdkTarball = packDirectory(REPOSITORIES.typescript, tempDir);
       const mcpTarball = packDirectory(REPOSITORIES.mcp, tempDir);
 

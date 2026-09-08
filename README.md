@@ -16,7 +16,7 @@
 
 ## Overview
 
-CueMap implements a **Continuous Gradient Algorithm** optimized for associative data structures:
+CueMap uses **temporal-associative retrieval**: lexical and structural candidate generation, with optional semantic reranking. Its main components are:
 
 1.  **Intersection (Context Filter)**: Triangulates relevant memories by overlapping cues
 2.  **Structural Extraction**: Emits deterministic cues for observable evidence such as dates, numbers, lists, source metadata, and surface entities.
@@ -24,7 +24,7 @@ CueMap implements a **Continuous Gradient Algorithm** optimized for associative 
 4.  **Reinforcement (Access-based Learning)**: Frequently accessed memories gain signal strength, remaining highly accessible even as they age.
 5.  **Sparse Recall**: Uses normalized lexical cues, structural facets, recency, salience, and bounded deterministic reranking.
 
-As of v0.7.2+, CueMap's default core path is deterministic and ontology-free. GloVe/Ollama cue generation, WordNet/POS expansion, semantic bridges, pattern completion, external lexicon graphs, context expansion/speculation endpoints, and autonomous consolidation have been removed from the default engine path. v0.7.2+ bundles a qint8 `all-MiniLM-L3-v2` vector layer for semantic reranking, intent classification, and query embeddings; the `edge` profile selects a q4 build of the same model. The encoder can still be disabled for constrained builds or deployments.
+As of v0.7.2+, CueMap's default core path is deterministic and ontology-free. GloVe/Ollama cue generation, WordNet/POS expansion, semantic bridges, pattern completion, external lexicon graphs, context expansion/speculation endpoints, and autonomous consolidation have been removed from the default engine path. v0.7.2+ bundles a qint8 `paraphrase-MiniLM-L3-v2` vector layer for semantic reranking, intent classification, and query embeddings; the `edge` profile selects a q4 build of the same model. The encoder can still be disabled for constrained builds or deployments.
 
 v0.7.2+ also uses numeric per-project memory IDs everywhere. If callers need deterministic upsert/dedupe identity, pass `source_key`; memory IDs remain compact runtime addresses.
 
@@ -51,10 +51,36 @@ CueMap treats the nlprule tokenizer as a runtime asset, not a build artifact. Se
 
 ```bash
 docker build -t cuemap/engine:0.7.3 .
-docker run -p 8735:8735 -v "$(pwd)/local_snapshot_dir:/app/data" cuemap/engine:0.7.3
+docker run -p 127.0.0.1:8735:8735 -v "$(pwd)/local_snapshot_dir:/app/data" cuemap/engine:0.7.3
 ```
 
-The container runs as the unprivileged `cuemap` user. Ensure a bind-mounted data directory is writable by UID/GID `10001`, or use a Docker-managed volume. Runtime defaults can be overridden with `CUEMAP_PORT`, `CUEMAP_DATA_DIR`, `CUEMAP_SNAPSHOT_INTERVAL_SECONDS`, `CUEMAP_PROJECT_INACTIVITY_TIMEOUT_SECONDS`, `CUEMAP_PROJECT_UNLOAD_CHECK_INTERVAL_SECONDS`, `TOKENIZER_PATH`, and `RUST_LOG`.
+The container runs as the unprivileged `cuemap` user. Ensure a bind-mounted data directory is writable by UID/GID `10001`, or use a Docker-managed volume. Runtime defaults can be overridden with `CUEMAP_HOST`, `CUEMAP_PORT`, `CUEMAP_DATA_DIR`, `CUEMAP_SNAPSHOT_INTERVAL_SECONDS`, `CUEMAP_PROJECT_INACTIVITY_TIMEOUT_SECONDS`, `CUEMAP_PROJECT_UNLOAD_CHECK_INTERVAL_SECONDS`, `TOKENIZER_PATH`, and `RUST_LOG`.
+
+### Network access and read-only operation
+
+The native server binds to `127.0.0.1:8735` by default. Set `server.host` or
+`CUEMAP_HOST` to a numeric IPv4 or IPv6 address to change the bind address.
+The Docker image binds to `0.0.0.0` inside the container; the examples publish
+its port only on the host loopback interface.
+
+Browser origins are denied by default, including simple cross-origin requests.
+To allow a browser application, list its exact origin in configuration:
+
+```toml
+[security]
+allowed_origins = ["http://localhost:3000"]
+```
+
+API-key authentication still applies to allowed browser clients.
+
+`server.read_only = true` and static loading disable write routes, recall
+reinforcement, automatic ingestion, and snapshot writes. Existing snapshots can
+still be loaded for queries. Ordinary requests and multipart uploads have a
+64 MiB body limit; project-package uploads to `/projects/load` have a 1 GiB limit.
+These limits apply to the request body, not the expanded contents of archives.
+
+Set `CUEMAP_HOME` to isolate the engine's configuration and PID files. It defaults
+to `~/.cuemap`; `CUEMAP_DATA_DIR` separately controls the data directory.
 
 ### Native npm packages
 
@@ -65,7 +91,7 @@ Build the Darwin ARM64, Darwin x64, Linux x64, and Linux ARM64 native packages l
 ./scripts/verify-npm-native-packages.sh
 ```
 
-The local packager builds Linux on Debian Trixie, bundles the checksum-pinned tokenizer, and writes package tarballs plus `SHA256SUMS` under `dist/npm-native/tarballs`. The Windows x64 package is built and published by the GitHub Actions release workflow.
+The local packager builds Linux on Debian Bookworm, bundles the checksum-pinned tokenizer, and writes package tarballs plus `SHA256SUMS` under `dist/npm-native/tarballs`. The Windows x64 package is built and published by the GitHub Actions release workflow.
 
 ### Release validation
 
@@ -343,7 +369,7 @@ Clients send the configured key in the `X-API-Key` header. See the [HTTP API ref
 ### Docker with Authentication
 
 ```bash
-docker run -p 8735:8735 -v "$(pwd)/local_snapshot_dir:/app/data" \
+docker run -p 127.0.0.1:8735:8735 -v "$(pwd)/local_snapshot_dir:/app/data" \
   -e CUEMAP_API_KEY=your-secret-key \
   cuemap/engine
 ```

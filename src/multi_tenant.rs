@@ -124,8 +124,10 @@ impl MultiTenantEngine {
         mut config: crate::config::ServerConfig,
         snapshots_dir: PathBuf,
     ) -> Self {
-        if let Err(e) = fs::create_dir_all(&snapshots_dir) {
-            eprintln!("Warning: Failed to create snapshots directory: {}", e);
+        if !config.server.read_only {
+            if let Err(e) = fs::create_dir_all(&snapshots_dir) {
+                eprintln!("Warning: Failed to create snapshots directory: {}", e);
+            }
         }
 
         config.semantic = config.semantic.resolved();
@@ -773,6 +775,9 @@ impl MultiTenantEngine {
 
     /// Save project metadata
     pub fn save_project_meta(&self, meta: &ProjectMeta) -> Result<(), String> {
+        if self.config.server.read_only {
+            return Err("Read-only mode".to_string());
+        }
         let meta_path = self
             .snapshots_dir
             .join(format!("{}.meta.json", meta.project_id));

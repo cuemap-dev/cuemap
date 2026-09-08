@@ -29,7 +29,7 @@ _TIMING_MARKER = "--- TIMING ---"
 def _load_harness():
     harness_path = os.environ.get(_HARNESS_ENV)
     if not harness_path:
-        raise RuntimeError(f"{_HARNESS_ENV} must point to test_longmemeval_settled.py")
+        harness_path = str(Path(__file__).resolve().parents[1] / "harnesses" / "test_longmemeval_settled.py")
 
     path = Path(harness_path).expanduser().resolve()
     if not path.is_file():

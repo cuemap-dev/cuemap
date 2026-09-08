@@ -35,6 +35,7 @@ function npmCommand() {
 }
 
 function run(command, args, options = {}) {
+  [command, args] = require("./node-command.cjs").commandFor(command, args);
   const result = spawnSync(command, args, {
     encoding: "utf8",
     stdio: options.stdio || "inherit",
@@ -208,7 +209,7 @@ function textOf(result) {
   return clientPath;
 }
 
-function main() {
+async function main() {
   const args = parseArgs(process.argv.slice(2));
   const expectedVersion = args.version;
   if (!expectedVersion) usage();
@@ -222,20 +223,17 @@ function main() {
   const logPath = path.join(tempDir, "engine.log");
   fs.mkdirSync(dataDir);
 
+  const registry = usingLocalPackages ? await require("./local-release-registry.cjs").start(localPackages) : null;
   try {
     run(npmCommand(), ["init", "-y"], { cwd: tempDir, stdio: "ignore" });
-    const installTargets = usingLocalPackages
-      ? localPackages
-      : [
-        `cuemap-mcp@${expectedVersion}`,
-        `cuemap@${expectedVersion}`,
-        `${packageName()}@${expectedVersion}`,
-      ];
+    const installTargets = [`cuemap-mcp@${expectedVersion}`];
     run(npmCommand(), [
       "install",
       "--no-save",
       "--ignore-scripts",
       "--package-lock=false",
+      "--no-audit",
+      ...(registry ? ["--registry", registry.url] : []),
       ...installTargets,
     ], { cwd: tempDir });
 
@@ -253,6 +251,11 @@ function main() {
     assertFile(path.join(engineRoot, "assets", "en_tokenizer.bin"), "native package tokenizer");
     assertFile(path.join(engineRoot, "LICENSE"), "native package license");
     assertFile(path.join(engineRoot, "NOTICE"), "native package notice");
+    assertFile(path.join(engineRoot, "THIRD_PARTY_NOTICES.txt"), "native package third-party license");
+    assertFile(path.join(engineRoot, "LGPL-2.1.txt"), "native package third-party license");
+    assertFile(path.join(engineRoot, "ONNXRUNTIME-LICENSE.txt"), "native package third-party license");
+    assertFile(path.join(engineRoot, "ONNXRUNTIME-NOTICES.txt"), "native package third-party license");
+
     verifyCommandVersion(wrapper, expectedVersion);
 
     const mcpManifestPath = resolvePackageManifest(requireFromTemp, "cuemap-mcp");
@@ -279,13 +282,12 @@ function main() {
 
     console.log(`Release smoke passed (${usingLocalPackages ? "local packages" : "public registry"}, ${packageLabel()})`);
   } finally {
+    if (registry) await registry.close();
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 }
 
-try {
-  main();
-} catch (error) {
+main().catch(error => {
   console.error(error.stack || error.message);
   process.exitCode = 1;
-}
+});

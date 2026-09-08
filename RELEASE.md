@@ -1,6 +1,6 @@
 # Release validation
 
-CueMap uses two release gates. Neither gate runs the evaluation suite.
+CueMap validates tagged release candidates before native publication and checks public registry installations afterward. The preflight does not run the full retrieval evaluation suite or the required release performance benchmark.
 
 ## Before publishing
 
@@ -10,8 +10,9 @@ From the CueMap workspace, with the five release repositories next to one anothe
 node rust_engine/scripts/release-preflight.cjs
 ```
 
-The preflight builds and tests the Rust engine, builds the TypeScript SDK and MCP
-server, verifies the Python SDK and Agent Plugin, packs local consumer artifacts,
+The preflight builds and tests the Rust engine, runs TypeScript, MCP, and Python
+real-engine integration tests, verifies the Python wheel in a clean environment
+and the Agent Plugin, packs local consumer artifacts,
 and installs those artifacts into a clean temporary npm project. It then verifies
 the native binary version, tokenizer, engine start/ingest/recall, MCP stdio
 startup, tool registration, memory creation, and recall.
@@ -47,3 +48,16 @@ Publish in this order:
 
 The post-release workflow is read-only against npm and PyPI; it never publishes
 or modifies a package.
+
+## Native publication gate
+
+Create the matching version tag in all five release repositories before running
+the engine release workflow. Companion sources are checked out at that tag.
+Publication requires all five native build/test jobs, Rust coverage, and the
+consumer preflight to pass. Linux binaries and Docker use Debian Bookworm.
+The publish job publishes the exact tarballs produced and exercised by the
+build jobs; pushes to `main` do not publish packages.
+
+Native packages and the TypeScript SDK must reach the registry before the MCP
+package can resolve its v0.7.3 dependency floor. After publication, refresh the
+MCP lockfile from the registry to capture the published tarball integrity hashes.

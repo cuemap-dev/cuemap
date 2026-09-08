@@ -2,9 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CUEMAP_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 CUEMAP_ENGINE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-CUEMAP_EVALS_DIR="${CUEMAP_EVALS_DIR:-$CUEMAP_ROOT/evals}"
+CUEMAP_EVALS_DIR="${CUEMAP_EVALS_DIR:-$CUEMAP_ENGINE_ROOT/evals/harnesses}"
 HARNESS="$CUEMAP_EVALS_DIR/test_locomo_settled.py"
 
 # Pin the CLI used by the Python harness.  Without this, LoCoMo can recall
@@ -28,7 +27,7 @@ if [[ ! -f "$HARNESS" ]]; then
   exit 1
 fi
 
-CUEMAP_URL="${CUEMAP_URL:-http://127.0.0.1:8080}"
+CUEMAP_URL="${CUEMAP_URL:-http://127.0.0.1:8735}"
 LIMIT="${LIMIT:-20}"
 EXPANSION_DEPTH="${EXPANSION_DEPTH:-10}"
 MODE="${MODE:-raw}"
@@ -49,7 +48,7 @@ esac
 mkdir -p "$OUT_DIR"
 
 args=(
-  python "$HARNESS"
+  "${PYTHON:-python3}" "$HARNESS"
   --url "$CUEMAP_URL"
   --limit "$LIMIT"
   --expansion-depth "$EXPANSION_DEPTH"
@@ -61,6 +60,10 @@ args=(
 
 if [[ "${DELETE_PROJECTS:-1}" == "1" ]]; then
   args+=(--delete-project-after-record)
+fi
+
+if [[ -n "${DATASET:-}" ]]; then
+  args+=(--dataset "$DATASET")
 fi
 
 if [[ -n "${START_INDEX:-}" ]]; then

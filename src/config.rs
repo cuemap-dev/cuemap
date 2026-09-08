@@ -52,8 +52,10 @@ impl Default for ServerConfig {
 }
 
 pub fn get_base_dir() -> PathBuf {
-    let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let path = PathBuf::from(home).join(".cuemap");
+    let path = env::var_os("CUEMAP_HOME").map(PathBuf::from).unwrap_or_else(|| {
+        let user_dir = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE"));
+        PathBuf::from(user_dir.unwrap_or_else(|| ".".into())).join(".cuemap")
+    });
     if !path.exists() {
         let _ = fs::create_dir_all(&path);
     }
@@ -71,23 +73,30 @@ impl ServerConfig {
 
         if path.exists() {
             let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-            let file_config: ServerConfig =
-                toml::from_str(&content).map_err(|e| format!("Failed to parse config: {}", e))?;
-
-            // Merge file config onto defaults
-            // Note: This is a shallow merge implementation for simplicity.
-            // In a robust system, we'd use a crate like `config` to merge fields deeply.
-            // For now, we trust `toml` to deserialize partially if Option, but since we use structs with defaults,
-            // `toml::from_str` usually replaces the whole struct if present.
-            // To do proper layering without `config` crate is verbose.
-            // Simplified approach: Parsing the file gives us a full config with defaults filled in by serde if missing in file.
-            // So we just use the file config, but we need to ensure CLI args override it later.
-            config = file_config;
-        } else {
-            // info!("Config file not found at {:?}, using defaults", path);
+            let overrides: toml::Value = toml::from_str(&content)
+                .map_err(|e| format!("Failed to parse config: {}", e))?;
+            let mut merged = toml::Value::try_from(&config).map_err(|e| e.to_string())?;
+            fn merge(base: &mut toml::Value, overrides: toml::Value) {
+                match (base, overrides) {
+                    (toml::Value::Table(base), toml::Value::Table(overrides)) => {
+                        for (key, value) in overrides {
+                            match base.get_mut(&key) {
+                                Some(existing) => merge(existing, value),
+                                None => { base.insert(key, value); }
+                            }
+                        }
+                    }
+                    (base, value) => *base = value,
+                }
+            }
+            merge(&mut merged, overrides);
+            config = merged.try_into().map_err(|e| format!("Failed to parse config: {}", e))?;
         }
 
         // 3. Environment variables overrides (Manual mapping for key fields)
+        if let Ok(host) = env::var("CUEMAP_HOST") {
+            config.server.host = host;
+        }
         if let Ok(port) = env::var("CUEMAP_PORT") {
             if let Ok(p) = port.parse() {
                 config.server.port = p;
@@ -251,6 +260,7 @@ impl ServerConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ServerSettings {
     pub port: u16,
     pub host: String,
@@ -266,7 +276,7 @@ impl Default for ServerSettings {
     fn default() -> Self {
         Self {
             port: 8735,
-            host: "0.0.0.0".to_string(),
+            host: "127.0.0.1".to_string(),
             data_dir: get_base_dir().join("data").to_string_lossy().to_string(),
             assets_dir: None,
             log_level: "info".to_string(),
@@ -277,7 +287,9 @@ impl Default for ServerSettings {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SecurityConfig {
+    pub allowed_origins: Vec<String>,
     pub require_auth: bool,
     pub api_keys: Vec<String>,
     pub master_key: Option<String>,
@@ -443,6 +455,17 @@ mod tests {
 
         let default = ServerConfig::default_for_profile("unknown");
         assert_eq!(default.server.port, 8735);
+    }
+
+    #[test]
+    fn partial_configuration_preserves_read_only_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.toml");
+        fs::write(&path, "[server]\nhost = \"::1\"\n").unwrap();
+        let config = ServerConfig::load(Some(path), Some("read_only".into())).unwrap();
+        assert!(config.server.read_only);
+        assert!(!config.persistence.enabled);
+        assert!(!config.jobs.background_processing);
     }
 
     #[test]
