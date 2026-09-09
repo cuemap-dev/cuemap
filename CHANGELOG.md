@@ -1,7 +1,5 @@
 # Changelog
 
-All notable changes to the CueMap Rust Engine will be documented in this file.
-
 ## [0.7.3] - 2026-08-27
 
 ### Added
@@ -11,6 +9,8 @@ All notable changes to the CueMap Rust Engine will be documented in this file.
 - **Broader source ingestion**: Added Tree-sitter-backed chunking for C, C++, C#, and Bash, plus structured TOML ingestion. Ambiguous `.h` files use source syntax and Apple-project markers to distinguish Objective-C from C/C++.
 - **Language-aware cue filtering**: Added keyword sets for the new mobile languages so code ingestion does not pollute lexical cues with language syntax.
 - **Project memory residency**: Added configurable inactivity-based unloading, transparent demand-loading for requests targeting unloaded projects, explicit `POST /projects/{project_id}/load` and `POST /projects/{project_id}/unload` endpoints, and loaded-state reporting in project summaries. The default inactivity period is one day.
+- Added engine-level recall `response_mode` (`full` by default or `preview`) and `preview_chars` (100–2000, default 200). Single- and cross-project responses omit full content in preview mode while preserving ranking and provenance.
+- Added opt-in `GET /memories/:id?decoded=true` for readable content and provenance without storage internals. Uses the engine content reader for compressed, encrypted, or disk-backed memories; the default HTTP response is unchanged.
 
 ### Fixed
 - **Lemmatization correctness**: Corrected common false lemmas, with regression coverage for truncated and wrong-part-of-speech outputs.

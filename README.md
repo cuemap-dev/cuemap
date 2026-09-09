@@ -134,6 +134,13 @@ Hint: Use `cuemap --help` to see available commands and options.
 
 ## Configuration
 
+For agent-facing memory inspection, `GET /memories/{id}?decoded=true` with
+`X-Project-ID` returns readable content, IDs, source key, cues, metadata, and
+timestamps. It resolves compressed, encrypted, and disk-backed content through
+the engine's content reader and omits storage internals such as vectors.
+Omitting `decoded=true` preserves the existing raw storage response. This
+option affects individual memory reads, not recall or its scoring path.
+
 CueMap uses a layered configuration system that prioritizes settings in the following order:
 **CLI Args** > **Env Vars** > **`server_config.toml`** > **Defaults**.
 
@@ -590,3 +597,15 @@ These modes are off by default and are designed for diagnostics or workloads tha
 CueMap Rust Engine and its native engine packages are licensed under
 Apache-2.0 from v0.7.3 onward. Earlier releases remain under BSL-1.1.
 See [LICENSE](LICENSE) and [NOTICE](NOTICE) for details.
+
+### Recall previews
+
+The engine's `POST /recall` accepts `response_mode: "preview"` and optional
+`preview_chars` (100–2000 UTF-16 code units, default 200). Full content remains
+the default. Previews replace each hit's `content` with a leading `preview`,
+`content_truncated`, and `content_length`, preserving metadata and ranking.
+Use previews for broad discovery, then fetch a selected memory with
+`GET /memories/{id}?decoded=true` or read its source. Metadata and diagnostics
+are not capped. TypeScript request objects and Python sync/async `recall`
+accept these same options; Python returns `RecallPreviewResult` for ungrouped
+preview results. The updated engine is required.

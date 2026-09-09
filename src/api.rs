@@ -78,6 +78,10 @@ pub struct AddMemoryBatchRequest {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct RecallRequest {
     #[serde(default)]
+    pub response_mode: RecallResponseMode,
+    #[serde(default = "default_preview_chars")]
+    pub preview_chars: usize,
+    #[serde(default)]
     pub cues: Vec<String>,
     #[serde(default)]
     pub query_text: Option<String>,
@@ -136,6 +140,41 @@ pub struct RecallRequest {
     pub disable_cuebridge_artifacts: bool,
     #[serde(default = "default_cuebridge_gap_limit")]
     pub cuebridge_gap_limit: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecallResponseMode {
+    #[default]
+    Full,
+    Preview,
+}
+
+fn default_preview_chars() -> usize { 200 }
+
+fn shape_recall_response(mut response: serde_json::Value, mode: RecallResponseMode, limit: usize) -> serde_json::Value {
+    if mode == RecallResponseMode::Full { return response; }
+    fn visit(value: &mut serde_json::Value, limit: usize) {
+        if let Some(results) = value.get_mut("results").and_then(|v| v.as_array_mut()) {
+            for result in results { visit(result, limit); }
+        } else if value.get("content").is_some_and(|v| v.is_string()) {
+            let content = value.as_object_mut().unwrap().remove("content").unwrap();
+            let content = content.as_str().unwrap();
+            let mut units = 0;
+            let mut end = 0;
+            for (offset, ch) in content.char_indices() {
+                units += ch.len_utf16();
+                if units <= limit { end = offset + ch.len_utf8(); }
+            }
+            value["preview"] = serde_json::json!(&content[..end]);
+            value["content_length"] = serde_json::json!(units);
+            value["content_truncated"] = serde_json::json!(end < content.len());
+        }
+    }
+    visit(&mut response, limit);
+    response["response_mode"] = serde_json::json!("preview");
+    response["preview_chars"] = serde_json::json!(limit);
+    response
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -4308,6 +4347,9 @@ async fn recall(
     Json(mut req): Json<RecallRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     req.auto_reinforce = req.auto_reinforce && !state.read_only;
+    if !(100..=2000).contains(&req.preview_chars) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "preview_chars must be between 100 and 2000"})));
+    }
     use std::time::Instant;
     let start = Instant::now();
     let EngineState {
@@ -4733,10 +4775,10 @@ async fn recall(
 
         return (
             StatusCode::OK,
-            Json(serde_json::json!({
+            Json(shape_recall_response(serde_json::json!({
                 "results": all_results,
                 "engine_latency": engine_latency_ms
-            })),
+            }), req.response_mode, req.preview_chars)),
         );
     }
 
@@ -5596,7 +5638,7 @@ async fn recall(
         }
         return (
             StatusCode::OK,
-            Json(response),
+            Json(shape_recall_response(response, req.response_mode, req.preview_chars)),
         );
     }
 
@@ -5612,7 +5654,7 @@ async fn recall(
     }
     (
         StatusCode::OK,
-        Json(response),
+        Json(shape_recall_response(response, req.response_mode, req.preview_chars)),
     )
 }
 
@@ -5676,10 +5718,17 @@ async fn reinforce_memory(
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct GetMemoryQuery {
+    #[serde(default)]
+    decoded: bool,
+}
+
 async fn get_memory(
     State(state): State<EngineState>,
     headers: HeaderMap,
     Path(memory_id): Path<MemoryId>,
+    Query(query): Query<GetMemoryQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let project_id = match extract_project_id(&headers) {
         Ok(id) => id,
@@ -5690,7 +5739,7 @@ async fn get_memory(
         ref mt_engine,
         ..
     } = &state;
-    let ctx = match mt_engine.get_or_create_project(project_id) {
+    let ctx = match mt_engine.get_or_create_project(project_id.clone()) {
         Ok(c) => c,
         Err(e) => {
             return (
@@ -5700,6 +5749,23 @@ async fn get_memory(
         }
     };
     match ctx.main.get_memory(memory_id) {
+        Some(memory) if query.decoded => match ctx.main.read_memory_content(&memory) {
+            Ok(content) => (StatusCode::OK, Json(serde_json::json!({
+                "id": memory.id,
+                "memory_id": memory.id,
+                "project_id": project_id,
+                "content": content,
+                "source_key": memory.source_key,
+                "metadata": memory.metadata,
+                "cues": memory.cues,
+                "created_at": memory.created_at,
+                "last_accessed": memory.last_accessed
+            }))),
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": "Memory content could not be read",
+                "memory_id": memory_id
+            }))),
+        },
         Some(memory) => (StatusCode::OK, Json(serde_json::json!(memory))),
         None => (
             StatusCode::NOT_FOUND,

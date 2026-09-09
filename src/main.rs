@@ -2673,6 +2673,8 @@ async fn handle_recall(args: RecallArgs) {
         }
     } else {
         let payload = api::RecallRequest {
+            response_mode: api::RecallResponseMode::Full,
+            preview_chars: 200,
             cues: args.cues,
             query_text: Some(args.query),
             query_embedding: None,

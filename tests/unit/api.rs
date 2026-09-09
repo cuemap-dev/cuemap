@@ -12,6 +12,62 @@
     use tower::ServiceExt;
 
     #[test]
+    fn preview_shaping_preserves_handles_diagnostics_and_unicode() {
+        let text = format!("{}😀tail", "x".repeat(99));
+        let response = serde_json::json!({"results":[
+            {"project_id":"a", "results":[{"id":7,"content":text,"metadata":{"source":"a.rs"}}]},
+            {"project_id":"b", "results":[]}, {"project_id":"c","error":"Unavailable"}
+        ],"timing":{"scan_ms":1}});
+        assert_eq!(shape_recall_response(response.clone(), RecallResponseMode::Full, 100), response);
+        let preview = shape_recall_response(response.clone(), RecallResponseMode::Preview, 100);
+        let hit = &preview["results"][0]["results"][0];
+        assert_eq!(hit["preview"], "x".repeat(99));
+        assert_eq!(hit["content_length"], 105);
+        assert_eq!(hit["content_truncated"], true);
+        assert!(hit.get("content").is_none());
+        assert_eq!(hit["id"], 7);
+        assert_eq!(hit["metadata"]["source"], "a.rs");
+        assert_eq!(preview["results"][1], response["results"][1]);
+        assert_eq!(preview["results"][2], response["results"][2]);
+        assert_eq!(preview["timing"], response["timing"]);
+        for content in ["", "short"] {
+            let shaped = shape_recall_response(serde_json::json!({"results":[{"content":content}]}), RecallResponseMode::Preview, 100);
+            assert_eq!(shaped["results"][0]["preview"], content);
+            assert_eq!(shaped["results"][0]["content_truncated"], false);
+        }
+    }
+
+    #[tokio::test]
+    async fn recall_preview_is_an_engine_response_for_single_and_multiple_projects() {
+        let router = test_router();
+        let content = format!("Preview discovery source. {}", "supporting evidence ".repeat(50));
+        let stored = router.clone().oneshot(Request::builder().method("POST").uri("/memories")
+            .header("X-Project-ID", "preview-test").header("content-type", "application/json")
+            .body(Body::from(serde_json::json!({"content":content,"disable_temporal_chunking":true}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(stored.status(), StatusCode::OK);
+        for projects in [serde_json::Value::Null, serde_json::json!(["preview-test"])] {
+            for explain in [false, true] {
+                let payload = serde_json::json!({"query_text":"preview discovery source","semantic_mode":"lexical",
+                    "response_mode":"preview","preview_chars":100,"projects":projects,"explain":explain});
+                let response = router.clone().oneshot(Request::builder().method("POST").uri("/recall")
+                    .header("X-Project-ID", "preview-test").header("content-type", "application/json")
+                    .body(Body::from(payload.to_string())).unwrap()).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = json_body(response).await;
+                assert_eq!(body["response_mode"], "preview");
+                let hit = if projects.is_null() { &body["results"][0] } else { &body["results"][0]["results"][0] };
+                assert_eq!(hit["preview"], &content[..100]);
+                assert!(hit.get("content").is_none());
+                assert_eq!(hit["content_truncated"], true);
+            }
+        }
+        let response = router.oneshot(Request::builder().method("POST").uri("/recall")
+            .header("X-Project-ID", "preview-test").header("content-type", "application/json")
+            .body(Body::from(r#"{"query_text":"test","response_mode":"preview","preview_chars":0}"#)).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
     fn source_event_time_prefers_explicit_and_reads_structured_metadata() {
         let mut metadata = HashMap::new();
         metadata.insert(
@@ -2141,7 +2197,27 @@
             .await
             .unwrap();
         assert_eq!(fetched.status(), StatusCode::OK);
-        assert_eq!(json_body(fetched).await["id"], id);
+        let raw = json_body(fetched).await;
+        assert_eq!(raw["id"], id);
+        assert!(raw["content"].is_array(), "legacy storage response is unchanged");
+
+        let decoded = router.clone().oneshot(
+            Request::builder().uri(format!("/memories/{id}?decoded=true"))
+                .header("X-Project-ID", "api-test").body(Body::empty()).unwrap(),
+        ).await.unwrap();
+        assert_eq!(decoded.status(), StatusCode::OK);
+        let decoded = json_body(decoded).await;
+        assert_eq!(decoded["content"], "hello world");
+        assert_eq!(decoded["memory_id"], id);
+        assert_eq!(decoded["project_id"], "api-test");
+        assert_eq!(decoded["metadata"]["source"], "test");
+        assert!(decoded.get("semantic_vector").is_none());
+
+        let other_project = router.clone().oneshot(
+            Request::builder().uri(format!("/memories/{id}?decoded=true"))
+                .header("X-Project-ID", "different-project").body(Body::empty()).unwrap(),
+        ).await.unwrap();
+        assert_eq!(other_project.status(), StatusCode::NOT_FOUND);
 
         let reinforced_with_cues = router
             .clone()
