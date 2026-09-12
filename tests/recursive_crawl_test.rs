@@ -4,6 +4,35 @@ use cuemap::agent::AgentConfig;
 use cuemap::jobs::JobQueue;
 use cuemap::multi_tenant::MultiTenantEngine;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Wait until the queue has acknowledged every write enqueued by an ingest.
+///
+/// The test queue still drains its channel asynchronously even when background
+/// jobs are disabled, so asserting immediately after `process_url*` returns
+/// races the worker.  Polling the session progress keeps these tests focused
+/// on the ordering guarantee they are meant to verify.
+async fn wait_for_writes(job_queue: &JobQueue, project_id: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+
+    loop {
+        let Some(session) = job_queue.get_session(project_id) else {
+            return;
+        };
+        let progress = session.get_progress();
+        if progress.writes_completed >= progress.writes_total {
+            return;
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Timed out waiting for writes to complete: {}/{}",
+            progress.writes_completed,
+            progress.writes_total
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
 
 /// Test basic URL chunking (single page, no recursion)
 #[tokio::test]
@@ -55,7 +84,6 @@ async fn test_single_url_chunking() {
 
 /// Test recursive crawl with depth=1 on a real documentation page
 /// This is a longer test that requires network access
-#[ignore] // Run with: cargo test --test recursive_crawl_test test_recursive_crawl_depth_1 -- --ignored
 #[tokio::test]
 async fn test_recursive_crawl_depth_1() {
     // Use axum docs as a stable test target (small, well-structured)
@@ -87,6 +115,10 @@ async fn test_recursive_crawl_depth_1() {
             true, // Same domain only
         )
         .await;
+
+    if result.is_ok() {
+        wait_for_writes(&job_queue, "test-project").await;
+    }
 
     match result {
         Ok(crawl_result) => {
@@ -141,7 +173,6 @@ async fn test_recursive_crawl_depth_1() {
 /// Test that job phases work correctly:
 /// 1. During crawl: phase should be Writing
 /// 2. After crawl: all writes should be complete before bg jobs start
-#[ignore]
 #[tokio::test]
 async fn test_job_phase_ordering() {
     let test_url = "https://example.com";
@@ -163,6 +194,10 @@ async fn test_job_phase_ordering() {
 
     // Single page crawl (depth=0 still uses recursive method internally)
     let result = ingester.process_url(test_url, "phase-test").await;
+
+    if result.is_ok() {
+        wait_for_writes(&job_queue, "phase-test").await;
+    }
 
     if let Ok(memory_ids) = result {
         if let Some(session) = job_queue.get_session("phase-test") {

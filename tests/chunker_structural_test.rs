@@ -35,6 +35,26 @@ fn test_all_formats_structural_cues() {
             vec!["lang:java", "type:class", "name:App"],
         ),
         (
+            "View.swift",
+            "struct Greeter {}",
+            vec!["lang:swift", "type:struct", "name:Greeter"],
+        ),
+        (
+            "home.dart",
+            "class HomeScreen {}",
+            vec!["lang:dart", "type:class", "name:HomeScreen"],
+        ),
+        (
+            "LegacyView.m",
+            "@interface LegacyView : NSObject\n@end",
+            vec!["lang:objc", "type:class_interface", "name:LegacyView"],
+        ),
+        (
+            "MainActivity.kt",
+            "class MainActivity {}",
+            vec!["lang:kotlin", "type:class", "name:MainActivity"],
+        ),
+        (
             "test.php",
             "<?php function run() {} ?>",
             vec!["lang:php", "type:function", "name:run"],

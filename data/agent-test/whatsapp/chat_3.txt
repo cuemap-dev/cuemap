@@ -1,0 +1,2 @@
+[01/02/24, 10:00:00] Alice: We should review the retrieval benchmark and decide which experiments to run next.
+[01/02/24, 10:01:00] Bob: Agreed, I will collect the latency numbers and share the report this afternoon.

@@ -2,6 +2,7 @@ use cuemap::config::TuningConfig;
 use cuemap::multi_tenant::*;
 use cuemap::structures::MainStats;
 use std::fs;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tempfile::tempdir;
 use tokio::time::sleep;
@@ -128,6 +129,191 @@ fn test_load_all_restores_every_project_snapshot() {
     assert!(matches!(results.get(&project_id), Some(Ok(()))));
     let restored = second.get_project(&project_id).expect("project should be restored");
     assert_eq!(restored.main.total_memories(), 1);
+}
+
+#[test]
+fn test_load_all_preserves_persisted_activity_for_inactivity_reaping() {
+    let dir = tempdir().unwrap();
+    let project_id = "load-old-activity".to_string();
+    let first = MultiTenantEngine::with_snapshots_dir(dir.path(), TuningConfig::default());
+    first.get_or_create_project(project_id.clone()).unwrap();
+    first.save_project(&project_id).unwrap();
+
+    let mut metadata = first.load_project_meta(&project_id).unwrap();
+    metadata.last_activity = 1;
+    first.save_project_meta(&metadata).unwrap();
+
+    let second = MultiTenantEngine::with_snapshots_dir(dir.path(), TuningConfig::default());
+    second.load_all();
+    let loaded = second
+        .list_projects()
+        .into_iter()
+        .find(|project| project.project_id == project_id)
+        .unwrap();
+    assert!(loaded.loaded);
+    assert_eq!(loaded.last_activity, 1.0);
+}
+
+#[test]
+fn test_unload_persists_project_and_demand_load_restores_it() {
+    let dir = tempdir().unwrap();
+    let engine = MultiTenantEngine::with_snapshots_dir(dir.path(), TuningConfig::default());
+    let project_id = "lifecycle-roundtrip".to_string();
+    let context = engine.get_or_create_project(project_id.clone()).unwrap();
+    context.main.add_memory(
+        "memory survives unloading".to_string(),
+        vec!["lifecycle".to_string()],
+        None,
+        MainStats::default(),
+        false,
+    );
+    drop(context);
+
+    assert_eq!(
+        engine.unload_project(&project_id).unwrap(),
+        ProjectUnloadResult::Unloaded
+    );
+    assert!(engine.get_project(&project_id).is_none());
+    assert!(!engine.list_loaded_project_ids().contains(&project_id));
+
+    let unloaded_stats = engine
+        .list_projects()
+        .into_iter()
+        .find(|project| project.project_id == project_id)
+        .expect("unloaded project should remain visible");
+    assert!(!unloaded_stats.loaded);
+    assert_eq!(unloaded_stats.total_memories, 1);
+
+    let restored = engine
+        .get_or_create_project(project_id.clone())
+        .expect("normal project access should demand-load a snapshot");
+    assert_eq!(restored.total_memories(), 1);
+    assert_eq!(
+        restored
+            .main
+            .recall(vec!["lifecycle".to_string()], 10, false, None)[0]
+            .content,
+        "memory survives unloading"
+    );
+    assert!(engine
+        .list_projects()
+        .into_iter()
+        .find(|project| project.project_id == project_id)
+        .unwrap()
+        .loaded);
+    assert!(engine.list_loaded_project_ids().contains(&project_id));
+}
+
+#[test]
+fn test_unload_refuses_active_context_and_is_idempotent_after_release() {
+    let dir = tempdir().unwrap();
+    let engine = MultiTenantEngine::with_snapshots_dir(dir.path(), TuningConfig::default());
+    let project_id = "lifecycle-busy".to_string();
+    let context = engine.get_or_create_project(project_id.clone()).unwrap();
+
+    assert_eq!(
+        engine.unload_project(&project_id).unwrap(),
+        ProjectUnloadResult::Busy
+    );
+    assert!(engine.get_project(&project_id).is_some());
+
+    drop(context);
+    assert_eq!(
+        engine.unload_project(&project_id).unwrap(),
+        ProjectUnloadResult::Unloaded
+    );
+    assert_eq!(
+        engine.unload_project(&project_id).unwrap(),
+        ProjectUnloadResult::AlreadyUnloaded
+    );
+}
+
+#[test]
+fn test_project_snapshot_replacement_is_atomic_and_refuses_active_contexts() {
+    let dir = tempdir().unwrap();
+    let engine = MultiTenantEngine::with_snapshots_dir(dir.path(), TuningConfig::default());
+    let project_id = "lifecycle-replace".to_string();
+    let context = engine.get_or_create_project(project_id.clone()).unwrap();
+    context.main.add_memory(
+        "keep this memory".to_string(),
+        vec!["replacement".to_string()],
+        None,
+        MainStats::default(),
+        false,
+    );
+
+    assert_eq!(
+        engine
+            .replace_project_snapshot(&project_id, || Ok(()))
+            .unwrap(),
+        ProjectReplaceResult::Busy
+    );
+    drop(context);
+
+    let error = engine
+        .replace_project_snapshot(&project_id, || Err("replacement failed".to_string()))
+        .unwrap_err();
+    assert_eq!(error, "replacement failed");
+    assert_eq!(
+        engine
+            .get_project(&project_id)
+            .unwrap()
+            .main
+            .recall(vec!["replacement".to_string()], 10, false, None)
+            .len(),
+        1
+    );
+
+    assert_eq!(
+        engine
+            .replace_project_snapshot(&project_id, || Ok(()))
+            .unwrap(),
+        ProjectReplaceResult::Reloaded
+    );
+}
+
+#[test]
+fn test_unload_requires_persistence_to_protect_unsaved_memory() {
+    let dir = tempdir().unwrap();
+    let mut config = cuemap::config::ServerConfig::default();
+    config.persistence.enabled = false;
+    let engine = MultiTenantEngine::with_config(config, dir.path().to_path_buf());
+    let project_id = "no-persistence".to_string();
+    let context = engine.get_or_create_project(project_id.clone()).unwrap();
+    drop(context);
+
+    let error = engine.unload_project(&project_id).unwrap_err();
+    assert!(error.contains("persistence to be enabled"));
+    assert!(engine.get_project(&project_id).is_some());
+}
+
+#[test]
+fn test_unload_inactive_projects_only_reaps_stale_loaded_contexts() {
+    let dir = tempdir().unwrap();
+    let engine = MultiTenantEngine::with_snapshots_dir(dir.path(), TuningConfig::default());
+    let stale_id = "lifecycle-stale".to_string();
+    let recent_id = "lifecycle-recent".to_string();
+    let stale = engine.get_or_create_project(stale_id.clone()).unwrap();
+    let recent = engine.get_or_create_project(recent_id.clone()).unwrap();
+    stale
+        .last_activity
+        .store(0, Ordering::Relaxed);
+    recent
+        .last_activity
+        .store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            Ordering::Relaxed,
+        );
+    drop(stale);
+    drop(recent);
+
+    let unloaded = engine.unload_inactive_projects(Duration::from_secs(1));
+    assert_eq!(unloaded, vec![stale_id.clone()]);
+    assert!(engine.get_project(&stale_id).is_none());
+    assert!(engine.get_project(&recent_id).is_some());
 }
 
 #[test]

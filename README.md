@@ -1,13 +1,22 @@
-# CueMap Rust Engine
+<p align="center">
+  <img src="https://cuemap.dev/cuemap-logo.PNG" alt="CueMap" width="120">
+</p>
 
-[![CI](https://github.com/cuemap-dev/cuemap/actions/workflows/coverage.yml/badge.svg?branch=v0.7.2)](https://github.com/cuemap-dev/cuemap/actions/workflows/coverage.yml)
-[![Coverage](https://codecov.io/github/cuemap-dev/cuemap/branch/v0.7.2/graph/badge.svg?flag=rust-engine)](https://app.codecov.io/github/cuemap-dev/cuemap)
+<h1 align="center">CueMap Rust Engine</h1>
+
+<p align="center">Fast, accurate, and explainable temporal-associative memory for agents.</p>
+
+<p align="center">
+  <a href="https://github.com/cuemap-dev/cuemap/actions/workflows/coverage.yml"><img src="https://github.com/cuemap-dev/cuemap/actions/workflows/coverage.yml/badge.svg?branch=v0.7.3" alt="CI"></a>
+  <a href="https://app.codecov.io/github/cuemap-dev/cuemap"><img src="https://codecov.io/github/cuemap-dev/cuemap/branch/v0.7.3/graph/badge.svg?flag=rust-engine" alt="Coverage"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-5e5ce6" alt="License"></a>
+</p>
 
 **High-performance temporal-associative memory store** designed for dynamic contextual retrieval.
 
 ## Overview
 
-CueMap implements a **Continuous Gradient Algorithm** optimized for associative data structures:
+CueMap uses **temporal-associative retrieval**: lexical and structural candidate generation, with optional semantic reranking. Its main components are:
 
 1.  **Intersection (Context Filter)**: Triangulates relevant memories by overlapping cues
 2.  **Structural Extraction**: Emits deterministic cues for observable evidence such as dates, numbers, lists, source metadata, and surface entities.
@@ -15,9 +24,11 @@ CueMap implements a **Continuous Gradient Algorithm** optimized for associative 
 4.  **Reinforcement (Access-based Learning)**: Frequently accessed memories gain signal strength, remaining highly accessible even as they age.
 5.  **Sparse Recall**: Uses normalized lexical cues, structural facets, recency, salience, and bounded deterministic reranking.
 
-As of v0.7.2, CueMap's default core path is deterministic and ontology-free. GloVe/Ollama cue generation, WordNet/POS expansion, semantic bridges, pattern completion, external lexicon graphs, context expansion/speculation endpoints, and autonomous consolidation have been removed from the default engine path. v0.7.2 bundles a qint8 `all-MiniLM-L3-v2` vector layer for semantic reranking, intent classification, and query embeddings; the `edge` profile selects a q4 build of the same model. The encoder can still be disabled for constrained builds or deployments.
+As of v0.7.2+, CueMap's default core path is deterministic and ontology-free. GloVe/Ollama cue generation, WordNet/POS expansion, semantic bridges, pattern completion, external lexicon graphs, context expansion/speculation endpoints, and autonomous consolidation have been removed from the default engine path. v0.7.2+ bundles a qint8 `paraphrase-MiniLM-L3-v2` vector layer for semantic reranking, intent classification, and query embeddings; the `edge` profile selects a q4 build of the same model. The encoder can still be disabled for constrained builds or deployments.
 
-v0.7.2 also uses numeric per-project memory IDs everywhere. If callers need deterministic upsert/dedupe identity, pass `source_key`; memory IDs remain compact runtime addresses.
+v0.7.2+ also uses numeric per-project memory IDs everywhere. If callers need deterministic upsert/dedupe identity, pass `source_key`; memory IDs remain compact runtime addresses.
+
+v0.7.3 adds Tree-sitter-backed ingestion for Swift, Dart, Objective-C, Kotlin, C, C++, C#, and Bash source files, plus structured TOML files.
 
 Built with Rust for maximum performance and reliability.
 
@@ -28,7 +39,7 @@ Built with Rust for maximum performance and reliability.
 ```bash
 # Production (optimized)
 cargo build --release
-./target/release/cuemap start --port 8080
+./target/release/cuemap start --port 8735
 
 # Development
 cargo run -- start
@@ -39,22 +50,52 @@ CueMap treats the nlprule tokenizer as a runtime asset, not a build artifact. Se
 ### Docker
 
 ```bash
-docker build -t cuemap/engine:0.7.2 .
-docker run -p 8080:8080 -v "$(pwd)/local_snapshot_dir:/app/data" cuemap/engine:0.7.2
+docker build -t cuemap/engine:0.7.3 .
+docker run -p 127.0.0.1:8735:8735 -v "$(pwd)/local_snapshot_dir:/app/data" cuemap/engine:0.7.3
 ```
 
-The container runs as the unprivileged `cuemap` user. Ensure a bind-mounted data directory is writable by UID/GID `10001`, or use a Docker-managed volume. Runtime defaults can be overridden with `CUEMAP_PORT`, `CUEMAP_DATA_DIR`, `CUEMAP_SNAPSHOT_INTERVAL_SECONDS`, `TOKENIZER_PATH`, and `RUST_LOG`.
+The container runs as the unprivileged `cuemap` user. Ensure a bind-mounted data directory is writable by UID/GID `10001`, or use a Docker-managed volume. Runtime defaults can be overridden with `CUEMAP_HOST`, `CUEMAP_PORT`, `CUEMAP_DATA_DIR`, `CUEMAP_SNAPSHOT_INTERVAL_SECONDS`, `CUEMAP_PROJECT_INACTIVITY_TIMEOUT_SECONDS`, `CUEMAP_PROJECT_UNLOAD_CHECK_INTERVAL_SECONDS`, `TOKENIZER_PATH`, and `RUST_LOG`.
+
+### Network access and read-only operation
+
+The native server binds to `127.0.0.1:8735` by default. Set `server.host` or
+`CUEMAP_HOST` to a numeric IPv4 or IPv6 address to change the bind address.
+The Docker image binds to `0.0.0.0` inside the container; the examples publish
+its port only on the host loopback interface.
+
+Browser origins are denied by default, including simple cross-origin requests.
+To allow a browser application, list its exact origin in configuration:
+
+```toml
+[security]
+allowed_origins = ["http://localhost:3000"]
+```
+
+API-key authentication still applies to allowed browser clients.
+
+`server.read_only = true` and static loading disable write routes, recall
+reinforcement, automatic ingestion, and snapshot writes. Existing snapshots can
+still be loaded for queries. Ordinary requests and multipart uploads have a
+64 MiB body limit; project-package uploads to `/projects/load` have a 1 GiB limit.
+These limits apply to the request body, not the expanded contents of archives.
+
+Set `CUEMAP_HOME` to isolate the engine's configuration and PID files. It defaults
+to `~/.cuemap`; `CUEMAP_DATA_DIR` separately controls the data directory.
 
 ### Native npm packages
 
-Build the Darwin ARM64, Darwin x64, Linux x64, and Linux ARM64 native packages without publishing them:
+Build the Darwin ARM64, Darwin x64, Linux x64, and Linux ARM64 native packages locally without publishing them:
 
 ```bash
 ./scripts/build-npm-native-packages.sh
 ./scripts/verify-npm-native-packages.sh
 ```
 
-The packager builds Linux on Debian Trixie, bundles the checksum-pinned tokenizer, and writes package tarballs plus `SHA256SUMS` under `dist/npm-native/tarballs`.
+The local packager builds Linux on Debian Bookworm, bundles the checksum-pinned tokenizer, and writes package tarballs plus `SHA256SUMS` under `dist/npm-native/tarballs`. The Windows x64 package is built and published by the GitHub Actions release workflow.
+
+### Release validation
+
+Run the local consumer preflight on macOS and Windows before publishing, then run the read-only public-registry smoke test from GitHub Actions after publishing. See [RELEASE.md](RELEASE.md) for the exact commands and release order.
 
 ### CLI Commands
 
@@ -81,7 +122,7 @@ cuemap <COMMAND> [OPTIONS]
 - **`add`**: Add a memory via natural language.
 - **`recall`**: Search memories (supports Grounded Recall and Web Recall).
 - **`ingest`**: Ingest data from files or URLs.
-- **`projects`**: Create and list projects.
+- **`project`**: Manage projects, portable packages, and sync (`projects` remains an alias).
 - **`set-project`**: Set the default project for the current session.
 - **`set-watch-dir`**: Set a watch directory for a project (enables agent).
 
@@ -92,6 +133,13 @@ cuemap <COMMAND> [OPTIONS]
 Hint: Use `cuemap --help` to see available commands and options.
 
 ## Configuration
+
+For agent-facing memory inspection, `GET /memories/{id}?decoded=true` with
+`X-Project-ID` returns readable content, IDs, source key, cues, metadata, and
+timestamps. It resolves compressed, encrypted, and disk-backed content through
+the engine's content reader and omits storage internals such as vectors.
+Omitting `decoded=true` preserves the existing raw storage response. This
+option affects individual memory reads, not recall or its scoring path.
 
 CueMap uses a layered configuration system that prioritizes settings in the following order:
 **CLI Args** > **Env Vars** > **`server_config.toml`** > **Defaults**.
@@ -116,7 +164,7 @@ On startup, if `--agent-dir` is provided, CueMap initializes the **Self-Learning
 ./target/release/cuemap start --agent-dir ~/projects/my-app
 
 # The agent will automatically:
-# 1. Supercharged Structural Ingestion (Rust, Python, Go, JS/TS, PHP, Java).
+# 1. Supercharged Structural Ingestion (Rust, Python, Go, JS/TS, PHP, Java, Swift, Dart, Objective-C, Kotlin, C/C++, C#, Bash, and TOML).
 #    - Native tree-sitter queries capture definitions, calls, and imports as grounded cues.
 # 2. Document & Data Parsing (PDF, Word, Excel, JSON, CSV, YAML, XML).
 #    - Extracts headers, keys, and metadata as structural metadata.
@@ -142,7 +190,7 @@ Add the MCP server to your AI agent's configuration (e.g., Claude Desktop, Curso
         "cuemap-mcp"
       ],
       "env": {
-        "CUEMAP_PORT": "8080"
+        "CUEMAP_PORT": "8735"
       }
     }
   }
@@ -160,6 +208,7 @@ CueMap provides complete project isolation with automatic persistence:
 - **Project Isolation**: Each project has its own memory space, identified by `X-Project-ID` header.
 - **Auto-Save on Shutdown**: All projects are saved on graceful shutdown when persistence is enabled.
 - **Auto-Load on Startup**: Snapshots are restored from the configured data directory when persistence is enabled.
+- **Memory-Aware Residency**: Loaded project contexts are automatically unloaded after a configurable inactivity period while their snapshots remain available on disk. A request for an unloaded project transparently loads it again.
 - **Zero Configuration**: Works out of the box
 
 ### Usage
@@ -168,7 +217,7 @@ CueMap runs in multi-tenant mode by default. Select a project for CLI commands w
 
 ```bash
 # Start the server
-./target/release/cuemap start --port 8080
+./target/release/cuemap start --port 8735
 
 # Choose a project and use the local CLI
 cuemap set-project my-project
@@ -179,6 +228,89 @@ cuemap recall "What is important?"
 # Restart server - loads persisted snapshots
 # Data persists across restarts unless snapshots are disabled.
 ```
+
+### Project memory residency
+
+By default, the engine checks loaded projects every 60 seconds and unloads
+projects that have had no activity for one day. Configure this in
+`server_config.toml`:
+
+```toml
+[project_lifecycle]
+inactivity_timeout_seconds = 86400
+unload_check_interval_seconds = 60
+```
+
+Set `inactivity_timeout_seconds = 0` to disable automatic unloading. Project
+snapshots are written before an unload, and ordinary recall, ingestion, and
+other project requests demand-load the project when needed. The first request
+after a reload can therefore have additional snapshot/index reconstruction
+latency. Use `POST /projects/{project_id}/load` to warm a project explicitly
+or `POST /projects/{project_id}/unload` to persist and release it immediately.
+`GET /projects` includes `loaded: true|false` for each project. Explicit
+unload returns a conflict while active work still holds the project context.
+
+### Memory optimization
+
+CueMap has two complementary ways to reduce memory usage. Choose between them
+based on whether the memory pressure comes from large content payloads or from
+having many inactive projects loaded at once.
+
+#### Content-level optimization: `--disk-content`
+
+Start the engine with `--disk-content` to keep memory content on disk instead
+of retaining the raw content bytes in RAM:
+
+```bash
+./target/release/cuemap start --disk-content
+```
+
+The project’s cues, metadata, indexes, and semantic vectors remain loaded, so
+recall stays warm. CueMap reads the content from
+`<data-dir>/contents/<project-id>/` when it needs to return a result. This is
+useful for a frequently accessed project with many large memories, but content
+results incur disk I/O. It is not a project unload mechanism.
+
+#### Project-level optimization: load/unload
+
+Project unloading persists the project snapshot and releases the complete
+in-memory project context, including its indexes and metadata. It is useful
+when an instance contains many repositories but only a few are active. A
+request for an unloaded project loads it automatically; the first request can
+therefore have higher latency. See [Project memory residency](#project-memory-residency)
+for the inactivity policy and explicit endpoints.
+
+The two options can be enabled together: `--disk-content` reduces the RAM used
+by each loaded project, while project unloading reduces the number of loaded
+projects. Disk-backed content lives outside the project snapshots, so backups
+must include both the snapshots directory and `<data-dir>/contents/`.
+
+### Portable project packages
+
+A `.cuemap` file carries a ready-to-query project—snapshots, disk-backed content,
+and CueBridge artifacts—so another server can load it without re-ingestion.
+
+```bash
+cuemap project pack my-project --output my-project.cuemap
+cuemap project load my-project.cuemap
+cuemap project push my-project s3://my-bucket/cuemap/
+cuemap project pull s3://my-bucket/cuemap/my-project.cuemap
+cuemap project sync my-project s3://my-bucket/team
+```
+
+HTTP clients use the matching `POST /projects/{id}/pack`, `/projects/load`,
+`/projects/{id}/push`, and `/projects/pull` endpoints.
+
+`pack`/`push` flush the running server first; use `--offline` only for a current
+stopped instance. Imports verify SHA-256 checksums and snapshot compatibility and
+refuse overwrite unless `--force` is used while the server is stopped. Packages
+exclude machine-specific watch settings and are point-in-time, sensitive copies.
+Encrypted projects require the same master key on the target. S3 commands use
+the configured AWS CLI and incur normal AWS charges.
+
+`sync` adds immutable commits and a conditionally updated S3 head. It pushes or
+pulls only fast-forwards and refuses divergent or concurrently changed state.
+HTTP clients use `POST /projects/{id}/sync` with `{"remote":"s3://..."}`.
 
 ### Snapshot Management
 
@@ -226,10 +358,10 @@ Set an API key via environment variable:
 
 ```bash
 # Single API key
-CUEMAP_API_KEY=your-secret-key ./target/release/cuemap start --port 8080
+CUEMAP_API_KEY=your-secret-key ./target/release/cuemap start --port 8735
 
 # Multiple API keys (comma-separated)
-CUEMAP_API_KEYS=key1,key2,key3 ./target/release/cuemap start --port 8080
+CUEMAP_API_KEYS=key1,key2,key3 ./target/release/cuemap start --port 8735
 ```
 
 Or configure keys in `~/.cuemap/server_config.toml`:
@@ -244,7 +376,7 @@ Clients send the configured key in the `X-API-Key` header. See the [HTTP API ref
 ### Docker with Authentication
 
 ```bash
-docker run -p 8080:8080 -v "$(pwd)/local_snapshot_dir:/app/data" \
+docker run -p 127.0.0.1:8735:8735 -v "$(pwd)/local_snapshot_dir:/app/data" \
   -e CUEMAP_API_KEY=your-secret-key \
   cuemap/engine
 ```
@@ -277,11 +409,11 @@ To optimize storage efficiency, especially for large textual memories, CueMap em
 
 ## Performance
 
-### Benchmark Results (v0.7.2)
+### Benchmark Results (v0.7.3)
 
 Tests performed on **Real-World Data** (Wikipedia Articles), processing full natural language sentences with the complete NLP pipeline.
 
-**Hardware:** MacBook Pro M-series, 64GB RAM, single node. The v0.7.2 release table below records completed lexical and hybrid runs at 10K, 100K, and 1M memories. Lexical runs isolate the sparse core with the semantic encoder disabled; hybrid runs include the bundled local encoder. P95 is the release headline percentile, while P99 remains available in the JSON diagnostics.
+**Hardware:** MacBook Pro M-series, 64GB RAM, single node. The v0.7.3 release table below records completed lexical and hybrid runs at 10K, 100K, and 1M memories. Lexical runs isolate the sparse core with the semantic encoder disabled; hybrid runs include the bundled local encoder. P95 is the release headline percentile, while P99 remains available in the JSON diagnostics.
 
 #### Benchmark Methodology
 
@@ -315,7 +447,7 @@ same command with `--semantic-mode hybrid` to produce the hybrid comparison. The
 dataset is downloaded only once and reused from the local cache on subsequent
 runs.
 
-#### v0.7.2 latency comparison
+#### v0.7.3 latency comparison
 
 The lexical release rerun now covers 10K, 100K, and 1M writes plus lean recall
 queries. The compact comparison below records the 10K, 100K, and 1M hybrid
@@ -356,9 +488,9 @@ Write latency remains mostly flat with project size; the dominant cost is per-me
 | **1,000,000** | 2.63 ms | 2.06 ms | 3.72 ms | 378 ops/s |
 
 **Key Metrics**:
-- **Low-latency recall:** The lexical v0.7.2 1M run measured 2.63ms average with 3.72ms p95; hybrid measurements remain separate because they include bundled encoder work.
+- **Low-latency recall:** The lexical v0.7.3 1M run measured 2.63ms average with 3.72ms p95; hybrid measurements remain separate because they include bundled encoder work.
 - **Numeric ID memory reduction:** 1M in-memory footprint dropped from about 5.25GB to about 1.93GB after the v0.7 numeric memory-ID refactor.
-- **Controlled hot path:** the release benchmark disables the local semantic encoder, LLMs, network services, and disk scans; normal v0.7.2 hybrid recall can use the bundled local encoder for bounded reranking.
+- **Controlled hot path:** the release benchmark disables the local semantic encoder, LLMs, network services, and disk scans; normal v0.7.3 hybrid recall can use the bundled local encoder for bounded reranking.
 
 ## Architecture
 
@@ -390,192 +522,9 @@ The website docs are the source of truth for endpoint behavior and are kept alig
 
 ## System Architecture
 
-### 1. High-Level Overview
+The system diagrams are maintained separately to keep this README focused:
 
-```mermaid
-graph TB
-    subgraph "Clients"
-        SDK[Python/TS SDKs]
-        CURL[HTTP Clients]
-    end
-    
-    subgraph "API Layer"
-        AXUM[Axum HTTP Server]
-        AUTH[Auth Middleware]
-    end
-    
-    subgraph "Multi-Tenant Core"
-        MT[MultiTenantEngine]
-        MAIN[CueMap Engine<br/>DashMap + aHash]
-        LEX[Lexicon Engine<br/>Token → Cue]
-        ALIAS[Alias Engine<br/>Synonyms]
-    end
-    
-    subgraph "Background Processing"
-        QUEUE[Job Queue<br/>Reinforcement + Agent Jobs]
-        SESSION[Session Manager<br/>Ingest Progress]
-    end
-    
-    subgraph "Intelligence"
-        NL[NL Tokenizer<br/>Lemmatization + RAKE]
-        STRUCT[Structural Facets<br/>Evidence + Metadata]
-    end
-    
-    subgraph "Persistence"
-        PERSIST[Snapshots<br/>Zstd + ChaCha20]
-    end
-    
-    SDK --> AXUM
-    CURL --> AXUM
-    AXUM --> AUTH --> MT
-    
-    MT --> MAIN
-    MT --> LEX
-    MT --> ALIAS
-    
-    AXUM --> QUEUE
-    AXUM --> SESSION
-    
-    QUEUE --> LEX
-    
-    MAIN <-.-> PERSIST
-    LEX <-.-> PERSIST
-    
-    style MAIN fill:#4CAF50
-    style LEX fill:#2196F3
-    style ALIAS fill:#FF9800
-    style QUEUE fill:#9C27B0
-```
-
-### 2. Write Flow
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant API as HTTP Handler
-    participant NL as NL Tokenizer
-    participant Norm as Normalizer
-    participant Tax as Taxonomy
-    participant Main as CueMap Engine
-    
-    C->>API: Memory write request<br/>{content, cues[]}
-    
-    alt cues[] is empty
-        API->>NL: tokenize_to_cues(content)
-        NL-->>API: ["payment", "timeout", ...]
-    end
-    
-    API->>Norm: normalize_cue(each)
-    Norm-->>API: normalized cues
-    
-    API->>Tax: validate_cues(cues)
-    Tax-->>API: {accepted[], rejected[]}
-    
-    API->>Main: add_memory(content, accepted)
-    Main-->>API: memory_id
-    
-    API-->>C: 200 {id, cues, latency_ms}
-    Note over C,API: ✅ Synchronous ~2ms
-    
-    Note over API,Main: Cue extraction and indexing happen synchronously
-```
-
-### 3. Read Flow
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant API as HTTP Handler
-    participant Lex as Lexicon
-    participant Alias as Alias Engine
-    participant Art as CueBridge Artifacts
-    participant Main as CueMap Engine
-    participant Q as Job Queue
-    
-    C->>API: Recall request<br/>{query_text?, cues[], limit}
-    
-    alt query_text provided
-        API->>Lex: resolve_cues_from_text(query)
-        Lex-->>API: resolved_cues[]
-    end
-    
-    API->>API: Merge & Normalize cues
-    
-    opt explicit aliases enabled
-        API->>Alias: apply_aliases(cues)
-        Alias-->>API: weighted_cues[(cue, weight)]
-    end
-
-    opt exact recall is weak and artifacts are enabled
-        API->>Art: lookup GapPack(query_signature)
-        Art-->>API: capped expansion cues
-    end
-    
-    API->>Main: recall_weighted(cues, limit, options)
-    Main->>Main: Salience Bias
-    Main->>Main: Score & Rank
-    
-    Main-->>API: RecallResult[]
-    
-    opt auto_reinforce = true
-        API->>Q: Enqueue ReinforceMemories
-        API->>Q: Enqueue ReinforceLexicon
-    end
-    
-    API-->>C: {results, explain?, latency_ms}
-```
-
-### 4. Background Job Pipeline
-
-```mermaid
-graph TB
-    subgraph "Job Sources"
-        INGEST[Ingestion]
-        RECALL[Recall]
-        AGENT[Self-Learning Agent]
-        TIMER[60s Heatmap Tick]
-    end
-    
-    subgraph "Job Types"
-        J4[ReinforceMemories]
-        J5[ReinforceLexicon]
-        J7[ExtractAndIngest]
-        J8[VerifyFile]
-        J10[DeleteMemory]
-        J9[UpdateMarketHeatmap]
-    end
-    
-    subgraph "Processing"
-        SESSION[Session Manager<br/>Tracks write completion]
-        QUEUE[MPSC Queue<br/>Async Worker]
-    end
-    
-    subgraph "Side Effects"
-        E1[Memories Reinforced]
-        E2[Lexicon Reinforced]
-        E4[Content Extracted]
-        E5[Stale File Memories Deleted]
-        E6[Market Heatmap Updated]
-    end
-    
-    RECALL --> J4 & J5
-    INGEST --> J7
-    AGENT --> J7 & J8 & J10
-    TIMER --> J9
-    
-    J7 --> SESSION
-    J4 & J5 --> QUEUE
-    J7 & J8 & J10 --> QUEUE
-    J9 --> QUEUE
-    
-    QUEUE --> E1 & E2 & E4 & E5 & E6
-    
-    style QUEUE fill:#9C27B0
-    style SESSION fill:#673AB7
-    style E1 fill:#2196F3
-    style E2 fill:#4CAF50
-    style E5 fill:#F44336
-```
+- [Architecture diagrams](ARCHITECTURE.md)
 
 ## Advanced Capabilities
 
@@ -584,9 +533,9 @@ graph TB
 The agent transforms your local filesystem into a deterministic structural knowledge base with zero manual effort.
 
 *   **Universal Format Support**: Deeply integrates with dozens of formats:
-    *   **Languages**: Rust, Python, TypeScript, Go, Java, PHP, HTML, CSS (via Tree-sitter).
+    *   **Languages**: Rust, Python, TypeScript, JavaScript, Go, Java, PHP, HTML, CSS, Swift, Dart, Objective-C, Kotlin, C, C++, C#, and Bash (via Tree-sitter).
     *   **Documents**: PDF (text extraction), Word (DOCX), Excel (XLSX).
-    *   **Data**: CSV (row-aware), JSON (key-aware), YAML, XML.
+    *   **Data**: CSV (row-aware), JSON (key-aware), YAML, XML, TOML.
 *   **Tree-sitter Powered Chunking**: Smartly splits code into functions, classes, and modules while preserving context.
 *   **Deterministic Knowledge Extraction**: Uses tree-sitter structure, document parsers, metadata facets, and token normalization; no runtime model call is required.
 *   **Idempotent Updates**: Uses content-aware hashing (`file:<path>:<hash>`) to prevent memory duplication and ensure stale memories are pruned.
@@ -645,9 +594,18 @@ These modes are off by default and are designed for diagnostics or workloads tha
 
 ## License
 
-BSL-1.1 (Business Source License 1.1) converting to Apache 2.0 after 4 years.
-See `LICENSE` for details.
+CueMap Rust Engine and its native engine packages are licensed under
+Apache-2.0 from v0.7.3 onward. Earlier releases remain under BSL-1.1.
+See [LICENSE](LICENSE) and [NOTICE](NOTICE) for details.
 
-This allows full use for development, testing, and self-hosting, while preventing the software from being offered as a competing managed Database Service.
+### Recall previews
 
-For commercial licensing (closed-source SaaS or offering as a service), contact: hello@cuemap.dev
+The engine's `POST /recall` accepts `response_mode: "preview"` and optional
+`preview_chars` (100–2000 UTF-16 code units, default 200). Full content remains
+the default. Previews replace each hit's `content` with a leading `preview`,
+`content_truncated`, and `content_length`, preserving metadata and ranking.
+Use previews for broad discovery, then fetch a selected memory with
+`GET /memories/{id}?decoded=true` or read its source. Metadata and diagnostics
+are not capped. TypeScript request objects and Python sync/async `recall`
+accept these same options; Python returns `RecallPreviewResult` for ungrouped
+preview results. The updated engine is required.

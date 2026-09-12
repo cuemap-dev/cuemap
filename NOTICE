@@ -1,0 +1,44 @@
+CueMap Rust Engine
+Copyright 2026 Kaan Demirel
+
+CueMap's original source is licensed under Apache-2.0. Third-party components
+retain their own licenses. Cargo dependency attributions and license texts are
+included in THIRD_PARTY_NOTICES.txt, including build and platform dependencies.
+
+Bundled MiniLM model and tokenizer
+---------------------------------
+Upstream: sentence-transformers/paraphrase-MiniLM-L3-v2
+Source: https://huggingface.co/sentence-transformers/paraphrase-MiniLM-L3-v2
+License: Apache-2.0 (see LICENSE)
+
+The bundled model_qint8_arm64.onnx is an unchanged upstream ONNX export:
+https://huggingface.co/sentence-transformers/paraphrase-MiniLM-L3-v2/blob/e51865b/onnx/model_qint8_arm64.onnx
+SHA-256: 44a2d6852c28e7a4cff4d77a8bc8d5ca2a8b38884c1fa746e6652d830109e0c2
+The model_int4.onnx file is a locally quantized derivative of that model family.
+The tokenizer.json contains the matching upstream tokenizer configuration.
+The local directory name all-MiniLM-L3-v2 is an internal identifier.
+Artifact hashes are recorded in assets/all-MiniLM-L3-v2/SHA256SUMS.
+
+The intent_probe_qint8.head and intent_probe_q4.head files were trained for
+CueMap using project-created examples and are distributed under Apache-2.0.
+
+nlprule tokenizer
+-----------------
+The nlprule Rust library offers MIT or Apache-2.0 licensing. Its compiled
+LanguageTool-derived tokenizer resources have separate LGPLv2.1 licensing.
+The distributed en_tokenizer.bin is an unchanged upstream nlprule binary.
+License text: LGPL-2.1.txt
+Upstream licensing: https://github.com/bminixhofer/nlprule#license
+Resource source project: https://github.com/languagetool-org/languagetool/tree/v5.2
+Tokenizer build tools: https://github.com/bminixhofer/nlprule/tree/0.6.4
+CueMap loads this file separately at runtime; TOKENIZER_PATH can select a
+replacement tokenizer. The distribution's compressed download is:
+https://cuemap.dev/assets/en_tokenizer.bin.gz
+SHA-256: f54fd31ec463f8646d0239bb531a64e0210ed1ae02bf5e3b42aeeb9bff8305ba
+
+ONNX Runtime
+------------
+The optional semantic encoder links ONNX Runtime 1.22.0 via ort-sys rc.10.
+Source: https://github.com/microsoft/onnxruntime/tree/v1.22.0
+License and bundled dependency notices: ONNXRUNTIME-LICENSE.txt and
+ONNXRUNTIME-NOTICES.txt.

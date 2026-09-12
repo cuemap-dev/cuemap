@@ -2,9 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CUEMAP_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 CUEMAP_ENGINE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-CUEMAP_EVALS_DIR="${CUEMAP_EVALS_DIR:-$CUEMAP_ROOT/evals}"
+CUEMAP_EVALS_DIR="${CUEMAP_EVALS_DIR:-$CUEMAP_ENGINE_ROOT/evals/harnesses}"
 HARNESS="$CUEMAP_EVALS_DIR/test_longmemeval_settled.py"
 
 # Pin both the adapter and canonical harness CLI calls to the release engine.
@@ -27,7 +26,7 @@ if [[ ! -f "$HARNESS" ]]; then
   exit 1
 fi
 
-CUEMAP_URL="${CUEMAP_URL:-http://127.0.0.1:8080}"
+CUEMAP_URL="${CUEMAP_URL:-http://127.0.0.1:8735}"
 LIMIT="${LIMIT:-20}"
 MODE="${MODE:-raw}"
 SEMANTIC_MODE="${SEMANTIC_MODE:-hybrid}"
@@ -55,7 +54,7 @@ if [[ "$TRACE_TIMING" == "1" ]]; then
 fi
 
 args=(
-  python
+  "${PYTHON:-python3}"
   "${SCRIPT_DIR}/fast_longmemeval.py"
   --url "$CUEMAP_URL"
   --limit "$LIMIT"
@@ -69,7 +68,7 @@ if [[ "${FAST_INGEST:-1}" == "1" ]]; then
   echo "Ingestion transport: direct /ingest/content (BEAM-compatible)"
 else
   args=(
-    python "$HARNESS"
+    "${PYTHON:-python3}" "$HARNESS"
     --url "$CUEMAP_URL"
     --limit "$LIMIT"
     --variant "${VARIANT:-core}"
@@ -81,6 +80,10 @@ fi
 
 if [[ "${DELETE_PROJECTS:-1}" == "1" ]]; then
   args+=(--delete-project-after-record)
+fi
+
+if [[ -n "${DATASET:-}" ]]; then
+  args+=(--dataset "$DATASET")
 fi
 
 if [[ -n "${START_INDEX:-}" ]]; then
@@ -138,7 +141,7 @@ else
 fi
 
 if [[ "$TRACE_TIMING" == "1" && -s "$TIMING_FILE" ]]; then
-  python "$CUEMAP_ROOT/evals/beam/report_timing.py" --input "$TIMING_FILE"
+  "${PYTHON:-python3}" "$CUEMAP_EVALS_DIR/report_timing.py" --input "$TIMING_FILE"
   echo "Timing samples: $TIMING_FILE"
 fi
 

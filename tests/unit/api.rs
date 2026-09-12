@@ -12,6 +12,62 @@
     use tower::ServiceExt;
 
     #[test]
+    fn preview_shaping_preserves_handles_diagnostics_and_unicode() {
+        let text = format!("{}😀tail", "x".repeat(99));
+        let response = serde_json::json!({"results":[
+            {"project_id":"a", "results":[{"id":7,"content":text,"metadata":{"source":"a.rs"}}]},
+            {"project_id":"b", "results":[]}, {"project_id":"c","error":"Unavailable"}
+        ],"timing":{"scan_ms":1}});
+        assert_eq!(shape_recall_response(response.clone(), RecallResponseMode::Full, 100), response);
+        let preview = shape_recall_response(response.clone(), RecallResponseMode::Preview, 100);
+        let hit = &preview["results"][0]["results"][0];
+        assert_eq!(hit["preview"], "x".repeat(99));
+        assert_eq!(hit["content_length"], 105);
+        assert_eq!(hit["content_truncated"], true);
+        assert!(hit.get("content").is_none());
+        assert_eq!(hit["id"], 7);
+        assert_eq!(hit["metadata"]["source"], "a.rs");
+        assert_eq!(preview["results"][1], response["results"][1]);
+        assert_eq!(preview["results"][2], response["results"][2]);
+        assert_eq!(preview["timing"], response["timing"]);
+        for content in ["", "short"] {
+            let shaped = shape_recall_response(serde_json::json!({"results":[{"content":content}]}), RecallResponseMode::Preview, 100);
+            assert_eq!(shaped["results"][0]["preview"], content);
+            assert_eq!(shaped["results"][0]["content_truncated"], false);
+        }
+    }
+
+    #[tokio::test]
+    async fn recall_preview_is_an_engine_response_for_single_and_multiple_projects() {
+        let router = test_router();
+        let content = format!("Preview discovery source. {}", "supporting evidence ".repeat(50));
+        let stored = router.clone().oneshot(Request::builder().method("POST").uri("/memories")
+            .header("X-Project-ID", "preview-test").header("content-type", "application/json")
+            .body(Body::from(serde_json::json!({"content":content,"disable_temporal_chunking":true}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(stored.status(), StatusCode::OK);
+        for projects in [serde_json::Value::Null, serde_json::json!(["preview-test"])] {
+            for explain in [false, true] {
+                let payload = serde_json::json!({"query_text":"preview discovery source","semantic_mode":"lexical",
+                    "response_mode":"preview","preview_chars":100,"projects":projects,"explain":explain});
+                let response = router.clone().oneshot(Request::builder().method("POST").uri("/recall")
+                    .header("X-Project-ID", "preview-test").header("content-type", "application/json")
+                    .body(Body::from(payload.to_string())).unwrap()).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = json_body(response).await;
+                assert_eq!(body["response_mode"], "preview");
+                let hit = if projects.is_null() { &body["results"][0] } else { &body["results"][0]["results"][0] };
+                assert_eq!(hit["preview"], &content[..100]);
+                assert!(hit.get("content").is_none());
+                assert_eq!(hit["content_truncated"], true);
+            }
+        }
+        let response = router.oneshot(Request::builder().method("POST").uri("/recall")
+            .header("X-Project-ID", "preview-test").header("content-type", "application/json")
+            .body(Body::from(r#"{"query_text":"test","response_mode":"preview","preview_chars":0}"#)).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
     fn source_event_time_prefers_explicit_and_reads_structured_metadata() {
         let mut metadata = HashMap::new();
         metadata.insert(
@@ -1963,6 +2019,35 @@
         )
     }
 
+    fn test_router_for_packages(
+        data_dir: &std::path::Path,
+        read_only: bool,
+    ) -> axum::Router {
+        let snapshots = data_dir.join("snapshots");
+        let mt_engine = Arc::new(MultiTenantEngine::with_snapshots_dir(
+            &snapshots,
+            TuningConfig::default(),
+        ));
+        let metrics = Arc::new(MetricsCollector::new());
+        let provider: Arc<dyn crate::jobs::ProjectProvider> = mt_engine.clone();
+        let job_queue = Arc::new(JobQueue::new(provider, Some(metrics.clone()), true));
+        let agent_manager = Arc::new(crate::agent::manager::AgentManager::new(
+            job_queue.clone(),
+            mt_engine.clone(),
+        ));
+        routes(
+            mt_engine,
+            job_queue,
+            metrics,
+            AuthConfig::from_config(&crate::config::SecurityConfig::default()),
+            read_only,
+            data_dir.to_string_lossy().to_string(),
+            None,
+            None,
+            agent_manager,
+        )
+    }
+
     async fn test_router_with_local_backup() -> axum::Router {
         let root = std::env::temp_dir().join(format!("cuemap-api-backup-{}", uuid::Uuid::new_v4()));
         let data_dir = root.join("data");
@@ -2037,7 +2122,21 @@
             .await
             .unwrap();
         assert_eq!(root.status(), StatusCode::OK);
-        assert!(json_body(root).await["capabilities"].as_array().unwrap().len() >= 4);
+        assert!(json_body(root).await["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability == "project_packages_v1"));
+        let root = router
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(json_body(root).await["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability == "project_sync_v1"));
 
         let missing_project = router
             .clone()
@@ -2069,6 +2168,20 @@
             .await
             .unwrap();
         assert_eq!(stored.status(), StatusCode::OK);
+
+        let saved = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/projects/api-test/save")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), StatusCode::OK);
+        assert_eq!(json_body(saved).await["status"], "saved");
         let stored_json = json_body(stored).await;
         let id = stored_json["id"].as_u64().unwrap();
 
@@ -2084,7 +2197,27 @@
             .await
             .unwrap();
         assert_eq!(fetched.status(), StatusCode::OK);
-        assert_eq!(json_body(fetched).await["id"], id);
+        let raw = json_body(fetched).await;
+        assert_eq!(raw["id"], id);
+        assert!(raw["content"].is_array(), "legacy storage response is unchanged");
+
+        let decoded = router.clone().oneshot(
+            Request::builder().uri(format!("/memories/{id}?decoded=true"))
+                .header("X-Project-ID", "api-test").body(Body::empty()).unwrap(),
+        ).await.unwrap();
+        assert_eq!(decoded.status(), StatusCode::OK);
+        let decoded = json_body(decoded).await;
+        assert_eq!(decoded["content"], "hello world");
+        assert_eq!(decoded["memory_id"], id);
+        assert_eq!(decoded["project_id"], "api-test");
+        assert_eq!(decoded["metadata"]["source"], "test");
+        assert!(decoded.get("semantic_vector").is_none());
+
+        let other_project = router.clone().oneshot(
+            Request::builder().uri(format!("/memories/{id}?decoded=true"))
+                .header("X-Project-ID", "different-project").body(Body::empty()).unwrap(),
+        ).await.unwrap();
+        assert_eq!(other_project.status(), StatusCode::NOT_FOUND);
 
         let reinforced_with_cues = router
             .clone()
@@ -2333,6 +2466,326 @@
             .await
             .unwrap();
         assert_eq!(deleted_project.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn routes_cover_project_load_unload_and_demand_reload() {
+        let router = test_router();
+        let project_id = "api-lifecycle";
+
+        let created = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/projects")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"project_id":"{project_id}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        let stored = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories")
+                    .header("content-type", "application/json")
+                    .header("X-Project-ID", project_id)
+                    .body(Body::from(r#"{"content":"reload me","cues":["lifecycle"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored.status(), StatusCode::OK);
+
+        let unloaded = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{project_id}/unload"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unloaded.status(), StatusCode::OK);
+        assert_eq!(json_body(unloaded).await["loaded"], false);
+
+        let listed = router
+            .clone()
+            .oneshot(Request::builder().uri("/projects").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let listed_json = json_body(listed).await;
+        let listed_project = listed_json
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|project| project["project_id"] == project_id)
+            .unwrap();
+        assert_eq!(listed_project["loaded"], false);
+        assert_eq!(listed_project["total_memories"], 1);
+
+        // Recall is a normal project request and should transparently load
+        // the snapshot back into memory.
+        let recalled = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/recall")
+                    .header("content-type", "application/json")
+                    .header("X-Project-ID", project_id)
+                    .body(Body::from(r#"{"cues":["lifecycle"],"limit":5}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recalled.status(), StatusCode::OK);
+        assert_eq!(json_body(recalled).await["results"].as_array().unwrap().len(), 1);
+
+        let explicitly_unloaded = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{project_id}/unload"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(explicitly_unloaded.status(), StatusCode::OK);
+
+        let loaded = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{project_id}/load"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(loaded.status(), StatusCode::OK);
+        assert_eq!(json_body(loaded).await["loaded"], true);
+    }
+
+    #[tokio::test]
+    async fn project_unload_is_forbidden_in_read_only_mode_and_missing_load_is_not_found() {
+        let router = test_router_with_read_only(true);
+
+        let unload = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/projects/api-lifecycle/unload")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unload.status(), StatusCode::FORBIDDEN);
+
+        let save = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/projects/api-lifecycle/save")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(save.status(), StatusCode::FORBIDDEN);
+
+        let load = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/projects/api-lifecycle/load")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(load.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn routes_cover_portable_project_package_round_trip_and_guards() {
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let source_router = test_router_for_packages(source.path(), false);
+
+        let stored = source_router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories")
+                    .header("content-type", "application/json")
+                    .header("X-Project-ID", "api-package")
+                    .body(Body::from(
+                        r#"{"content":"portable API memory","cues":["package-roundtrip"]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored.status(), StatusCode::OK);
+
+        let packed = source_router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/projects/api-package/pack")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(packed.status(), StatusCode::OK);
+        assert_eq!(
+            packed.headers()["content-type"],
+            "application/vnd.cuemap.project"
+        );
+        let package = to_bytes(packed.into_body(), usize::MAX).await.unwrap();
+        assert!(package.starts_with(b"CUEMAP01"));
+
+        let target_router = test_router_for_packages(target.path(), false);
+        let loaded = target_router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/projects/load")
+                    .header("content-type", "application/vnd.cuemap.project")
+                    .body(Body::from(package.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(loaded.status(), StatusCode::OK);
+        assert_eq!(json_body(loaded).await["project_id"], "api-package");
+
+        let duplicate = target_router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/projects/load")
+                    .body(Body::from(package))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+
+        let recalled = target_router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/recall")
+                    .header("content-type", "application/json")
+                    .header("X-Project-ID", "api-package")
+                    .body(Body::from(
+                        r#"{"cues":["package-roundtrip"],"semantic_mode":"lexical"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recalled.status(), StatusCode::OK);
+        assert_eq!(json_body(recalled).await["results"][0]["content"], "portable API memory");
+
+        let invalid_push = target_router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/projects/api-package/push")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"destination":"https://example.test/file"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_push.status(), StatusCode::BAD_REQUEST);
+
+        let invalid_pull = target_router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/projects/pull")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"source":"s3://bucket-only"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_pull.status(), StatusCode::BAD_REQUEST);
+
+        let invalid_sync = target_router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/projects/api-package/sync")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"remote":"https://example.test/sync"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_sync.status(), StatusCode::BAD_REQUEST);
+
+        let read_only_root = tempfile::tempdir().unwrap();
+        let read_only = test_router_for_packages(read_only_root.path(), true);
+        let read_only_pack = read_only
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/projects/api-package/pack")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_only_pack.status(), StatusCode::FORBIDDEN);
+        let read_only_load = read_only
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/projects/load")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_only_load.status(), StatusCode::FORBIDDEN);
+        let read_only_sync = read_only
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/projects/api-package/sync")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"remote":"s3://example-bucket/team"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_only_sync.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -3614,4 +4067,91 @@
             .await
             .unwrap();
         assert_eq!(crawled.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn uploads_cannot_overwrite_or_delete_client_selected_paths() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let victim = sandbox.path().join("sentinel.txt");
+        std::fs::write(&victim, "original sentinel").unwrap();
+        let router = test_router();
+        let absolute = victim.to_string_lossy().to_string();
+        let traversal = format!("../{}/sentinel.txt", sandbox.path().file_name().unwrap().to_string_lossy());
+        let mut names = vec![absolute, traversal];
+        #[cfg(unix)] {
+            let link = sandbox.path().join("link.txt");
+            std::os::unix::fs::symlink(&victim, &link).unwrap();
+            names.push(link.to_string_lossy().to_string());
+        }
+        for filename in names {
+            let body = format!("--probe\r\nContent-Disposition: form-data; name=\"file\"; filename=\"normal.txt\"\r\n\r\nHarmless upload text.\r\n--probe\r\nContent-Disposition: form-data; name=\"filename\"\r\n\r\n{}\r\n--probe--\r\n", filename);
+            let upload = || router.clone().oneshot(Request::builder().method("POST").uri("/ingest/file")
+                .header("Content-Type", "multipart/form-data; boundary=probe")
+                .header("X-Project-ID", "upload-regression")
+                .body(Body::from(body.clone())).unwrap());
+            let (one, two) = tokio::join!(upload(), upload());
+            assert_eq!(one.unwrap().status(), StatusCode::OK);
+            assert_eq!(two.unwrap().status(), StatusCode::OK);
+            assert_eq!(std::fs::read_to_string(&victim).unwrap(), "original sentinel");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_blocks_all_mutating_route_families_before_extraction() {
+        let router = test_router_with_read_only(true);
+        for (method, path) in [
+            ("POST", "/memories"), ("POST", "/memories/batch"),
+            ("PATCH", "/memories/1/reinforce"), ("DELETE", "/memories/1"),
+            ("POST", "/projects"), ("DELETE", "/projects/demo"),
+            ("POST", "/projects/demo/watch-dir"), ("POST", "/projects/demo/artifacts"),
+            ("POST", "/projects/demo/save"),
+            ("POST", "/projects/demo/unload"), ("POST", "/projects/demo/pack"),
+            ("POST", "/projects/demo/push"), ("POST", "/projects/demo/sync"),
+            ("POST", "/projects/load"), ("POST", "/projects/pull"),
+            ("POST", "/aliases"), ("POST", "/aliases/merge"),
+            ("DELETE", "/lexicon/entry/1"), ("POST", "/lexicon/wire"),
+            ("POST", "/ingest/content"), ("POST", "/ingest/file"), ("POST", "/ingest/url"),
+            ("POST", "/backup/upload"), ("POST", "/backup/download"), ("DELETE", "/backup/demo"),
+        ] {
+            let response = router.clone().oneshot(Request::builder().method(method).uri(path)
+                .body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
+        }
+        let health = router.oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(health.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn browser_requests_are_rejected_even_without_json_preflight() {
+        let router = test_router();
+        for origin in ["https://attacker.example", "null", "http://localhost:3000"] {
+            let response = router.clone().oneshot(Request::builder().method("POST").uri("/memories")
+                .header("Origin", origin).header("Content-Type", "text/plain")
+                .body(Body::from("{}")).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        let response = router.oneshot(Request::builder().uri("/projects")
+            .header("Sec-Fetch-Site", "same-origin").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn oversized_uploads_are_rejected() {
+        let response = test_router().oneshot(Request::builder().method("POST").uri("/ingest/file")
+            .header("Content-Type", "multipart/form-data; boundary=probe")
+            .header("Content-Length", (64 * 1024 * 1024 + 1).to_string())
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn streaming_body_limits_reject_payloads_without_content_length() {
+        let payload = vec![b'x'; 1024 * 1024];
+        let stream = futures::stream::iter((0..65).map(move |_| {
+            Ok::<_, std::convert::Infallible>(bytes::Bytes::copy_from_slice(&payload))
+        }));
+        let response = test_router().oneshot(Request::builder().method("POST").uri("/ingest/content")
+            .header("Content-Type", "application/json")
+            .body(Body::from_stream(stream)).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }

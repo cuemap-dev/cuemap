@@ -65,14 +65,21 @@ async function stopChild() {
     new Promise((resolve) => child.once("exit", resolve)),
     new Promise((resolve) => setTimeout(resolve, 5_000)),
   ]);
-  if (child.exitCode === null) child.kill("SIGKILL");
+  if (child.exitCode === null) {
+    const exited = new Promise((resolve) => child.once("exit", resolve));
+    child.kill("SIGKILL");
+    await exited;
+  }
 }
 
 async function main() {
   const port = await findFreePort();
   const baseUrl = `http://127.0.0.1:${port}`;
+  const windows = process.platform === "win32";
+  const spawnExecutable = windows && path.extname(executable).toLowerCase() !== ".exe"
+    ? path.join(path.dirname(executable), "cuemap-native.exe") : executable;
   child = spawn(
-    executable,
+    spawnExecutable,
     [
       "start",
       "--port",
@@ -84,7 +91,10 @@ async function main() {
     ],
     {
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, TOKENIZER_PATH: "" },
+      env: { ...process.env, CUEMAP_HOME: path.join(dataDir, "config"),
+        CUEMAP_HOST: "127.0.0.1", CUEMAP_API_KEY: "",
+        TOKENIZER_PATH: windows
+          ? path.join(path.dirname(path.dirname(spawnExecutable)), "assets", "en_tokenizer.bin") : "" },
     },
   );
   for (const stream of [child.stdout, child.stderr]) {

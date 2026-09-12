@@ -10,7 +10,6 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tower_http::cors::CorsLayer;
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::{self, fmt, prelude::*, Registry};
 
@@ -58,6 +57,43 @@ mod tests {
         format!("http://{address}")
     }
 
+    fn shell_command(command: &str) -> (PathBuf, Vec<String>) {
+        #[cfg(windows)]
+        {
+            let shell = std::env::var_os("COMSPEC")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("cmd.exe"));
+            return (shell, vec!["/C".to_string(), command.to_string()]);
+        }
+
+        #[cfg(not(windows))]
+        {
+            (
+                PathBuf::from("/bin/sh"),
+                vec!["-c".to_string(), command.to_string()],
+            )
+        }
+    }
+
+    fn long_running_command() -> std::process::Command {
+        #[cfg(windows)]
+        {
+            let shell = std::env::var_os("COMSPEC")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("cmd.exe"));
+            let mut command = std::process::Command::new(shell);
+            command.args(["/C", "ping 127.0.0.1 -n 31 > NUL"]);
+            command
+        }
+
+        #[cfg(not(windows))]
+        {
+            let mut command = std::process::Command::new("sleep");
+            command.arg("30");
+            command
+        }
+    }
+
     fn add_args(url: String) -> AddArgs {
         AddArgs {
             content: "cli memory".to_string(),
@@ -79,7 +115,7 @@ mod tests {
             semantic_mode: "lexical".to_string(),
             depth: 1,
             token_budget: 128,
-            port: 8080,
+            port: 8735,
             no_auto_reinforce: false,
             min_intersection: None,
             query_time: None,
@@ -380,12 +416,13 @@ mod tests {
         .is_err());
 
         let spawned_log = root.path().join("spawned.log");
-        let shell_args = vec![
-            "-c".to_string(),
-            "printf 'Unstable sorting for speed\\n'".to_string(),
-        ];
+        let (shell, shell_args) = shell_command(if cfg!(windows) {
+            "echo Unstable sorting for speed"
+        } else {
+            "printf 'Unstable sorting for speed\\n'"
+        });
         assert!(spawn_detached_process(
-            Path::new("/bin/sh"),
+            &shell,
             &shell_args,
             &spawned_log,
             "Unstable sorting for speed",
@@ -394,9 +431,13 @@ mod tests {
         .await
         .unwrap());
 
-        let timeout_args = vec!["-c".to_string(), "true".to_string()];
+        let (shell, timeout_args) = shell_command(if cfg!(windows) {
+            "exit 0"
+        } else {
+            "true"
+        });
         assert!(!spawn_detached_process(
-            Path::new("/bin/sh"),
+            &shell,
             &timeout_args,
             &root.path().join("spawn-timeout.log"),
             "never appears",
@@ -404,8 +445,9 @@ mod tests {
         )
         .await
         .unwrap());
+        let missing_executable = root.path().join("definitely-missing-cuemap-child");
         assert!(spawn_detached_process(
-            Path::new("/definitely/missing/cuemap-child"),
+            &missing_executable,
             &[],
             &root.path().join("spawn-error.log"),
             "ready",
@@ -497,15 +539,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_read_only_ipv6_server_enforces_auth_and_keeps_health_public() {
+        let root = tempfile::tempdir().unwrap();
+        let port = std::net::TcpListener::bind(("::1", 0)).unwrap().local_addr().unwrap().port();
+        let mut config = config::ServerConfig::default();
+        config.server.host = "::1".into();
+        config.server.port = port;
+        config.server.read_only = true;
+        config.server.data_dir = root.path().join("data").to_string_lossy().into();
+        config.security.api_keys = vec!["test-key".into()];
+        config.security.allowed_origins = vec!["https://trusted.example".into()];
+        config.semantic.encoder_enabled = false;
+        config.semantic.enabled = false;
+        let task = tokio::spawn(run_server_with_pid_path(config, None, true, root.path().join("pid")));
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let url = format!("http://[::1]:{port}");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while client.get(format!("{url}/healthz")).send().await.is_err() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.unwrap();
+        assert_eq!(client.get(format!("{url}/healthz")).send().await.unwrap().status(), 204);
+        assert_eq!(client.get(format!("{url}/")).send().await.unwrap().status(), 401);
+        let trusted = client.get(format!("{url}/")).header("X-API-Key", "test-key")
+            .header("Origin", "https://trusted.example").send().await.unwrap();
+        assert_eq!(trusted.status(), 200);
+        assert_eq!(trusted.headers()["access-control-allow-origin"], "https://trusted.example");
+        assert_eq!(client.post(format!("{url}/memories")).header("X-API-Key", "test-key")
+            .json(&serde_json::json!({"content": "must not persist"})).send().await.unwrap().status(), 403);
+        assert!(!root.path().join("data/snapshots").exists());
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
     async fn stop_handler_covers_missing_success_and_failed_pid_paths() {
         let root = tempfile::tempdir().unwrap();
         let missing_path = root.path().join("missing.pid");
         handle_stop_at(missing_path).await;
 
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
+        let mut child = long_running_command().spawn().unwrap();
         let pid_path = root.path().join("running.pid");
         std::fs::write(&pid_path, child.id().to_string()).unwrap();
         handle_stop_at(pid_path.clone()).await;
@@ -1167,7 +1240,7 @@ mod tests {
         match cli.command {
             Commands::Ingest(IngestArgs {
                 type_: IngestType::File { url, .. },
-            }) => assert_eq!(url, "http://localhost:8080"),
+            }) => assert_eq!(url, "http://localhost:8735"),
             _ => panic!("expected file ingest command"),
         }
 
@@ -1176,7 +1249,7 @@ mod tests {
         match cli.command {
             Commands::Ingest(IngestArgs {
                 type_: IngestType::Url { server_url, .. },
-            }) => assert_eq!(server_url, "http://localhost:8080"),
+            }) => assert_eq!(server_url, "http://localhost:8735"),
             _ => panic!("expected URL ingest command"),
         }
 
@@ -1184,9 +1257,83 @@ mod tests {
         match cli.command {
             Commands::Lexicon(LexiconArgs {
                 cmd: LexiconCmd::Inspect { url, .. },
-            }) => assert_eq!(url, "http://localhost:8080"),
+            }) => assert_eq!(url, "http://localhost:8735"),
             _ => panic!("expected lexicon inspect command"),
         }
+    }
+
+    #[test]
+    fn cli_project_package_commands_and_alias_parse() {
+        let cli = Cli::try_parse_from([
+            "cuemap",
+            "project",
+            "pack",
+            "demo-project",
+            "--offline",
+            "--output",
+            "demo.cuemap",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Projects(ProjectArgs {
+                cmd:
+                    ProjectCmd::Pack {
+                        project,
+                        output,
+                        offline,
+                        ..
+                    },
+            }) => {
+                assert_eq!(project, "demo-project");
+                assert_eq!(output, Some(PathBuf::from("demo.cuemap")));
+                assert!(offline);
+            }
+            _ => panic!("expected project pack command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "cuemap",
+            "projects",
+            "pull",
+            "s3://example-bucket/demo.cuemap",
+            "--data-dir",
+            "/tmp/cuemap-package-test",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Projects(ProjectArgs {
+                cmd: ProjectCmd::Pull { .. }
+            })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "cuemap",
+            "project",
+            "sync",
+            "demo-project",
+            "s3://example-bucket/team",
+            "--offline",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Projects(ProjectArgs {
+                cmd: ProjectCmd::Sync {
+                    project,
+                    remote,
+                    offline: true,
+                    ..
+                }
+            }) if project == "demo-project" && remote == "s3://example-bucket/team"
+        ));
+
+        assert_eq!(
+            project_package::s3_destination("s3://example-bucket/team/", "demo-project").unwrap(),
+            "s3://example-bucket/team/demo-project.cuemap"
+        );
+        assert!(project_package::validate_s3_uri("https://example.com/file", false).is_err());
+        assert!(project_package::validate_s3_uri("s3://example-bucket", false).is_err());
     }
 }
 
@@ -1213,7 +1360,8 @@ enum Commands {
     /// Manage individual memories (get/reinforce/delete)
     Memories(MemoriesArgs),
 
-    /// Manage projects
+    /// Manage projects and portable project packages
+    #[command(name = "project", visible_alias = "projects")]
     Projects(ProjectArgs),
 
     /// Set default project for CLI commands
@@ -1229,7 +1377,7 @@ enum Commands {
 #[derive(Parser, Debug)]
 struct StopArgs {
     /// Server URL (to find the PID via local config if possible)
-    #[arg(long, default_value = "http://localhost:8080")]
+    #[arg(long, default_value = "http://localhost:8735")]
     url: String,
 }
 
@@ -1264,7 +1412,7 @@ struct StatusArgs {
     #[arg(long)]
     json: bool,
     /// Server URL
-    #[arg(long, default_value = "http://localhost:8080")]
+    #[arg(long, default_value = "http://localhost:8735")]
     url: String,
 }
 
@@ -1376,7 +1524,7 @@ struct AddArgs {
     #[arg(long)]
     async_ingest: bool,
     /// Server URL
-    #[arg(long, default_value = "http://localhost:8080")]
+    #[arg(long, default_value = "http://localhost:8735")]
     url: String,
 }
 
@@ -1421,7 +1569,7 @@ enum IngestType {
         #[arg(long)]
         segment_max_chunk_chars: Option<usize>,
         /// Server URL
-        #[arg(long, default_value = "http://localhost:8080")]
+        #[arg(long, default_value = "http://localhost:8735")]
         url: String,
     },
     /// Ingest a file
@@ -1430,7 +1578,7 @@ enum IngestType {
         #[arg(short, long)]
         project: Option<String>,
         /// Server URL
-        #[arg(long, default_value = "http://localhost:8080")]
+        #[arg(long, default_value = "http://localhost:8735")]
         url: String,
     },
     /// Ingest a URL
@@ -1445,7 +1593,7 @@ enum IngestType {
         #[arg(long, default_value = "true")]
         same_domain_only: bool,
         /// Server URL
-        #[arg(long, default_value = "http://localhost:8080")]
+        #[arg(long, default_value = "http://localhost:8735")]
         server_url: String,
     },
 }
@@ -1474,7 +1622,7 @@ struct RecallArgs {
     token_budget: u32,
 
     /// Server port (overrides config)
-    #[arg(long, default_value = "8080")]
+    #[arg(long, default_value = "8735")]
     pub port: u16,
     /// Disable automatic reinforcement during recall
     #[arg(long)]
@@ -1543,7 +1691,7 @@ struct RecallArgs {
     #[arg(long)]
     trace_timing: bool,
     /// Server URL
-    #[arg(long, default_value = "http://localhost:8080")]
+    #[arg(long, default_value = "http://localhost:8735")]
     url: String,
 
     /// Enable web recall mode
@@ -1573,7 +1721,7 @@ enum LexiconCmd {
         #[arg(short, long)]
         project: Option<String>,
         /// Server URL
-        #[arg(long, default_value = "http://localhost:8080")]
+        #[arg(long, default_value = "http://localhost:8735")]
         url: String,
     },
 }
@@ -1600,7 +1748,7 @@ struct MemoriesArgs {
     project: Option<String>,
 
     /// Server URL
-    #[arg(long, default_value = "http://localhost:8080")]
+    #[arg(long, default_value = "http://localhost:8735")]
     url: String,
 }
 
@@ -1618,7 +1766,7 @@ struct AliasArgs {
     #[arg(short, long)]
     weight: Option<f64>,
     /// Server URL
-    #[arg(long, default_value = "http://localhost:8080")]
+    #[arg(long, default_value = "http://localhost:8735")]
     url: String,
 }
 
@@ -1632,14 +1780,14 @@ struct ProjectArgs {
 enum ProjectCmd {
     /// List all projects
     List {
-        #[arg(long, default_value = "http://localhost:8080")]
+        #[arg(long, default_value = "http://localhost:8735")]
         url: String,
     },
     /// Create a new project
     Create {
         #[arg(short, long)]
         name: String,
-        #[arg(long, default_value = "http://localhost:8080")]
+        #[arg(long, default_value = "http://localhost:8735")]
         url: String,
     },
     /// Set watch directory for a project
@@ -1648,8 +1796,88 @@ enum ProjectCmd {
         project: String,
         /// Path to watch directory
         path: String,
-        #[arg(long, default_value = "http://localhost:8080")]
+        #[arg(long, default_value = "http://localhost:8735")]
         url: String,
+    },
+    /// Package a saved project index as a portable .cuemap file
+    Pack {
+        /// Project ID to package
+        project: String,
+        /// Output path (defaults to <project>.cuemap)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// CueMap data directory (defaults to configured data directory)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Server URL used to flush a current snapshot before packaging
+        #[arg(long, default_value = "http://localhost:8735")]
+        url: String,
+        /// Package the existing on-disk snapshot without contacting the server
+        #[arg(long)]
+        offline: bool,
+        /// Replace an existing output file
+        #[arg(long)]
+        force: bool,
+    },
+    /// Install a portable .cuemap package into the local data directory
+    Load {
+        /// Package path
+        package: PathBuf,
+        /// CueMap data directory (defaults to configured data directory)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Running server to warm after installing a new project
+        #[arg(long, default_value = "http://localhost:8735")]
+        url: String,
+        /// Replace an existing offline project
+        #[arg(long)]
+        force: bool,
+    },
+    /// Package a project and upload it with the configured AWS CLI
+    Push {
+        /// Project ID to package
+        project: String,
+        /// S3 object or prefix, for example s3://bucket/team/
+        destination: String,
+        /// CueMap data directory (defaults to configured data directory)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Server URL used to flush a current snapshot before packaging
+        #[arg(long, default_value = "http://localhost:8735")]
+        url: String,
+        /// Package the existing on-disk snapshot without contacting the server
+        #[arg(long)]
+        offline: bool,
+    },
+    /// Download a .cuemap package with the configured AWS CLI and install it
+    Pull {
+        /// S3 object URI, for example s3://bucket/team/project.cuemap
+        source: String,
+        /// CueMap data directory (defaults to configured data directory)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Running server to warm after installing a new project
+        #[arg(long, default_value = "http://localhost:8735")]
+        url: String,
+        /// Replace an existing offline project
+        #[arg(long)]
+        force: bool,
+    },
+    /// Fast-forward a project through immutable package history on S3
+    Sync {
+        /// Project ID to synchronize
+        project: String,
+        /// S3 sync root, for example s3://bucket/team
+        remote: String,
+        /// CueMap data directory (used with --offline)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Running CueMap server
+        #[arg(long, default_value = "http://localhost:8735")]
+        url: String,
+        /// Synchronize the saved on-disk project without contacting a server
+        #[arg(long)]
+        offline: bool,
     },
 }
 
@@ -1853,11 +2081,24 @@ async fn run_server(config: config::ServerConfig, load_static: Option<String>, _
 }
 
 async fn run_server_with_pid_path(
-    config: config::ServerConfig,
+    mut config: config::ServerConfig,
     load_static: Option<String>,
     _is_child: bool,
     pid_path: PathBuf,
 ) {
+    let read_only = load_static.is_some() || config.server.read_only;
+    if read_only {
+        config.server.read_only = true;
+        config.persistence.enabled = false;
+        config.jobs.background_processing = false;
+    }
+    let ip = match config.server.host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip,
+        Err(error) => {
+            eprintln!("Invalid server.host {:?}: {}", config.server.host, error);
+            return;
+        }
+    };
     // Extract commonly used configs
     let server_config = &config.server;
     let auth_config_struct = &config.security;
@@ -1950,14 +2191,32 @@ async fn run_server_with_pid_path(
     }
 
     // Setup shutdown handler
-    if !is_static {
+    if !read_only {
         if config.persistence.enabled {
             setup_multi_tenant_shutdown_handler(mt_engine.clone()).await;
             mt_engine.start_periodic_snapshots(Duration::from_secs(
                 config.persistence.snapshot_interval_seconds,
             ));
+            if config.project_lifecycle.inactivity_timeout_seconds > 0
+                && config.project_lifecycle.unload_check_interval_seconds > 0
+            {
+                info!(
+                    "Project auto-unloading enabled: inactive after {}s, checked every {}s",
+                    config.project_lifecycle.inactivity_timeout_seconds,
+                    config.project_lifecycle.unload_check_interval_seconds
+                );
+                mt_engine.start_project_unloader(
+                    Duration::from_secs(
+                        config.project_lifecycle.unload_check_interval_seconds,
+                    ),
+                    Duration::from_secs(config.project_lifecycle.inactivity_timeout_seconds),
+                );
+            } else {
+                info!("Project auto-unloading disabled by configuration");
+            }
         } else {
             warn!("Periodic snapshots and shutdown save are DISABLED.");
+            warn!("Project auto-unloading is disabled because persistence is disabled.");
         }
     }
 
@@ -1982,7 +2241,7 @@ async fn run_server_with_pid_path(
     // Auto-start agents for projects with watch directories configured
     for proj_stats in mt_engine.list_projects() {
         if let Ok(meta) = mt_engine.load_project_meta(&proj_stats.project_id) {
-            if meta.agent_enabled {
+            if !read_only && meta.agent_enabled {
                 if let Some(watch_dir) = meta.watch_dir {
                     let agent_config = agent::AgentConfig {
                         project_id: meta.project_id.clone(),
@@ -2033,15 +2292,14 @@ async fn run_server_with_pid_path(
             job_queue,
             metrics,
             auth_config,
-            is_static,
+            read_only,
             server_config.data_dir.clone(),
             cloud_backup,
             context_signer,
             agent_manager.clone(),
-        ))
-        .layer(CorsLayer::permissive());
+        ));
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], server_config.port));
+    let addr = SocketAddr::new(ip, server_config.port);
     info!("Server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
@@ -2415,6 +2673,8 @@ async fn handle_recall(args: RecallArgs) {
         }
     } else {
         let payload = api::RecallRequest {
+            response_mode: api::RecallResponseMode::Full,
+            preview_chars: 200,
             cues: args.cues,
             query_text: Some(args.query),
             query_embedding: None,
@@ -2670,6 +2930,324 @@ async fn handle_projects(args: ProjectArgs) {
                 Err(e) => eprintln!("✗ Failed: {}", e),
             }
         }
+        ProjectCmd::Pack {
+            project,
+            output,
+            data_dir,
+            url,
+            offline,
+            force,
+        } => {
+            let output = output.unwrap_or_else(|| PathBuf::from(format!("{project}.cuemap")));
+            match prepare_project_package(
+                &client,
+                &project,
+                &output,
+                data_dir,
+                &url,
+                offline,
+                force,
+            )
+            .await
+            {
+                Ok(summary) => println!(
+                    "✓ Packed project '{}' into {} ({} files, {})",
+                    summary.project_id,
+                    summary.path.display(),
+                    summary.file_count,
+                    human_bytes(summary.size_bytes)
+                ),
+                Err(error) => eprintln!("✗ Failed to pack project: {error}"),
+            }
+        }
+        ProjectCmd::Load {
+            package,
+            data_dir,
+            url,
+            force,
+        } => match install_project_package(&client, &package, data_dir, &url, force).await {
+            Ok(summary) => println!(
+                "✓ Loaded project '{}' from {} ({} files, {})",
+                summary.project_id,
+                summary.path.display(),
+                summary.file_count,
+                human_bytes(summary.size_bytes)
+            ),
+            Err(error) => eprintln!("✗ Failed to load package: {error}"),
+        },
+        ProjectCmd::Push {
+            project,
+            destination,
+            data_dir,
+            url,
+            offline,
+        } => {
+            let destination = match project_package::s3_destination(&destination, &project) {
+                Ok(destination) => destination,
+                Err(error) => {
+                    eprintln!("✗ Failed to push project: {error}");
+                    return;
+                }
+            };
+            let temp = std::env::temp_dir().join(format!(
+                "cuemap-push-{}-{}.cuemap",
+                project,
+                uuid::Uuid::new_v4()
+            ));
+            let result = async {
+                let summary = prepare_project_package(
+                    &client,
+                    &project,
+                    &temp,
+                    data_dir,
+                    &url,
+                    offline,
+                    false,
+                )
+                .await?;
+                project_package::upload_s3(&temp, &destination)?;
+                Ok::<_, String>(summary)
+            }
+            .await;
+            let _ = std::fs::remove_file(&temp);
+            match result {
+                Ok(summary) => println!(
+                    "✓ Pushed project '{}' to {} ({})",
+                    summary.project_id,
+                    destination,
+                    human_bytes(summary.size_bytes)
+                ),
+                Err(error) => eprintln!("✗ Failed to push project: {error}"),
+            }
+        }
+        ProjectCmd::Pull {
+            source,
+            data_dir,
+            url,
+            force,
+        } => {
+            if let Err(error) = project_package::validate_s3_uri(&source, false) {
+                eprintln!("✗ Failed to pull project: {error}");
+                return;
+            }
+            let temp = std::env::temp_dir().join(format!(
+                "cuemap-pull-{}.cuemap",
+                uuid::Uuid::new_v4()
+            ));
+            let result = async {
+                project_package::download_s3(&source, &temp)?;
+                install_project_package(&client, &temp, data_dir, &url, force).await
+            }
+            .await;
+            let _ = std::fs::remove_file(&temp);
+            match result {
+                Ok(summary) => println!(
+                    "✓ Pulled and loaded project '{}' from {} ({} files, {})",
+                    summary.project_id,
+                    source,
+                    summary.file_count,
+                    human_bytes(summary.size_bytes)
+                ),
+                Err(error) => eprintln!("✗ Failed to pull project: {error}"),
+            }
+        }
+        ProjectCmd::Sync {
+            project,
+            remote,
+            data_dir,
+            url,
+            offline,
+        } => {
+            if offline {
+                let data_dir = match configured_project_data_dir(data_dir) {
+                    Ok(data_dir) => data_dir,
+                    Err(error) => {
+                        eprintln!("✗ Failed to sync project: {error}");
+                        return;
+                    }
+                };
+                match project_sync::sync_project(&data_dir, &project, &remote, true).await {
+                    Ok(project_sync::SyncRun::Complete(result)) => print_sync_result(&result),
+                    Ok(project_sync::SyncRun::PullRequired(_)) => {
+                        eprintln!("✗ Failed to sync project: offline pull was not applied")
+                    }
+                    Err(error) => eprintln!("✗ Failed to sync project: {error}"),
+                }
+            } else {
+                let response = client
+                    .post(format!("{url}/projects/{project}/sync"))
+                    .json(&serde_json::json!({ "remote": remote }))
+                    .send()
+                    .await;
+                match response {
+                    Ok(response) if response.status().is_success() => {
+                        match response.json::<project_sync::SyncResult>().await {
+                            Ok(result) => print_sync_result(&result),
+                            Err(error) => eprintln!("✗ Invalid sync response: {error}"),
+                        }
+                    }
+                    Ok(response) => {
+                        let status = response.status();
+                        let body = response.text().await.unwrap_or_default();
+                        eprintln!("✗ Failed to sync project (HTTP {status}): {body}");
+                    }
+                    Err(error) => eprintln!("✗ Failed to sync project: {error}"),
+                }
+            }
+        }
+    }
+}
+
+fn print_sync_result(result: &project_sync::SyncResult) {
+    let action = match &result.action {
+        project_sync::SyncAction::Pushed => "pushed",
+        project_sync::SyncAction::Pulled => "pulled",
+        project_sync::SyncAction::UpToDate => "up to date",
+        project_sync::SyncAction::Adopted => "adopted existing remote state",
+    };
+    println!(
+        "✓ Project '{}' {} at generation {} ({})",
+        result.project_id,
+        action,
+        result.generation,
+        &result.commit_sha256[..12]
+    );
+}
+
+async fn prepare_project_package(
+    client: &reqwest::Client,
+    project: &str,
+    output: &Path,
+    data_dir: Option<PathBuf>,
+    url: &str,
+    offline: bool,
+    force: bool,
+) -> Result<project_package::ProjectPackageSummary, String> {
+    if !multi_tenant::validate_project_id(project) {
+        return Err(format!(
+            "Invalid project ID '{project}'; use 3-64 letters, numbers, '-' or '_'"
+        ));
+    }
+    if !offline {
+        flush_project_snapshot(client, project, url).await?;
+    }
+    let data_dir = configured_project_data_dir(data_dir)?;
+    project_package::pack_project(&data_dir, project, output, force)
+}
+
+async fn flush_project_snapshot(
+    client: &reqwest::Client,
+    project: &str,
+    url: &str,
+) -> Result<(), String> {
+    let response = client
+        .post(format!("{url}/projects/{project}/save"))
+        .send()
+        .await
+        .map_err(|error| {
+            format!(
+                "Could not ask the server to save the project: {error}. If the server is stopped and the snapshot is current, retry with --offline"
+            )
+        })?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    Err(format!("Server snapshot save failed with HTTP {status}: {body}"))
+}
+
+async fn install_project_package(
+    client: &reqwest::Client,
+    package: &Path,
+    data_dir: Option<PathBuf>,
+    url: &str,
+    force: bool,
+) -> Result<project_package::ProjectPackageSummary, String> {
+    let manifest = project_package::inspect_project_package(package)?;
+    let server_has_project = server_project_state(client, url, &manifest.project_id).await;
+    if force && server_has_project.is_some() {
+        return Err(format!(
+            "Refusing to replace project '{}' while a server is reachable at {}. Stop that server and retry, or load into a clean data directory",
+            manifest.project_id, url
+        ));
+    }
+    if matches!(server_has_project, Some(true)) {
+        return Err(format!(
+            "Project '{}' already exists in the running server",
+            manifest.project_id
+        ));
+    }
+
+    let data_dir = configured_project_data_dir(data_dir)?;
+    let summary = project_package::load_project_package(&data_dir, package, force)?;
+
+    if server_has_project == Some(false) {
+        let response = client
+            .post(format!("{url}/projects/{}/load", summary.project_id))
+            .send()
+            .await;
+        match response {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                return Err(format!(
+                    "Package was installed, but the running server could not load it (HTTP {status}: {body}). Restart the server with --data-dir {}",
+                    data_dir.display()
+                ));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Package was installed, but the running server could not load it: {error}"
+                ));
+            }
+        }
+    }
+    Ok(summary)
+}
+
+/// `Some(true)` means the server knows this project, `Some(false)` means a
+/// server is reachable but the project is new, and `None` means no server was
+/// reachable. Authentication failures count as a reachable server so forceful
+/// replacement is still refused.
+async fn server_project_state(
+    client: &reqwest::Client,
+    url: &str,
+    project: &str,
+) -> Option<bool> {
+    let response = client.get(format!("{url}/projects")).send().await.ok()?;
+    if !response.status().is_success() {
+        return Some(false);
+    }
+    let projects: Vec<serde_json::Value> = response.json().await.ok()?;
+    Some(projects.iter().any(|value| {
+        value.get("project_id").and_then(|id| id.as_str()) == Some(project)
+    }))
+}
+
+fn configured_project_data_dir(explicit: Option<PathBuf>) -> Result<PathBuf, String> {
+    if let Some(path) = explicit {
+        return Ok(path);
+    }
+    config::ServerConfig::load(None, None)
+        .map(|config| PathBuf::from(config.server.data_dir))
+        .map_err(|error| format!("Failed to resolve CueMap data directory: {error}"))
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes_f = bytes as f64;
+    if bytes_f >= GIB {
+        format!("{:.2} GiB", bytes_f / GIB)
+    } else if bytes_f >= MIB {
+        format!("{:.2} MiB", bytes_f / MIB)
+    } else if bytes_f >= KIB {
+        format!("{:.2} KiB", bytes_f / KIB)
+    } else {
+        format!("{bytes} B")
     }
 }
 
@@ -2977,6 +3555,7 @@ async fn handle_stop_at(pid_path: PathBuf) {
         use std::process::Command;
         let res = Command::new("taskkill")
             .arg("/F")
+            .arg("/T")
             .arg("/PID")
             .arg(pid.to_string())
             .status();

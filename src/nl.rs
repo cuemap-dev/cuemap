@@ -201,6 +201,15 @@ static GO_KEYWORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
 static JS_KEYWORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
 static PHP_KEYWORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
 static JAVA_KEYWORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
+static SWIFT_KEYWORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
+static DART_KEYWORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
+static OBJC_KEYWORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
+static KOTLIN_KEYWORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
+static C_KEYWORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
+static CPP_KEYWORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
+static CSHARP_KEYWORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
+static BASH_KEYWORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
+static TOML_KEYWORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Language {
@@ -212,6 +221,15 @@ pub enum Language {
     Go,
     Php,
     Java,
+    Swift,
+    Dart,
+    ObjectiveC,
+    Kotlin,
+    C,
+    Cpp,
+    CSharp,
+    Bash,
+    Toml,
     Css,
     Html,
 }
@@ -226,6 +244,15 @@ impl From<&str> for Language {
             "lang:go" => Language::Go,
             "lang:php" => Language::Php,
             "lang:java" => Language::Java,
+            "lang:swift" => Language::Swift,
+            "lang:dart" => Language::Dart,
+            "lang:objc" => Language::ObjectiveC,
+            "lang:kotlin" => Language::Kotlin,
+            "lang:c" => Language::C,
+            "lang:cpp" => Language::Cpp,
+            "lang:csharp" => Language::CSharp,
+            "lang:bash" => Language::Bash,
+            "lang:toml" => Language::Toml,
             "lang:css" => Language::Css,
             "lang:html" => Language::Html,
             _ => Language::Default,
@@ -783,6 +810,115 @@ pub fn get_language_stopwords(lang: Language) -> &'static HashSet<&'static str> 
             .into_iter()
             .collect()
         }),
+        Language::Swift => SWIFT_KEYWORDS.get_or_init(|| {
+            [
+                "associatedtype", "class", "deinit", "enum", "extension", "fileprivate",
+                "func", "import", "init", "inout", "internal", "let", "open", "operator",
+                "private", "protocol", "public", "static", "struct", "subscript", "typealias",
+                "var", "break", "case", "continue", "default", "defer", "do", "else",
+                "fallthrough", "for", "guard", "if", "in", "repeat", "return", "switch",
+                "where", "while", "as", "catch", "false", "is", "nil", "rethrows", "super",
+                "self", "throw", "throws", "true", "try", "weak", "unowned", "override",
+            ]
+            .into_iter()
+            .collect()
+        }),
+        Language::Dart => DART_KEYWORDS.get_or_init(|| {
+            [
+                "abstract", "as", "assert", "async", "await", "break", "case", "catch",
+                "class", "const", "continue", "covariant", "default", "deferred", "do",
+                "dynamic", "else", "enum", "export", "extends", "extension", "external",
+                "factory", "false", "final", "finally", "for", "function", "get", "hide",
+                "if", "implements", "import", "in", "interface", "is", "late", "library",
+                "mixin", "new", "null", "on", "operator", "part", "required", "rethrow",
+                "return", "set", "show", "static", "super", "switch", "sync", "this", "throw",
+                "true", "try", "typedef", "var", "void", "while", "with", "yield",
+            ]
+            .into_iter()
+            .collect()
+        }),
+        Language::ObjectiveC => OBJC_KEYWORDS.get_or_init(|| {
+            [
+                "auto", "break", "case", "char", "const", "continue", "default", "do",
+                "double", "else", "enum", "extern", "float", "for", "goto", "if", "inline",
+                "int", "long", "register", "restrict", "return", "short", "signed", "sizeof",
+                "static", "struct", "switch", "typedef", "union", "unsigned", "void",
+                "volatile", "while", "class", "interface", "implementation", "protocol",
+                "property", "synthesize", "dynamic", "selector", "encode", "end", "import",
+                "include", "define", "ifdef", "ifndef", "endif", "elif",
+            ]
+            .into_iter()
+            .collect()
+        }),
+        Language::Kotlin => KOTLIN_KEYWORDS.get_or_init(|| {
+            [
+                "as", "break", "class", "continue", "do", "else", "false", "for", "fun",
+                "if", "in", "interface", "is", "null", "object", "package", "return", "super",
+                "this", "throw", "true", "try", "typealias", "typeof", "val", "var", "when",
+                "while", "by", "catch", "constructor", "delegate", "dynamic", "field", "file",
+                "finally", "get", "import", "init", "param", "property", "receiver", "set",
+                "setparam", "where", "actual", "abstract", "annotation", "companion", "const",
+                "crossinline", "data", "enum", "expect", "external", "final", "infix", "inline",
+                "inner", "internal", "lateinit", "noinline", "open", "operator", "out", "override",
+                "private", "protected", "public", "reified", "sealed", "suspend", "tailrec", "vararg",
+            ]
+            .into_iter()
+            .collect()
+        }),
+        Language::C => C_KEYWORDS.get_or_init(|| {
+            [
+                "auto", "break", "case", "char", "const", "continue", "default", "do",
+                "double", "else", "enum", "extern", "float", "for", "goto", "if", "inline",
+                "int", "long", "register", "restrict", "return", "short", "signed", "sizeof",
+                "static", "struct", "switch", "typedef", "union", "unsigned", "void",
+                "volatile", "while",
+            ]
+            .into_iter()
+            .collect()
+        }),
+        Language::Cpp => CPP_KEYWORDS.get_or_init(|| {
+            [
+                "alignas", "alignof", "and", "asm", "auto", "bitand", "bitor", "bool",
+                "break", "case", "catch", "char", "class", "compl", "concept", "const",
+                "consteval", "constexpr", "constinit", "const_cast", "continue", "decltype",
+                "default", "delete", "do", "double", "dynamic_cast", "else", "enum", "explicit",
+                "export", "extern", "false", "final", "float", "for", "friend", "goto", "if",
+                "inline", "int", "mutable", "namespace", "new", "noexcept", "not", "nullptr",
+                "operator", "or", "private", "protected", "public", "register", "reinterpret_cast",
+                "requires", "return", "short", "signed", "sizeof", "static", "static_assert",
+                "static_cast", "struct", "switch", "template", "this", "thread_local", "throw",
+                "true", "try", "typedef", "typeid", "typename", "union", "unsigned", "using",
+                "virtual", "void", "volatile", "wchar_t", "while", "xor",
+            ]
+            .into_iter()
+            .collect()
+        }),
+        Language::CSharp => CSHARP_KEYWORDS.get_or_init(|| {
+            [
+                "abstract", "as", "async", "await", "base", "bool", "break", "byte", "case",
+                "catch", "char", "checked", "class", "const", "continue", "decimal", "default",
+                "delegate", "do", "double", "else", "enum", "event", "explicit", "extern", "false",
+                "finally", "fixed", "float", "for", "foreach", "goto", "if", "implicit", "in",
+                "int", "interface", "internal", "is", "lock", "long", "namespace", "new", "null",
+                "object", "operator", "out", "override", "params", "private", "protected", "public",
+                "readonly", "ref", "return", "sbyte", "sealed", "short", "sizeof", "stackalloc",
+                "static", "string", "struct", "switch", "this", "throw", "true", "try", "typeof",
+                "uint", "ulong", "unchecked", "unsafe", "ushort", "using", "virtual", "void",
+                "volatile", "while", "var",
+            ]
+            .into_iter()
+            .collect()
+        }),
+        Language::Bash => BASH_KEYWORDS.get_or_init(|| {
+            [
+                "break", "case", "coproc", "continue", "do", "done", "elif", "else", "esac",
+                "export", "fi", "for", "function", "if", "in", "local", "readonly", "return",
+                "select", "set", "then", "time", "typeset", "until", "unset", "while",
+            ]
+            .into_iter()
+            .collect()
+        }),
+        Language::Toml => TOML_KEYWORDS.get_or_init(|| ["true", "false"].into_iter().collect()),
         _ => get_stopwords(), // Fallback to normal stopwords
     }
 }

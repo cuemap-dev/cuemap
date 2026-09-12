@@ -26,6 +26,32 @@ fn test_yaml_chunking() {
 }
 
 #[test]
+fn test_toml_chunking() {
+    let content = r#"
+title = "CueMap"
+
+[package]
+name = "cuemap"
+version = "0.7.3"
+
+[[bin]]
+name = "cuemap"
+path = "src/main.rs"
+"#;
+    let chunks = Chunker::chunk_file(std::path::Path::new("Cargo.toml"), content);
+
+    assert!(!chunks.is_empty());
+    assert!(chunks.iter().any(|chunk| {
+        chunk.category == ChunkCategory::Structured
+            && chunk.structural_cues.contains(&"lang:toml".to_string())
+            && chunk.context == "table:package"
+    }));
+    assert!(chunks
+        .iter()
+        .any(|chunk| chunk.context == "table_array_element:bin"));
+}
+
+#[test]
 fn test_html_chunking() {
     let content = "<html><body><h1>Test</h1></body></html>";
     let chunks = Chunker::chunk_html(content);
@@ -66,6 +92,92 @@ fn test_css_chunking() {
 }
 
 #[test]
+fn mainstream_tree_sitter_languages_emit_structural_cues() {
+    let cases = [
+        (
+            "point.c",
+            "#include <stdio.h>\nstruct Point { int x; };\nint distance(struct Point point) { printf(\"%d\", point.x); return point.x; }",
+            "lang:c",
+            "defines_function:distance",
+        ),
+        (
+            "engine.cpp",
+            "#include <vector>\nnamespace cuemap { class Engine { public: void run() {} }; }",
+            "lang:cpp",
+            "defines_namespace:cuemap",
+        ),
+        (
+            "Engine.cs",
+            "using System;\nnamespace CueMap { public class Engine { public void Run() { Console.WriteLine(\"ok\"); } } }",
+            "lang:csharp",
+            "defines_class:Engine",
+        ),
+        (
+            "build.sh",
+            "#!/usr/bin/env bash\nset -euo pipefail\ngreet() { echo \"hello\"; }\ngreet",
+            "lang:bash",
+            "defines_function:greet",
+        ),
+    ];
+
+    for (filename, content, lang, semantic_cue) in cases {
+        let chunks = Chunker::chunk_file(std::path::Path::new(filename), content);
+        assert!(!chunks.is_empty(), "Failed to chunk {filename}");
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.structural_cues.contains(&lang.to_string())),
+            "{filename} missing language cue: {chunks:?}"
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.structural_cues.contains(&semantic_cue.to_string())),
+            "{filename} missing semantic cue: {chunks:?}"
+        );
+    }
+}
+
+#[test]
+fn headers_use_project_and_content_context_for_classification() {
+    use tempfile::tempdir;
+
+    let plain_header = PathBuf::from("include/config.h");
+    assert_eq!(
+        Chunker::detect_type(&plain_header),
+        Some(cuemap::agent::chunker::ChunkerType::C)
+    );
+
+    let cpp_header = Chunker::chunk_file(
+        std::path::Path::new("include/engine.h"),
+        "#pragma once\nnamespace cuemap { class Engine { public: void run(); }; }",
+    );
+    assert!(cpp_header
+        .iter()
+        .any(|chunk| chunk.structural_cues.contains(&"lang:cpp".to_string())));
+
+    let apple_root = tempdir().unwrap();
+    std::fs::create_dir(apple_root.path().join("CueMap.xcodeproj")).unwrap();
+    std::fs::write(
+        apple_root.path().join("CueMap.xcodeproj/project.pbxproj"),
+        "// !$*UTF8*$!",
+    )
+    .unwrap();
+    let apple_header = apple_root.path().join("Engine.h");
+    assert_eq!(
+        Chunker::detect_type(&apple_header),
+        Some(cuemap::agent::chunker::ChunkerType::ObjectiveC)
+    );
+    let apple_chunks = Chunker::chunk_file(
+        &apple_header,
+        "#import <Foundation/Foundation.h>\n@interface Engine : NSObject\n@end",
+    );
+    assert!(apple_chunks
+        .iter()
+        .any(|chunk| chunk.structural_cues.contains(&"lang:objc".to_string())));
+}
+
+#[test]
 fn test_detect_type() {
     use cuemap::agent::chunker::ChunkerType;
 
@@ -85,6 +197,105 @@ fn test_detect_type() {
         Chunker::detect_type(&PathBuf::from("test.docx")),
         Some(ChunkerType::Office)
     );
+    assert_eq!(
+        Chunker::detect_type(&PathBuf::from("ViewController.SWIFT")),
+        Some(ChunkerType::Swift)
+    );
+    assert_eq!(
+        Chunker::detect_type(&PathBuf::from("home.dart")),
+        Some(ChunkerType::Dart)
+    );
+    assert_eq!(
+        Chunker::detect_type(&PathBuf::from("LegacyView.m")),
+        Some(ChunkerType::ObjectiveC)
+    );
+    assert_eq!(
+        Chunker::detect_type(&PathBuf::from("MainActivity.kt")),
+        Some(ChunkerType::Kotlin)
+    );
+    assert_eq!(
+        Chunker::detect_type(&PathBuf::from("Cargo.toml")),
+        Some(ChunkerType::Toml)
+    );
+    assert_eq!(
+        Chunker::detect_type(&PathBuf::from("Engine.cs")),
+        Some(ChunkerType::CSharp)
+    );
+    assert_eq!(
+        Chunker::detect_type(&PathBuf::from("engine.cpp")),
+        Some(ChunkerType::Cpp)
+    );
+    assert_eq!(
+        Chunker::detect_type(&PathBuf::from("point.c")),
+        Some(ChunkerType::C)
+    );
+    assert_eq!(
+        Chunker::detect_type(&PathBuf::from("build.sh")),
+        Some(ChunkerType::Bash)
+    );
+}
+
+#[test]
+fn mobile_language_chunkers_emit_structural_cues() {
+    let cases = [
+        (
+            "View.swift",
+            "import Foundation\nstruct Greeter {\n    func greet() {}\n}",
+            "lang:swift",
+            "type:struct",
+            "name:Greeter",
+            "defines_struct:Greeter",
+        ),
+        (
+            "home.dart",
+            "class HomeScreen {\n  void build() {}\n}",
+            "lang:dart",
+            "type:class",
+            "name:HomeScreen",
+            "defines_class:HomeScreen",
+        ),
+        (
+            "LegacyView.m",
+            "@interface LegacyView : NSObject\n@end",
+            "lang:objc",
+            "type:class_interface",
+            "name:LegacyView",
+            "defines_class:LegacyView",
+        ),
+        (
+            "MainActivity.kt",
+            "class MainActivity {\n    fun render() {}\n}",
+            "lang:kotlin",
+            "type:class",
+            "name:MainActivity",
+            "defines_class:MainActivity",
+        ),
+    ];
+
+    for (filename, content, lang, type_cue, name, semantic_cue) in cases {
+        let chunks = Chunker::chunk_file(std::path::Path::new(filename), content);
+        assert!(!chunks.is_empty(), "Failed to chunk {filename}");
+        assert!(
+            chunks.iter().any(|chunk| chunk.structural_cues.contains(&lang.to_string())),
+            "{filename} missing language cue: {chunks:?}"
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.structural_cues.contains(&type_cue.to_string())),
+            "{filename} missing type cue: {chunks:?}"
+        );
+        assert!(
+            chunks.iter().any(|chunk| chunk.structural_cues.contains(&name.to_string())),
+            "{filename} missing name cue: {chunks:?}"
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.structural_cues.contains(&semantic_cue.to_string())),
+            "{filename} missing semantic cue: {chunks:?}"
+        );
+    }
 }
 
 #[test]

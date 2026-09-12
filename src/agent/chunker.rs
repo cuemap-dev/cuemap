@@ -68,6 +68,102 @@ const JAVA_QUERY: &str = r#"
 (import_declaration (scoped_identifier) @imports_module)
 "#;
 
+const SWIFT_QUERY: &str = r#"
+(function_declaration name: (simple_identifier) @defines_function)
+(protocol_function_declaration name: (simple_identifier) @defines_method)
+(class_declaration declaration_kind: "class" name: (type_identifier) @defines_class)
+(class_declaration declaration_kind: "struct" name: (type_identifier) @defines_struct)
+(class_declaration declaration_kind: "enum" name: (type_identifier) @defines_enum)
+(class_declaration declaration_kind: "actor" name: (type_identifier) @defines_class)
+(class_declaration declaration_kind: "extension" name: (type_identifier) @defines_class)
+(protocol_declaration name: (type_identifier) @defines_interface)
+(call_suffix name: (simple_identifier) @calls_function)
+(import_declaration (identifier) @imports_module)
+"#;
+
+const DART_QUERY: &str = r#"
+(function_declaration
+  signature: (function_signature name: (identifier) @defines_function))
+(getter_declaration
+  signature: (getter_signature name: (identifier) @defines_function))
+(setter_declaration
+  signature: (setter_signature name: (identifier) @defines_function))
+(class_declaration name: (identifier) @defines_class)
+(mixin_declaration (identifier) @defines_class)
+(extension_declaration name: (identifier) @defines_class)
+(extension_type_declaration name: (extension_type_name (identifier) @defines_class))
+(enum_declaration name: (identifier) @defines_enum)
+(method_signature (function_signature name: (identifier) @defines_method))
+(method_signature (getter_signature name: (identifier) @defines_method))
+(method_signature (setter_signature name: (identifier) @defines_method))
+(constructor_signature name: (identifier) @defines_method)
+(call_expression function: (identifier) @calls_function)
+(call_expression function: (member_expression property: (identifier) @calls_method))
+(call_expression function: (null_aware_member_expression property: (identifier) @calls_method))
+"#;
+
+const OBJC_QUERY: &str = r#"
+(class_interface (identifier) @defines_class)
+(class_implementation (identifier) @defines_class)
+(protocol_declaration (identifier) @defines_interface)
+(method_declaration (method_identifier) @defines_method)
+(function_definition declarator: (function_declarator declarator: (identifier) @defines_function))
+(call_expression function: (identifier) @calls_function)
+(preproc_include path: (_) @imports_module)
+"#;
+
+const KOTLIN_QUERY: &str = r#"
+(class_declaration "class" (type_identifier) @defines_class)
+(object_declaration (type_identifier) @defines_class)
+(class_declaration "interface" (type_identifier) @defines_interface)
+(enum_class_body (enum_entry (simple_identifier) @defines_enum))
+(function_declaration (simple_identifier) @defines_function)
+(call_expression (simple_identifier) @calls_function)
+(navigation_expression (simple_identifier) @calls_method)
+(import_header (identifier) @imports_module)
+"#;
+
+const C_QUERY: &str = r#"
+(function_definition declarator: (function_declarator declarator: (_) @defines_function))
+(struct_specifier name: (type_identifier) @defines_struct)
+(enum_specifier name: (type_identifier) @defines_enum)
+(type_definition declarator: (type_identifier) @defines_type)
+(call_expression function: (identifier) @calls_function)
+(call_expression function: (field_expression field: (field_identifier) @calls_method))
+(preproc_include path: (_) @imports_module)
+"#;
+
+const CPP_QUERY: &str = r#"
+(function_definition declarator: (function_declarator declarator: (_) @defines_function))
+(class_specifier name: (type_identifier) @defines_class)
+(struct_specifier name: (type_identifier) @defines_struct)
+(enum_specifier name: (type_identifier) @defines_enum)
+(namespace_definition name: (_) @defines_namespace)
+(call_expression function: (identifier) @calls_function)
+(call_expression function: (field_expression field: (field_identifier) @calls_method))
+(preproc_include path: (_) @imports_module)
+"#;
+
+const CSHARP_QUERY: &str = r#"
+(class_declaration name: (identifier) @defines_class)
+(struct_declaration name: (identifier) @defines_struct)
+(interface_declaration name: (identifier) @defines_interface)
+(enum_declaration name: (identifier) @defines_enum)
+(namespace_declaration name: (_) @defines_namespace)
+(method_declaration name: (identifier) @defines_method)
+(property_declaration name: (identifier) @defines_property)
+(invocation_expression function: (identifier) @calls_function)
+(invocation_expression function: (member_access_expression name: (identifier) @calls_method))
+(using_directive (type) @imports_module)
+"#;
+
+const BASH_QUERY: &str = r#"
+(function_definition name: (word) @defines_function)
+(command name: (command_name) @calls_function)
+(for_statement variable: (variable_name) @defines_variable)
+(variable_assignment name: (variable_name) @defines_variable)
+"#;
+
 struct Parsers {
     python: Option<Parser>,
     rust: Option<Parser>,
@@ -78,6 +174,15 @@ struct Parsers {
     css: Option<Parser>,
     php: Option<Parser>,
     java: Option<Parser>,
+    swift: Option<Parser>,
+    dart: Option<Parser>,
+    objc: Option<Parser>,
+    kotlin: Option<Parser>,
+    c: Option<Parser>,
+    cpp: Option<Parser>,
+    csharp: Option<Parser>,
+    bash: Option<Parser>,
+    toml: Option<Parser>,
 }
 
 impl Parsers {
@@ -92,6 +197,15 @@ impl Parsers {
             css: None,
             php: None,
             java: None,
+            swift: None,
+            dart: None,
+            objc: None,
+            kotlin: None,
+            c: None,
+            cpp: None,
+            csharp: None,
+            bash: None,
+            toml: None,
         }
     }
 
@@ -184,6 +298,96 @@ impl Parsers {
             parser
         })
     }
+
+    fn get_swift(&mut self) -> &mut Parser {
+        self.swift.get_or_insert_with(|| {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_swift::LANGUAGE.into())
+                .expect("Error loading Swift grammar");
+            parser
+        })
+    }
+
+    fn get_dart(&mut self) -> &mut Parser {
+        self.dart.get_or_insert_with(|| {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_dart::LANGUAGE.into())
+                .expect("Error loading Dart grammar");
+            parser
+        })
+    }
+
+    fn get_objc(&mut self) -> &mut Parser {
+        self.objc.get_or_insert_with(|| {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_objc::LANGUAGE.into())
+                .expect("Error loading Objective-C grammar");
+            parser
+        })
+    }
+
+    fn get_kotlin(&mut self) -> &mut Parser {
+        self.kotlin.get_or_insert_with(|| {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&brokk_tree_sitter_kotlin::LANGUAGE.into())
+                .expect("Error loading Kotlin grammar");
+            parser
+        })
+    }
+
+    fn get_c(&mut self) -> &mut Parser {
+        self.c.get_or_insert_with(|| {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_c::LANGUAGE.into())
+                .expect("Error loading C grammar");
+            parser
+        })
+    }
+
+    fn get_cpp(&mut self) -> &mut Parser {
+        self.cpp.get_or_insert_with(|| {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_cpp::LANGUAGE.into())
+                .expect("Error loading C++ grammar");
+            parser
+        })
+    }
+
+    fn get_csharp(&mut self) -> &mut Parser {
+        self.csharp.get_or_insert_with(|| {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+                .expect("Error loading C# grammar");
+            parser
+        })
+    }
+
+    fn get_bash(&mut self) -> &mut Parser {
+        self.bash.get_or_insert_with(|| {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_bash::LANGUAGE.into())
+                .expect("Error loading Bash grammar");
+            parser
+        })
+    }
+
+    fn get_toml(&mut self) -> &mut Parser {
+        self.toml.get_or_insert_with(|| {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_toml_ng::LANGUAGE.into())
+                .expect("Error loading TOML grammar");
+            parser
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -202,7 +406,7 @@ pub enum ChunkCategory {
     Code, // Programming languages - structural cues
     #[default]
     Prose, // Longform text - sentence/logical-block segmentation
-    Structured, // CSV, JSON, YAML, XML - key-aware extraction
+    Structured, // CSV, JSON, YAML, XML, TOML - key-aware extraction
     ApiSpec, // OpenAPI/Swagger - special handling
     Conversation, // Chat exports - participant context
     WebContent, // URLs - metadata extraction
@@ -219,11 +423,20 @@ pub enum ChunkerType {
     Css,
     Php,
     Java,
+    Swift,
+    Dart,
+    ObjectiveC,
+    Kotlin,
+    C,
+    Cpp,
+    CSharp,
+    Bash,
     Markdown,
     Csv,
     Json,
     Yaml,
     Xml,
+    Toml,
     Pdf,
     Office, // DOCX, XLSX, PPTX
     Text,
@@ -296,7 +509,7 @@ impl Chunker {
 
     pub fn chunk_file(path: &Path, content: &str) -> Vec<Chunk> {
         // PRIORITY 1: Path-based type detection (explicit extensions win)
-        let file_type = match Self::detect_type(path) {
+        let file_type = match Self::detect_type_for_content(path, content) {
             Some(t) => t,
             None => {
                 // PRIORITY 2: Content-based detection for social media exports or other formats without extensions
@@ -320,11 +533,20 @@ impl Chunker {
             ChunkerType::Css => Self::chunk_css(content),
             ChunkerType::Php => Self::chunk_php(content),
             ChunkerType::Java => Self::chunk_java(content),
+            ChunkerType::Swift => Self::chunk_swift(content),
+            ChunkerType::Dart => Self::chunk_dart(content),
+            ChunkerType::ObjectiveC => Self::chunk_objc(content),
+            ChunkerType::Kotlin => Self::chunk_kotlin(content),
+            ChunkerType::C => Self::chunk_c(content),
+            ChunkerType::Cpp => Self::chunk_cpp(content),
+            ChunkerType::CSharp => Self::chunk_csharp(content),
+            ChunkerType::Bash => Self::chunk_bash(content),
             ChunkerType::Markdown => Self::chunk_markdown(content),
             ChunkerType::Csv => Self::chunk_csv(content),
             ChunkerType::Json => Self::chunk_json(content),
             ChunkerType::Yaml => Self::chunk_yaml(content),
             ChunkerType::Xml => Self::chunk_xml(content),
+            ChunkerType::Toml => Self::chunk_toml(content),
             ChunkerType::Pdf => Self::chunk_pdf(path),
             ChunkerType::Office => Self::chunk_office(path),
             ChunkerType::Text => Self::chunk_text(content),
@@ -458,7 +680,22 @@ impl Chunker {
             return Some(ChunkerType::SocialExport);
         }
 
-        match path.extension().and_then(|s| s.to_str()) {
+        let file_name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase());
+        if matches!(
+            file_name.as_deref(),
+            Some(".bashrc" | ".bash_profile" | ".bash_login" | ".profile" | "ebuild" | "eclass")
+        ) {
+            return Some(ChunkerType::Bash);
+        }
+
+        let extension = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase());
+        match extension.as_deref() {
             Some("py") => Some(ChunkerType::Python),
             Some("rs") => Some(ChunkerType::Rust),
             Some("ts" | "tsx") => Some(ChunkerType::TypeScript),
@@ -468,16 +705,152 @@ impl Chunker {
             Some("css") => Some(ChunkerType::Css),
             Some("php") => Some(ChunkerType::Php),
             Some("java") => Some(ChunkerType::Java),
+            Some("swift") => Some(ChunkerType::Swift),
+            Some("dart") => Some(ChunkerType::Dart),
+            Some("m" | "mm") => Some(ChunkerType::ObjectiveC),
+            Some("h") => Some(Self::classify_header(path, None)),
+            Some("kt" | "kts") => Some(ChunkerType::Kotlin),
+            Some("c") => Some(ChunkerType::C),
+            Some("cc" | "cp" | "cpp" | "cxx" | "c++" | "hh" | "hpp" | "hxx" | "ipp" | "inl") => {
+                Some(ChunkerType::Cpp)
+            }
+            Some("cs" | "csx") => Some(ChunkerType::CSharp),
+            Some("sh" | "bash" | "zsh" | "bats") => Some(ChunkerType::Bash),
             Some("md") => Some(ChunkerType::Markdown),
             Some("csv") => Some(ChunkerType::Csv),
             Some("json") => Some(ChunkerType::Json),
             Some("yaml" | "yml") => Some(ChunkerType::Yaml),
             Some("xml") => Some(ChunkerType::Xml),
+            Some("toml") => Some(ChunkerType::Toml),
             Some("pdf") => Some(ChunkerType::Pdf),
             Some("docx" | "xlsx" | "pptx") => Some(ChunkerType::Office),
             Some("txt" | "log") => Some(ChunkerType::Text),
             _ => None,
         }
+    }
+
+    fn detect_type_for_content(path: &Path, content: &str) -> Option<ChunkerType> {
+        if path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.eq_ignore_ascii_case("h"))
+            .unwrap_or(false)
+        {
+            return Some(Self::classify_header(path, Some(content)));
+        }
+
+        Self::detect_type(path)
+    }
+
+    /// Headers are the one common extension shared by C, C++, and Objective-C.
+    /// Use source syntax first, then project markers, while retaining C as the
+    /// neutral default for non-Apple projects.
+    fn classify_header(path: &Path, content: Option<&str>) -> ChunkerType {
+        if let Some(content) = content {
+            let lower = content.to_ascii_lowercase();
+            if Self::looks_like_objective_c(&lower) {
+                return ChunkerType::ObjectiveC;
+            }
+            if Self::looks_like_cpp(&lower) {
+                return ChunkerType::Cpp;
+            }
+        }
+
+        if Self::is_apple_project(path) {
+            ChunkerType::ObjectiveC
+        } else {
+            ChunkerType::C
+        }
+    }
+
+    fn looks_like_objective_c(lower_content: &str) -> bool {
+        [
+            "@interface",
+            "@implementation",
+            "@protocol",
+            "@property",
+            "@selector(",
+            "#import <foundation/",
+            "#import <uikit/",
+            "#import <appkit/",
+            "#import <cocoa/",
+            "#include <objc/",
+        ]
+        .iter()
+        .any(|marker| lower_content.contains(marker))
+    }
+
+    fn looks_like_cpp(lower_content: &str) -> bool {
+        [
+            "namespace ",
+            "using namespace ",
+            "template<",
+            "template <",
+            "std::",
+            "constexpr ",
+            "nullptr",
+            "public:",
+            "private:",
+            "protected:",
+            "::",
+        ]
+        .iter()
+        .any(|marker| lower_content.contains(marker))
+            || lower_content.lines().any(|line| {
+                let line = line.trim_start();
+                line.starts_with("class ") || line.starts_with("struct ")
+            })
+    }
+
+    fn is_apple_project(path: &Path) -> bool {
+        let mut current = path.parent();
+        while let Some(directory) = current {
+            if directory.join("project.pbxproj").is_file()
+                || directory.join("Podfile").is_file()
+                || directory.join("Cartfile").is_file()
+            {
+                return true;
+            }
+
+            if let Ok(entries) = std::fs::read_dir(directory) {
+                for entry in entries.flatten() {
+                    let entry_path = entry.path();
+                    if matches!(
+                        entry_path.extension().and_then(|value| value.to_str()),
+                        Some("xcodeproj" | "xcworkspace" | "playground")
+                    ) {
+                        return true;
+                    }
+                    if entry_path
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .map(|value| value.eq_ignore_ascii_case("Package.swift"))
+                        .unwrap_or(false)
+                    {
+                        if let Ok(package_manifest) = std::fs::read_to_string(&entry_path) {
+                            let lower = package_manifest.to_ascii_lowercase();
+                            if [
+                                ".ios(",
+                                ".macos(",
+                                ".maccatalyst(",
+                                ".tvos(",
+                                ".watchos(",
+                                ".visionos(",
+                            ]
+                            .iter()
+                            .any(|marker| lower.contains(marker))
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            current = directory.parent();
+        }
+
+        false
     }
 
     fn chunk_python(content: &str) -> Vec<Chunk> {
@@ -786,6 +1159,267 @@ impl Chunker {
         })
     }
 
+    pub fn chunk_swift(content: &str) -> Vec<Chunk> {
+        PARSERS.with(|parsers| {
+            let mut parsers = parsers.borrow_mut();
+            let parser = parsers.get_swift();
+            Self::chunk_treesitter_with_names(
+                content,
+                parser,
+                &[
+                    "class_declaration",
+                    "protocol_declaration",
+                    "function_declaration",
+                    "protocol_function_declaration",
+                    "if_statement",
+                    "guard_statement",
+                    "for_statement",
+                    "while_statement",
+                    "repeat_while_statement",
+                    "switch_statement",
+                    "call_expression",
+                    "property_declaration",
+                    "comment",
+                ],
+                "lang:swift",
+                ChunkCategory::Code,
+                Some(SWIFT_QUERY),
+                true,
+            )
+        })
+    }
+
+    pub fn chunk_dart(content: &str) -> Vec<Chunk> {
+        PARSERS.with(|parsers| {
+            let mut parsers = parsers.borrow_mut();
+            let parser = parsers.get_dart();
+            Self::chunk_treesitter_with_names(
+                content,
+                parser,
+                &[
+                    "class_declaration",
+                    "mixin_declaration",
+                    "extension_declaration",
+                    "extension_type_declaration",
+                    "enum_declaration",
+                    "function_declaration",
+                    "getter_declaration",
+                    "setter_declaration",
+                    "method_signature",
+                    "constructor_signature",
+                    "if_statement",
+                    "for_statement",
+                    "while_statement",
+                    "do_statement",
+                    "switch_statement",
+                    "call_expression",
+                    "comment",
+                ],
+                "lang:dart",
+                ChunkCategory::Code,
+                Some(DART_QUERY),
+                true,
+            )
+        })
+    }
+
+    pub fn chunk_objc(content: &str) -> Vec<Chunk> {
+        PARSERS.with(|parsers| {
+            let mut parsers = parsers.borrow_mut();
+            let parser = parsers.get_objc();
+            Self::chunk_treesitter_with_names(
+                content,
+                parser,
+                &[
+                    "class_interface",
+                    "class_implementation",
+                    "protocol_declaration",
+                    "method_declaration",
+                    "function_definition",
+                    "if_statement",
+                    "for_statement",
+                    "while_statement",
+                    "do_statement",
+                    "compound_statement",
+                    "message_expression",
+                    "call_expression",
+                    "comment",
+                ],
+                "lang:objc",
+                ChunkCategory::Code,
+                Some(OBJC_QUERY),
+                true,
+            )
+        })
+    }
+
+    pub fn chunk_kotlin(content: &str) -> Vec<Chunk> {
+        PARSERS.with(|parsers| {
+            let mut parsers = parsers.borrow_mut();
+            let parser = parsers.get_kotlin();
+            Self::chunk_treesitter_with_names(
+                content,
+                parser,
+                &[
+                    "class_declaration",
+                    "object_declaration",
+                    "enum_class_body",
+                    "function_declaration",
+                    "property_declaration",
+                    "if_expression",
+                    "for_statement",
+                    "while_statement",
+                    "do_while_statement",
+                    "when_expression",
+                    "call_expression",
+                    "comment",
+                ],
+                "lang:kotlin",
+                ChunkCategory::Code,
+                Some(KOTLIN_QUERY),
+                true,
+            )
+        })
+    }
+
+    pub fn chunk_c(content: &str) -> Vec<Chunk> {
+        PARSERS.with(|parsers| {
+            let mut parsers = parsers.borrow_mut();
+            let parser = parsers.get_c();
+            Self::chunk_treesitter_with_names(
+                content,
+                parser,
+                &[
+                    "function_definition",
+                    "struct_specifier",
+                    "enum_specifier",
+                    "type_definition",
+                    "declaration",
+                    "preproc_include",
+                    "preproc_def",
+                    "preproc_function_def",
+                    "if_statement",
+                    "for_statement",
+                    "while_statement",
+                    "switch_statement",
+                    "expression_statement",
+                    "comment",
+                ],
+                "lang:c",
+                ChunkCategory::Code,
+                Some(C_QUERY),
+                true,
+            )
+        })
+    }
+
+    pub fn chunk_cpp(content: &str) -> Vec<Chunk> {
+        PARSERS.with(|parsers| {
+            let mut parsers = parsers.borrow_mut();
+            let parser = parsers.get_cpp();
+            Self::chunk_treesitter_with_names(
+                content,
+                parser,
+                &[
+                    "function_definition",
+                    "class_specifier",
+                    "struct_specifier",
+                    "enum_specifier",
+                    "namespace_definition",
+                    "template_declaration",
+                    "declaration",
+                    "preproc_include",
+                    "preproc_def",
+                    "preproc_function_def",
+                    "if_statement",
+                    "for_statement",
+                    "while_statement",
+                    "switch_statement",
+                    "expression_statement",
+                    "comment",
+                ],
+                "lang:cpp",
+                ChunkCategory::Code,
+                Some(CPP_QUERY),
+                true,
+            )
+        })
+    }
+
+    pub fn chunk_csharp(content: &str) -> Vec<Chunk> {
+        PARSERS.with(|parsers| {
+            let mut parsers = parsers.borrow_mut();
+            let parser = parsers.get_csharp();
+            Self::chunk_treesitter_with_names(
+                content,
+                parser,
+                &[
+                    "namespace_declaration",
+                    "class_declaration",
+                    "struct_declaration",
+                    "interface_declaration",
+                    "enum_declaration",
+                    "method_declaration",
+                    "constructor_declaration",
+                    "property_declaration",
+                    "if_statement",
+                    "for_statement",
+                    "foreach_statement",
+                    "while_statement",
+                    "switch_statement",
+                    "local_declaration_statement",
+                    "expression_statement",
+                    "comment",
+                ],
+                "lang:csharp",
+                ChunkCategory::Code,
+                Some(CSHARP_QUERY),
+                true,
+            )
+        })
+    }
+
+    pub fn chunk_bash(content: &str) -> Vec<Chunk> {
+        PARSERS.with(|parsers| {
+            let mut parsers = parsers.borrow_mut();
+            let parser = parsers.get_bash();
+            Self::chunk_treesitter_with_names(
+                content,
+                parser,
+                &[
+                    "function_definition",
+                    "command",
+                    "variable_assignment",
+                    "if_statement",
+                    "for_statement",
+                    "while_statement",
+                    "case_statement",
+                    "comment",
+                ],
+                "lang:bash",
+                ChunkCategory::Code,
+                Some(BASH_QUERY),
+                true,
+            )
+        })
+    }
+
+    pub fn chunk_toml(content: &str) -> Vec<Chunk> {
+        PARSERS.with(|parsers| {
+            let mut parsers = parsers.borrow_mut();
+            let parser = parsers.get_toml();
+            Self::chunk_treesitter_with_names(
+                content,
+                parser,
+                &["table", "table_array_element", "pair"],
+                "lang:toml",
+                ChunkCategory::Structured,
+                None,
+                true,
+            )
+        })
+    }
+
     fn chunk_treesitter_with_names(
         content: &str,
         parser: &mut Parser,
@@ -904,6 +1538,37 @@ impl Chunker {
         chunks
     }
 
+    fn find_declarator_name(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+        if matches!(
+            node.kind(),
+            "identifier"
+                | "field_identifier"
+                | "type_identifier"
+                | "qualified_identifier"
+                | "namespace_identifier"
+        ) {
+            return Some(node);
+        }
+
+        if let Some(declarator) = node.child_by_field_name("declarator") {
+            if let Some(name) = Self::find_declarator_name(declarator) {
+                return Some(name);
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "parameter_list" {
+                continue;
+            }
+            if let Some(name) = Self::find_declarator_name(child) {
+                return Some(name);
+            }
+        }
+
+        None
+    }
+
     fn visit_nodes_recursive(
         node: tree_sitter::Node,
         content: &str,
@@ -957,11 +1622,30 @@ impl Chunker {
                 .or_else(|| node.child_by_field_name("identifier"))
                 .or_else(|| node.child_by_field_name("selectors"))
                 .or_else(|| {
+                    if kind == "function_definition" {
+                        node.child_by_field_name("declarator")
+                            .and_then(Self::find_declarator_name)
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| {
                     for i in 0..node.child_count() {
                         let c = node.child(i as u32).unwrap();
                         if c.kind() == "identifier"
+                            || c.kind() == "type_identifier"
+                            || c.kind() == "simple_identifier"
                             || c.kind() == "tag_name"
                             || c.kind() == "selectors"
+                            || c.kind() == "field_identifier"
+                            || c.kind() == "namespace_identifier"
+                            || c.kind() == "qualified_identifier"
+                            || c.kind() == "word"
+                            || c.kind() == "command_name"
+                            || c.kind() == "variable_name"
+                            || c.kind() == "bare_key"
+                            || c.kind() == "dotted_key"
+                            || c.kind() == "quoted_key"
                         {
                             return Some(c);
                         }
@@ -986,12 +1670,24 @@ impl Chunker {
                 .unwrap_or_else(|| node.utf8_text(content.as_bytes()).unwrap_or(""))
                 .to_string();
 
-            let type_cue = kind
+            let mut type_cue = kind
                 .replace("_declaration", "")
                 .replace("_definition", "")
                 .replace("_item", "")
                 .replace("_rule", "")
                 .replace("_set", "");
+
+            // Swift uses one `class_declaration` node for classes, structs,
+            // enums, actors, and extensions. Preserve the declaration kind
+            // as a structural cue instead of collapsing all of them to
+            // `type:class`.
+            if lang_tag == "lang:swift" && kind == "class_declaration" {
+                type_cue = node
+                    .child_by_field_name("declaration_kind")
+                    .and_then(|declaration_kind| declaration_kind.utf8_text(content.as_bytes()).ok())
+                    .unwrap_or("class")
+                    .to_string();
+            }
 
             let name_label = if lang_tag == "lang:css" {
                 "selector"
@@ -1971,6 +2667,14 @@ impl Chunker {
             Some("css") => Self::chunk_css(content),
             Some("php") => Self::chunk_php(content),
             Some("java") => Self::chunk_java(content),
+            Some("swift") => Self::chunk_swift(content),
+            Some("dart") => Self::chunk_dart(content),
+            Some("objc" | "objective-c" | "objectivec") => Self::chunk_objc(content),
+            Some("kotlin" | "kt" | "kts") => Self::chunk_kotlin(content),
+            Some("c") => Self::chunk_c(content),
+            Some("cpp" | "c++" | "cxx" | "cc") => Self::chunk_cpp(content),
+            Some("csharp" | "c#" | "cs") => Self::chunk_csharp(content),
+            Some("bash" | "shell" | "sh" | "zsh") => Self::chunk_bash(content),
             _ => Vec::new(),
         }
     }
@@ -2003,28 +2707,58 @@ impl Chunker {
     }
 
     fn normalize_code_language(language: &str) -> String {
-        let value = language
-            .trim()
-            .to_ascii_lowercase()
+        let raw = language.trim().to_ascii_lowercase();
+        let value = raw
+            .as_str()
             .trim_matches(|c: char| !c.is_ascii_alphanumeric())
             .to_string();
-        match value.as_str() {
+        match raw.as_str() {
+            "c#" => "csharp".to_string(),
+            "c++" => "cpp".to_string(),
+            "shell" => "bash".to_string(),
+            _ => match value.as_str() {
             "py" => "python".to_string(),
             "rs" => "rust".to_string(),
             "ts" | "tsx" => "typescript".to_string(),
             "js" | "jsx" => "javascript".to_string(),
             "htm" => "html".to_string(),
+            "m" | "mm" => "objc".to_string(),
+            "h" => "c".to_string(),
+            "kt" | "kts" => "kotlin".to_string(),
+            "c" => "c".to_string(),
+            "cc" | "cp" | "cpp" | "cxx" | "c++" | "hh" | "hpp" | "hxx" | "ipp" | "inl" => {
+                "cpp".to_string()
+            }
+            "cs" | "csx" => "csharp".to_string(),
+            "sh" | "bash" | "zsh" | "bats" => "bash".to_string(),
+            "toml" => "toml".to_string(),
             _ => value,
+            },
         }
     }
 
     fn is_structured_language(language: Option<&str>) -> bool {
-        matches!(language, Some("json" | "yaml" | "xml" | "csv"))
+        matches!(language, Some("json" | "yaml" | "xml" | "csv" | "toml"))
     }
 
     fn infer_code_language(content: &str) -> Option<String> {
         let lower = content.to_ascii_lowercase();
         let trimmed = lower.trim_start();
+        if trimmed.starts_with("import ")
+            && (lower.contains("import foundation")
+                || lower.contains("import uikit")
+                || lower.contains("import swiftui"))
+        {
+            return Some("swift".to_string());
+        }
+        if trimmed.starts_with("fun ") || trimmed.starts_with("data class ") {
+            return Some("kotlin".to_string());
+        }
+        if (trimmed.starts_with("class ") || trimmed.starts_with("void main("))
+            && (lower.contains("void main(") || lower.contains("widget"))
+        {
+            return Some("dart".to_string());
+        }
         if trimmed.starts_with("def ")
             || trimmed.starts_with("class ")
             || trimmed.starts_with("from ")
@@ -2043,6 +2777,12 @@ impl Chunker {
         }
         if trimmed.starts_with("package ") || trimmed.starts_with("func ") {
             return Some("go".to_string());
+        }
+        if trimmed.starts_with("@interface")
+            || trimmed.starts_with("@implementation")
+            || trimmed.starts_with("@protocol")
+        {
+            return Some("objc".to_string());
         }
         if trimmed.starts_with("#include ") || trimmed.starts_with("public class ") {
             return Some("java".to_string());
@@ -2460,12 +3200,21 @@ impl Chunker {
             | Some(ChunkerType::Html)
             | Some(ChunkerType::Css)
             | Some(ChunkerType::Php)
-            | Some(ChunkerType::Java) => ChunkCategory::Code,
+            | Some(ChunkerType::Java)
+            | Some(ChunkerType::C)
+            | Some(ChunkerType::Cpp)
+            | Some(ChunkerType::CSharp)
+            | Some(ChunkerType::Bash) => ChunkCategory::Code,
+            Some(ChunkerType::Swift)
+            | Some(ChunkerType::Dart)
+            | Some(ChunkerType::ObjectiveC)
+            | Some(ChunkerType::Kotlin) => ChunkCategory::Code,
 
             Some(ChunkerType::Csv)
             | Some(ChunkerType::Json)
             | Some(ChunkerType::Yaml)
-            | Some(ChunkerType::Xml) => ChunkCategory::Structured,
+            | Some(ChunkerType::Xml)
+            | Some(ChunkerType::Toml) => ChunkCategory::Structured,
 
             Some(ChunkerType::ApiSpec) => ChunkCategory::ApiSpec,
             Some(ChunkerType::SocialExport) => ChunkCategory::Conversation,

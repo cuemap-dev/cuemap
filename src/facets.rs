@@ -20,8 +20,7 @@ use std::sync::OnceLock;
 const MAX_FACETS: usize = 64;
 const MAX_ENTITIES: usize = 16;
 // Keep this explicit so source-role weighting can be benchmark-ablated without
-// confusing it with a semantic classifier. The current value preserves the
-// established v0.7.2 retrieval behavior.
+// confusing it with a semantic classifier.
 const QUERY_PERSPECTIVE_SOURCE_ROLE_WEIGHT: f64 = 2.0;
 
 fn money_re() -> &'static Regex {

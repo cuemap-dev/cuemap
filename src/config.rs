@@ -31,6 +31,8 @@ pub struct ServerConfig {
     pub tuning: TuningConfig,
     #[serde(default)]
     pub semantic: SemanticConfig,
+    #[serde(default)]
+    pub project_lifecycle: ProjectLifecycleConfig,
 }
 
 impl Default for ServerConfig {
@@ -44,13 +46,16 @@ impl Default for ServerConfig {
             search: SearchConfig::default(),
             tuning: TuningConfig::default(),
             semantic: SemanticConfig::default(),
+            project_lifecycle: ProjectLifecycleConfig::default(),
         }
     }
 }
 
 pub fn get_base_dir() -> PathBuf {
-    let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let path = PathBuf::from(home).join(".cuemap");
+    let path = env::var_os("CUEMAP_HOME").map(PathBuf::from).unwrap_or_else(|| {
+        let user_dir = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE"));
+        PathBuf::from(user_dir.unwrap_or_else(|| ".".into())).join(".cuemap")
+    });
     if !path.exists() {
         let _ = fs::create_dir_all(&path);
     }
@@ -68,23 +73,30 @@ impl ServerConfig {
 
         if path.exists() {
             let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-            let file_config: ServerConfig =
-                toml::from_str(&content).map_err(|e| format!("Failed to parse config: {}", e))?;
-
-            // Merge file config onto defaults
-            // Note: This is a shallow merge implementation for simplicity.
-            // In a robust system, we'd use a crate like `config` to merge fields deeply.
-            // For now, we trust `toml` to deserialize partially if Option, but since we use structs with defaults,
-            // `toml::from_str` usually replaces the whole struct if present.
-            // To do proper layering without `config` crate is verbose.
-            // Simplified approach: Parsing the file gives us a full config with defaults filled in by serde if missing in file.
-            // So we just use the file config, but we need to ensure CLI args override it later.
-            config = file_config;
-        } else {
-            // info!("Config file not found at {:?}, using defaults", path);
+            let overrides: toml::Value = toml::from_str(&content)
+                .map_err(|e| format!("Failed to parse config: {}", e))?;
+            let mut merged = toml::Value::try_from(&config).map_err(|e| e.to_string())?;
+            fn merge(base: &mut toml::Value, overrides: toml::Value) {
+                match (base, overrides) {
+                    (toml::Value::Table(base), toml::Value::Table(overrides)) => {
+                        for (key, value) in overrides {
+                            match base.get_mut(&key) {
+                                Some(existing) => merge(existing, value),
+                                None => { base.insert(key, value); }
+                            }
+                        }
+                    }
+                    (base, value) => *base = value,
+                }
+            }
+            merge(&mut merged, overrides);
+            config = merged.try_into().map_err(|e| format!("Failed to parse config: {}", e))?;
         }
 
         // 3. Environment variables overrides (Manual mapping for key fields)
+        if let Ok(host) = env::var("CUEMAP_HOST") {
+            config.server.host = host;
+        }
         if let Ok(port) = env::var("CUEMAP_PORT") {
             if let Ok(p) = port.parse() {
                 config.server.port = p;
@@ -98,6 +110,16 @@ impl ServerConfig {
         if let Ok(snapshot_interval) = env::var("CUEMAP_SNAPSHOT_INTERVAL_SECONDS") {
             if let Ok(seconds) = snapshot_interval.parse() {
                 config.persistence.snapshot_interval_seconds = seconds;
+            }
+        }
+        if let Ok(inactivity_timeout) = env::var("CUEMAP_PROJECT_INACTIVITY_TIMEOUT_SECONDS") {
+            if let Ok(seconds) = inactivity_timeout.parse() {
+                config.project_lifecycle.inactivity_timeout_seconds = seconds;
+            }
+        }
+        if let Ok(check_interval) = env::var("CUEMAP_PROJECT_UNLOAD_CHECK_INTERVAL_SECONDS") {
+            if let Ok(seconds) = check_interval.parse() {
+                config.project_lifecycle.unload_check_interval_seconds = seconds;
             }
         }
         if let Ok(key) = env::var("CUEMAP_SECRET_KEY") {
@@ -238,6 +260,7 @@ impl ServerConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ServerSettings {
     pub port: u16,
     pub host: String,
@@ -252,8 +275,8 @@ pub struct ServerSettings {
 impl Default for ServerSettings {
     fn default() -> Self {
         Self {
-            port: 8080,
-            host: "0.0.0.0".to_string(),
+            port: 8735,
+            host: "127.0.0.1".to_string(),
             data_dir: get_base_dir().join("data").to_string_lossy().to_string(),
             assets_dir: None,
             log_level: "info".to_string(),
@@ -264,7 +287,9 @@ impl Default for ServerSettings {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SecurityConfig {
+    pub allowed_origins: Vec<String>,
     pub require_auth: bool,
     pub api_keys: Vec<String>,
     pub master_key: Option<String>,
@@ -279,6 +304,28 @@ pub struct PersistenceConfig {
     pub compress_snapshots: bool,
     #[serde(default)]
     pub cloud: CloudConfig,
+}
+
+/// Runtime policy for keeping project contexts resident in memory.
+///
+/// A zero inactivity timeout disables automatic unloading. Explicit load and
+/// unload endpoints remain available regardless of the automatic policy.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProjectLifecycleConfig {
+    /// Number of seconds without project activity before an unload is attempted.
+    pub inactivity_timeout_seconds: u64,
+    /// How often the engine checks loaded projects for inactivity.
+    pub unload_check_interval_seconds: u64,
+}
+
+impl Default for ProjectLifecycleConfig {
+    fn default() -> Self {
+        Self {
+            inactivity_timeout_seconds: 24 * 60 * 60,
+            unload_check_interval_seconds: 60,
+        }
+    }
 }
 
 impl Default for PersistenceConfig {
@@ -407,7 +454,26 @@ mod tests {
         assert_eq!(benchmark.server.log_level, "warn");
 
         let default = ServerConfig::default_for_profile("unknown");
-        assert_eq!(default.server.port, 8080);
+        assert_eq!(default.server.port, 8735);
+    }
+
+    #[test]
+    fn partial_configuration_preserves_read_only_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.toml");
+        fs::write(&path, "[server]\nhost = \"::1\"\n").unwrap();
+        let config = ServerConfig::load(Some(path), Some("read_only".into())).unwrap();
+        assert!(config.server.read_only);
+        assert!(!config.persistence.enabled);
+        assert!(!config.jobs.background_processing);
+    }
+
+    #[test]
+    fn default_project_lifecycle_timeout_is_one_day() {
+        assert_eq!(
+            ProjectLifecycleConfig::default().inactivity_timeout_seconds,
+            24 * 60 * 60
+        );
     }
 
     #[test]
@@ -423,6 +489,8 @@ mod tests {
             ("CUEMAP_PORT", "9123"),
             ("CUEMAP_DATA_DIR", "/tmp/cuemap-test-data"),
             ("CUEMAP_SNAPSHOT_INTERVAL_SECONDS", "7"),
+            ("CUEMAP_PROJECT_INACTIVITY_TIMEOUT_SECONDS", "11"),
+            ("CUEMAP_PROJECT_UNLOAD_CHECK_INTERVAL_SECONDS", "3"),
             ("CUEMAP_SECRET_KEY", "secret"),
             ("CUEMAP_SIGNING_PRIVATE_KEY", "signing"),
             ("CUEMAP_MASTER_KEY", "master"),
@@ -457,6 +525,8 @@ mod tests {
         assert_eq!(loaded.server.port, 9123);
         assert_eq!(loaded.server.data_dir, "/tmp/cuemap-test-data");
         assert_eq!(loaded.persistence.snapshot_interval_seconds, 7);
+        assert_eq!(loaded.project_lifecycle.inactivity_timeout_seconds, 11);
+        assert_eq!(loaded.project_lifecycle.unload_check_interval_seconds, 3);
         assert_eq!(loaded.security.secret_key.as_deref(), Some("secret"));
         assert_eq!(loaded.security.signing_private_key.as_deref(), Some("signing"));
         assert_eq!(loaded.security.master_key.as_deref(), Some("master"));
@@ -490,6 +560,6 @@ mod tests {
             Some(value) => std::env::set_var(key, value),
             None => std::env::remove_var(key),
         }
-        assert_eq!(loaded.server.port, 8080);
+        assert_eq!(loaded.server.port, 8735);
     }
 }

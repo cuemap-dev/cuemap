@@ -14,6 +14,8 @@ pub mod multi_tenant;
 pub mod nl;
 pub mod normalization;
 pub mod persistence;
+pub mod project_package;
+pub mod project_sync;
 pub mod projects;
 pub mod structures;
 pub mod taxonomy;

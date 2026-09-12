@@ -19,14 +19,13 @@ fn test_embedded_dictionary_smoke() {
 }
 
 #[test]
-#[ignore = "requires the optional tests/data/verbs.csv and tests/data/nouns.csv quality corpus"]
 fn test_generate_dictionary_and_verify() {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let data_dir = PathBuf::from(manifest_dir).join("tests/data");
 
     assert!(
         data_dir.join("verbs.csv").is_file() && data_dir.join("nouns.csv").is_file(),
-        "optional lemmatization corpus is missing; add tests/data/verbs.csv and tests/data/nouns.csv before running this ignored quality test"
+        "lemmatization corpus is missing; add tests/data/verbs.csv and tests/data/nouns.csv"
     );
 
     let mut overrides: HashMap<String, String> = HashMap::new();
