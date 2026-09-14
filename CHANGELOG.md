@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.7.3] - 2026-08-27
+## [0.7.3] - 2026-09-14
 
 ### Added
 - **Portable project packages**: Added checksummed `.cuemap` packages that carry ready-to-query project snapshots, disk-backed content, and CueBridge artifacts without replaying ingestion. Matching CLI and HTTP operations support local pack/load and S3 push/pull through an already-configured AWS CLI. Imports validate paths, payload hashes, and snapshots before staged installation.
