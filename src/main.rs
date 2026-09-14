@@ -3597,25 +3597,21 @@ async fn handle_stop_at(pid_path: PathBuf) {
 
     #[cfg(unix)]
     {
-        use std::process::Command;
         if pid <= 1 || pid > i32::MAX as u32 {
             eprintln!("✗ Refusing to signal invalid server PID {}.", pid);
             return;
         }
-        let res = Command::new("kill")
-            .arg("-15") // SIGTERM
-            .arg(pid.to_string())
-            .status();
-
-        match res {
-            Ok(s) if s.success() => {
-                println!("✓ Termination signal sent to server (PID: {})", pid);
-                let _ = std::fs::remove_file(pid_path);
-            }
-            _ => eprintln!(
+        // Call the platform API directly so minimal release containers do not
+        // need an external `kill` utility installed.
+        let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        if result == 0 {
+            println!("✓ Termination signal sent to server (PID: {})", pid);
+            let _ = std::fs::remove_file(pid_path);
+        } else {
+            eprintln!(
                 "✗ Failed to kill process {}. It might have already exited.",
                 pid
-            ),
+            );
         }
     }
 
