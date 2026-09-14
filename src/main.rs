@@ -25,6 +25,9 @@ struct Cli {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cuemap::config::TuningConfig;
+    use cuemap::multi_tenant::MultiTenantEngine;
+    use cuemap::structures::MainStats;
     use std::io::Write;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1228,6 +1231,72 @@ mod tests {
                 project: "cli-project".to_string(),
                 path: "/tmp".to_string(),
                 url: dead_url,
+            },
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn cli_project_package_handlers_round_trip_offline() {
+        let source = tempfile::tempdir().unwrap();
+        let project_id = "cli-package".to_string();
+        let engine = MultiTenantEngine::with_snapshots_dir(
+            source.path().join("snapshots"),
+            TuningConfig::default(),
+        );
+        let context = engine.get_or_create_project(project_id.clone()).unwrap();
+        context.main.add_memory(
+            "offline package memory".to_string(),
+            vec!["package".to_string()],
+            None,
+            MainStats::default(),
+            true,
+        );
+        engine.save_project(&project_id).unwrap();
+
+        let package = source.path().join("cli-package.cuemap");
+        handle_projects(ProjectArgs {
+            cmd: ProjectCmd::Pack {
+                project: project_id.clone(),
+                output: Some(package.clone()),
+                data_dir: Some(source.path().to_path_buf()),
+                url: "http://127.0.0.1:1".to_string(),
+                offline: true,
+                force: false,
+            },
+        })
+        .await;
+        assert!(package.is_file());
+
+        let target = tempfile::tempdir().unwrap();
+        handle_projects(ProjectArgs {
+            cmd: ProjectCmd::Load {
+                package: package.clone(),
+                data_dir: Some(target.path().to_path_buf()),
+                url: "http://127.0.0.1:1".to_string(),
+                force: false,
+            },
+        })
+        .await;
+        assert!(target.path().join("snapshots/cli-package.bin").is_file());
+
+        // Validation happens before any AWS or server calls for these commands.
+        handle_projects(ProjectArgs {
+            cmd: ProjectCmd::Push {
+                project: project_id.clone(),
+                destination: "https://example.test/package".to_string(),
+                data_dir: Some(source.path().to_path_buf()),
+                url: "http://127.0.0.1:1".to_string(),
+                offline: true,
+            },
+        })
+        .await;
+        handle_projects(ProjectArgs {
+            cmd: ProjectCmd::Pull {
+                source: "https://example.test/package".to_string(),
+                data_dir: Some(target.path().to_path_buf()),
+                url: "http://127.0.0.1:1".to_string(),
+                force: false,
             },
         })
         .await;

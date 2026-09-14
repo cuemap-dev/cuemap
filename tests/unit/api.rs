@@ -2789,6 +2789,63 @@
     }
 
     #[tokio::test]
+    async fn routes_cover_project_lifecycle_and_package_validation_errors() {
+        let router = test_router();
+
+        for uri in [
+            "/projects/bad!id/load",
+            "/projects/bad!id/save",
+            "/projects/bad!id/unload",
+            "/projects/bad!id/pack",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+
+        for uri in [
+            "/projects/missing-project/load",
+            "/projects/missing-project/save",
+            "/projects/missing-project/pack",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+
+        let malformed_package = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/projects/load")
+                    .header("content-type", "application/vnd.cuemap.project")
+                    .body(Body::from("not a cuemap package"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(malformed_package.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn routes_cover_project_guards_reload_and_directory_validation() {
         let router = test_router();
 
