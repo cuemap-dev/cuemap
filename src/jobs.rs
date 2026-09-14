@@ -414,10 +414,7 @@ impl ProjectProvider for MultiTenantEngine {
     }
 
     fn list_active_projects(&self) -> Vec<String> {
-        self.list_projects()
-            .into_iter()
-            .map(|p| p.project_id)
-            .collect()
+        self.list_loaded_project_ids()
     }
 }
 

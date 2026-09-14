@@ -62,6 +62,20 @@ pub fn normalize_cue(raw: &str, config: &NormalizationConfig) -> (String, Normal
         }
     }
 
+    // Collapse repeated values in namespaced cues such as
+    // `lang:python:python`. This is intentionally applied after custom
+    // rewrite rules so both forms share the same traceable normalization.
+    if let Some((prefix, values)) = current.split_once(':') {
+        let parts: Vec<&str> = values.split(':').collect();
+        if parts.len() > 1 && parts.windows(2).all(|pair| pair[0] == pair[1]) {
+            let deduplicated = format!("{prefix}:{}", parts[0]);
+            if deduplicated != current {
+                current = deduplicated;
+                applied_rules.push("dedupe_prefix".to_string());
+            }
+        }
+    }
+
     (
         current.clone(),
         NormalizeTrace {

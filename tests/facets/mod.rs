@@ -475,7 +475,7 @@ fn extracts_quantities_percentages_ranges_and_comparisons() {
 #[test]
 fn extracts_technical_identifiers_without_reusing_agent_namespaces() {
     let facets = extract_memory_facets(
-        "UUID 550e8400-e29b-41d4-a716-446655440000, version v0.7.2, PR #142, GH-143, commit a91f72c, endpoint 127.0.0.1:8080, cuemap.dev, CUEMAP_INDEX_PATH, @kaan, and #retrieval.",
+        "UUID 550e8400-e29b-41d4-a716-446655440000, version v0.7.3, PR #142, GH-143, commit a91f72c, endpoint 127.0.0.1:8080, cuemap.dev, CUEMAP_INDEX_PATH, @kaan, and #retrieval.",
         None,
         &[],
     );
@@ -484,7 +484,7 @@ fn extracts_technical_identifiers_without_reusing_agent_namespaces() {
         "has:uuid",
         "uuid:550e8400_e29b_41d4_a716_446655440000",
         "has:semver",
-        "version:0_7_2",
+        "version:0_7_3",
         "has:issue_reference",
         "issue:142",
         "issue:143",

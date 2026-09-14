@@ -4,6 +4,7 @@ use cuemap::config::TuningConfig;
 use cuemap::jobs::{JobQueue, ProjectProvider};
 use cuemap::multi_tenant::MultiTenantEngine;
 use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::time::{sleep, timeout, Duration};
@@ -350,7 +351,7 @@ async fn replacing_saved_scope_prunes_previously_tracked_paths() {
         .keys()
         .next()
         .unwrap();
-    assert!(tracked_path.ends_with("/src/main.rs"));
+    assert!(Path::new(tracked_path).ends_with(Path::new("src").join("main.rs")));
 }
 
 #[tokio::test]

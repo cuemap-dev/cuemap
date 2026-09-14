@@ -1,10 +1,10 @@
 # BEAM: Scaling Deterministic Recall To 10M Tokens
 
-`CueMap v0.7.2` `BEAM 128K / 1M / 10M` `CueBridge lift` `embedding-free`
+`CueMap v0.7.3` `BEAM 128K / 1M / 10M` `CueBridge lift` `hybrid reranking`
 
 BEAM is the stress test for scale. CueMap uses deterministic lexical/facet recall instead of an embedding service or vector database, so this benchmark asks the central question: can that architecture stay competitive at 1M and 10M tokens?
 
-The answer in v0.7.2 is yes. The latest raw 128K, 1M, and 10M runs reach 84.2%, 80.3%, and 67.0% Hit@20, with Hit@100 at 96.3%, 93.1%, and 83.5% respectively. All three runs use the wrapper's default **hybrid recall mode** (`SEMANTIC_MODE=hybrid`), message-level turn ingestion, evidence coverage disabled, and ordered reconstruction disabled.
+The reported runs show that it can. The latest raw 128K, 1M, and 10M runs reach 84.2%, 80.3%, and 67.0% Hit@20, with Hit@100 at 96.3%, 93.1%, and 83.5% respectively. All three runs use the wrapper's default **hybrid recall mode** (`SEMANTIC_MODE=hybrid`), message-level turn ingestion, evidence coverage disabled, and ordered reconstruction disabled.
 
 ## Headline
 
@@ -14,7 +14,7 @@ The answer in v0.7.2 is yes. The latest raw 128K, 1M, and 10M runs reach 84.2%, 
 | 1M | 625 | 38.4% | 63.4% | 74.6% | 80.3% | 90.4% | 93.1% |
 | 10M | 176 | 33.5% | 50.0% | 58.5% | 67.0% | 77.8% | 83.5% |
 
-The 10M tier crosses the 50% Hit@20 target while keeping Hit@100 above 80%. That matters because it shows CueMap handles the scale jump and often puts the right memory into the candidate set with embedding-free recall.
+The 10M tier crosses the 50% Hit@20 target while keeping Hit@100 above 80%. That matters because it shows CueMap handles the scale jump and retrieves relevant evidence after lexical and structural candidate generation and hybrid reranking.
 
 ## Depth Metrics
 
@@ -81,7 +81,7 @@ What works now:
 |---|---|
 | Candidate discovery | 128K Hit@100 is 96.3%; 1M Hit@100 is 93.1%; 10M Hit@100 is 83.5%. |
 | Contradictions and updates | These categories stay strong even at 10M. |
-| Embedding-free architecture | The engine preserves strong 10M candidate discovery with deterministic indexing. |
+| Candidate generation without embeddings | Lexical and structural indexing supplies candidates; the reported hybrid results also use semantic reranking. |
 
 Next lift areas:
 
@@ -164,4 +164,4 @@ Useful knobs:
 | `MODE` | `raw` | `raw`, `product-cuebridge`, or `question-oracle`. |
 | `DELETE_PROJECTS` | `1` | Delete temporary eval projects after each record. |
 
-The wrapper writes fresh output under `evals/beam/results/` by default. The figures above come from the latest v0.7.2 raw runs for all three tiers.
+The wrapper writes fresh output under `evals/beam/results/` by default. The figures above cover raw runs for all three tiers.

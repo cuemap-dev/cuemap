@@ -1,9 +1,9 @@
 [package]
 name = "cuemap"
-version = "0.7.2"
+version = "0.7.3"
 edition = "2021"
 autobins = false
-license = "BSL-1.1"
+license = "Apache-2.0"
 description = "High-performance temporal-associative memory engine for AI agents"
 readme = "README.md"
 repository = "https://github.com/cuemap-dev/cuemap"
@@ -29,8 +29,10 @@ name = "cuemap"
 path = "src/main.rs"
 
 [dependencies]
+tempfile = "3.8"
 axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1", features = ["full", "signal"] }
+tokio-util = { version = "0.7", features = ["io"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 bincode = "1.3"
@@ -38,7 +40,7 @@ dashmap = "5.5"
 uuid = { version = "1.6", features = ["v4", "serde", "v5"] }
 rayon = "1.8"
 tower = "0.4"
-tower-http = { version = "0.5", features = ["cors"] }
+tower-http = { version = "0.5", features = ["cors", "limit"] }
 rand = "0.8"
 chrono = "0.4"
 indexmap = { version = "2.1", features = ["serde"] }
@@ -63,6 +65,15 @@ tree-sitter-html = "0.23.1"
 tree-sitter-css = "0.23.1"
 tree-sitter-java = "0.23.0"
 tree-sitter-php = "0.23.0"
+tree-sitter-swift = "0.7.3"
+tree-sitter-dart = "0.2.0"
+tree-sitter-objc = "3.0.2"
+brokk-tree-sitter-kotlin = "0.4.0"
+tree-sitter-c = "0.24.2"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-c-sharp = "0.23.5"
+tree-sitter-bash = "0.25.1"
+tree-sitter-toml-ng = "0.7.0"
 csv = "1.3"
 serde_yaml = "0.9"
 half = { version = "1.8.3", features = ["serde"] }
@@ -110,7 +121,6 @@ semantic-encoder = ["dep:ort", "dep:tokenizers"]
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["full", "test-util"] }
-tempfile = "3.8"
 tower = { version = "0.4", features = ["util"] }
 
 [profile.release]

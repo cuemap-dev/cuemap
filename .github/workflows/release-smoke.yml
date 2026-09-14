@@ -1,0 +1,164 @@
+name: Post-release Smoke Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Published CueMap version to validate"
+        required: true
+        default: "0.7.3"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  package-presence:
+    name: Verify published package set
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Verify npm packages and licenses
+        shell: bash
+        run: |
+          node <<'NODE'
+          const { execFileSync } = require("node:child_process");
+
+          const version = process.env.VERSION;
+          const packages = [
+            "cuemap",
+            "cuemap-mcp",
+            "cuemap-agent-plugin",
+            "@cuemap-dev/engine-darwin-arm64",
+            "@cuemap-dev/engine-darwin-x64",
+            "@cuemap-dev/engine-linux-arm64",
+            "@cuemap-dev/engine-linux-x64",
+            "@cuemap-dev/engine-win32-x64",
+          ];
+
+          function npmView(packageName, field) {
+            const output = execFileSync(
+              "npm",
+              ["view", `${packageName}@${version}`, field, "--json"],
+              { encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] },
+            );
+            return JSON.parse(output);
+          }
+
+          for (const packageName of packages) {
+            const publishedVersion = npmView(packageName, "version");
+            if (publishedVersion !== version) {
+              throw new Error(`${packageName} resolved to ${publishedVersion}, expected ${version}`);
+            }
+            console.log(`${packageName}@${version} exists`);
+          }
+
+          for (const packageName of [
+            "@cuemap-dev/engine-darwin-arm64",
+            "@cuemap-dev/engine-darwin-x64",
+            "@cuemap-dev/engine-linux-arm64",
+            "@cuemap-dev/engine-linux-x64",
+            "@cuemap-dev/engine-win32-x64",
+          ]) {
+            if (npmView(packageName, "license") !== "Apache-2.0") {
+              throw new Error(`${packageName} is not Apache-2.0 licensed`);
+            }
+          }
+
+          for (const packageName of ["cuemap", "cuemap-mcp", "cuemap-agent-plugin"]) {
+            if (npmView(packageName, "license") !== "MIT") {
+              throw new Error(`${packageName} is not MIT licensed`);
+            }
+          }
+          NODE
+
+      - name: Verify published Agent Plugin pin
+        shell: bash
+        run: |
+          temp_dir="$(mktemp -d)"
+          trap 'rm -rf "$temp_dir"' EXIT
+          cd "$temp_dir"
+          npm pack --json --pack-destination "$temp_dir" "cuemap-agent-plugin@${VERSION}" > pack.json
+          tarball="$(node -p 'JSON.parse(require("fs").readFileSync("pack.json", "utf8"))[0].filename')"
+          mkdir extracted
+          tar -xzf "$tarball" -C extracted
+          node - "$VERSION" <<'NODE'
+          const fs = require("node:fs");
+          const path = require("node:path");
+          const expectedVersion = process.argv[2];
+          const root = path.join(process.cwd(), "extracted", "package");
+          const plugin = JSON.parse(fs.readFileSync(path.join(root, "plugin.json"), "utf8"));
+          const mcp = JSON.parse(fs.readFileSync(path.join(root, "mcp.json"), "utf8"));
+          if (plugin.version !== expectedVersion) throw new Error("Agent Plugin version mismatch");
+          const server = mcp.mcpServers?.cuemap;
+          if (!server || server.args?.[1] !== `cuemap-mcp@${expectedVersion}`) {
+            throw new Error("Agent Plugin does not pin the matching MCP version");
+          }
+          console.log("published Agent Plugin pin verified");
+          NODE
+
+  python-package:
+    name: Verify published Python SDK
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install and import published Python SDK
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/cuemap-release-python"
+          "$RUNNER_TEMP/cuemap-release-python/bin/python" -m pip install --disable-pip-version-check "cuemap==${VERSION}"
+          "$RUNNER_TEMP/cuemap-release-python/bin/python" - "$VERSION" <<'PY'
+          import importlib.metadata
+          import sys
+          import cuemap
+
+          expected = sys.argv[1]
+          actual = importlib.metadata.version("cuemap")
+          assert actual == expected, (actual, expected)
+          assert cuemap.__version__ == expected, cuemap.__version__
+          print(f"published Python SDK {actual} verified")
+          PY
+
+  platform-smoke:
+    name: Smoke test (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: darwin-arm64
+            runner: macos-latest
+          - label: darwin-x64
+            runner: macos-15-intel
+          - label: linux-arm64
+            runner: ubuntu-24.04-arm
+          - label: linux-x64
+            runner: ubuntu-latest
+          - label: win32-x64
+            runner: windows-latest
+    steps:
+      - name: Check out smoke harness
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install and exercise published packages
+        run: node scripts/release-smoke.cjs --version ${{ inputs.version }}

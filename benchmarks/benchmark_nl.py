@@ -751,6 +751,7 @@ async def main():
     import sys
     
     parser = argparse.ArgumentParser(description='CueMap NL Benchmark: Python vs Rust')
+    parser.add_argument('--url', default="http://127.0.0.1:8735", help="CueMap engine URL")
     parser.add_argument('--sizes', type=str, help='Comma-separated list of sizes (e.g., 10000,100000)')
     parser.add_argument('--project-id', type=str, default="nl_test",help='Project ID for multi-tenant instance')
     parser.add_argument('--wikipedia-path', type=str, default=None, help='Path to a local Wikipedia parquet file or directory; omitted downloads the release Kaggle fixture')
@@ -806,7 +807,7 @@ async def main():
     
     benchmark = CueMapNLBenchmark(
         python_url="http://localhost:8000",
-        rust_url="http://localhost:8080",
+        rust_url=args.url,
         project_id=args.project_id,
         wiki_path=wikipedia_path,
         wiki_reservoir_size=effective_wiki_reservoir_size,

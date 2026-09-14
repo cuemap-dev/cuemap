@@ -86,10 +86,10 @@ write_package_json() {
       os: [os],
       cpu: [cpu],
       bin: { cuemap: "bin/cuemap" },
-      files: ["bin", "assets", "README.md", "LICENSE"],
+      files: ["bin", "assets", "README.md", "LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.txt", "LGPL-2.1.txt", "ONNXRUNTIME-LICENSE.txt", "ONNXRUNTIME-NOTICES.txt"],
       repository: { type: "git", url: "https://github.com/cuemap-dev/cuemap.git" },
       author: "Kaan Demirel",
-      license: "BSL-1.1",
+      license: "Apache-2.0",
       publishConfig: { access: "public" },
     };
     if (os === "linux") manifest.libc = ["glibc"];
@@ -111,6 +111,12 @@ stage_package() {
   cp "${DIST_DIR}/tokenizer/en_tokenizer.bin" "${package_dir}/assets/en_tokenizer.bin"
   cp "${ROOT_DIR}/scripts/npm-native-README.md" "${package_dir}/README.md"
   cp "${ROOT_DIR}/LICENSE" "${package_dir}/LICENSE"
+  cp "${ROOT_DIR}/NOTICE" "${package_dir}/NOTICE"
+  cp "${ROOT_DIR}/THIRD_PARTY_NOTICES.txt" "${package_dir}/THIRD_PARTY_NOTICES.txt"
+  cp "${ROOT_DIR}/LGPL-2.1.txt" "${package_dir}/LGPL-2.1.txt"
+  cp "${ROOT_DIR}/ONNXRUNTIME-LICENSE.txt" "${package_dir}/ONNXRUNTIME-LICENSE.txt"
+  cp "${ROOT_DIR}/ONNXRUNTIME-NOTICES.txt" "${package_dir}/ONNXRUNTIME-NOTICES.txt"
+
   chmod 0755 "${package_dir}/bin/cuemap" "${package_dir}/bin/cuemap-native"
   write_package_json "${package_dir}/package.json" "${package_name}" "${os_name}" "${cpu_name}"
 

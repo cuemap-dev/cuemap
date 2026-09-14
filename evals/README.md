@@ -1,6 +1,6 @@
-# CueMap v0.7.2 Evaluation Pack
+# CueMap v0.7.3 Evaluation Pack
 
-CueMap is a deterministic memory engine with an embedding-free, vector-database-free, LLM-free recall hot path. These reports document the v0.7.2 retrieval runs used to calibrate release readiness across LongMemEval, LoCoMo, and BEAM.
+CueMap uses lexical and structural candidate generation, with optional semantic reranking. These reports present retrieval metrics for the v0.7.3 evaluation pack across LongMemEval, LoCoMo, and BEAM. Hybrid runs use embeddings for reranking; they are not embedding-free.
 
 The short version: CueMap is already very strong on compact long-memory retrieval, competitive on LoCoMo when adjacent context expansion is enabled, and shows strong candidate discovery at BEAM 10M scale. The latest raw BEAM 128K, 1M, and 10M runs reach 84.2%, 80.3%, and 67.0% Hit@20, with 4,702, 2,934, and 1,749 average top-20 context tokens respectively. The separate historical CueBridge question-oracle run improved Hit@20 by 10 questions; it is reported independently from the latest raw baselines.
 
@@ -20,7 +20,7 @@ The latest LoCoMo, LongMemEval, and BEAM runs use the wrappers' default `SEMANTI
 
 ## Hot-Path Latency Context
 
-These retrieval benchmarks focus on accuracy. For hot-path performance, the release latency runs measured:
+These benchmarks measure evidence retrieval (Hit@K and evidence coverage), not generated-answer accuracy. No single LLM-judge accuracy score is reported. For hot-path performance, the release latency runs measured:
 
 | Dataset size | Operation | Throughput | Avg | P50 | P99 |
 |---:|---|---:|---:|---:|---:|
@@ -29,7 +29,7 @@ These retrieval benchmarks focus on accuracy. For hot-path performance, the rele
 | 1M memories | Write | 351 ops/s | 2.85 ms | 2.39 ms | 11.23 ms |
 | 1M memories | Read, NL lean | 369 ops/s | 2.70 ms | 2.06 ms | 5.10 ms |
 
-The benchmark harnesses add HTTP, ingest, scoring, and optional CueBridge generation overhead. The runtime point is that raw recall remains a deterministic, millisecond-class path.
+The benchmark harnesses add HTTP, ingest, scoring, and optional CueBridge generation overhead. The latency table reports a separate workload and should not be read as the end-to-end latency of these evaluation runs.
 
 ## Reports
 
@@ -42,8 +42,8 @@ The benchmark harnesses add HTTP, ingest, scoring, and optional CueBridge genera
 Each benchmark has a shell wrapper in its directory:
 
 ```bash
-bash evals/longmemeval/run_longmemeval.sh
-bash evals/locomo/run_locomo.sh
+DATASET=/path/to/longmemeval_s_cleaned.json bash evals/longmemeval/run_longmemeval.sh
+DATASET=/path/to/locomo10.json bash evals/locomo/run_locomo.sh
 bash evals/beam/run_beam.sh
 ```
 
@@ -81,3 +81,8 @@ For disposable benchmark projects, keep `DELETE_PROJECTS=1` so temporary `eval_*
 These are raw retrieval metrics rather than LLM-as-judge answer accuracy. This is deliberate: raw retrieval shows what the memory engine actually found before answer-model interpretation.
 
 CueBridge numbers in these reports are labeled carefully. The highlighted CueBridge lift is the BEAM 128K diagnostic question-oracle run, which uses benchmark questions to probe whether artifacts can improve ranking. It demonstrates mechanism and upside; product-mode CueBridge is the next packaging step.
+
+The raw harnesses are included under `evals/harnesses` and use Python 3.10+.
+Install `datasets` for BEAM and provide the original LongMemEval/LoCoMo JSON
+files with `DATASET`. Dataset files are not bundled. Optional CueBridge modes
+require a separate CueBridge installation; use `CUEBRIDGE_CLI` for its CLI path.

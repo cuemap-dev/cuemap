@@ -1,8 +1,8 @@
 # LongMemEval: Compact Long-Memory Recall
 
-`CueMap v0.7.2` `raw hybrid recall` `near-saturated Hit@20`
+`CueMap v0.7.3` `raw hybrid recall` `near-saturated Hit@20`
 
-LongMemEval is the cleanest showcase for CueMap's raw engine: compact user memories, compact retrieval depth, and a strong deterministic recall path. CueMap reaches near-saturated Hit@20 while keeping the recall path embedding-free and LLM-free. The latest run uses the wrapper default `SEMANTIC_MODE=hybrid`, combining lexical and semantic retrieval signals.
+LongMemEval is the cleanest showcase for CueMap's raw engine: compact user memories, compact retrieval depth, and a strong deterministic recall path. CueMap reaches 96.2% Hit@20 in the reported hybrid run, using lexical and structural candidate generation followed by semantic reranking. The latest run uses the wrapper default `SEMANTIC_MODE=hybrid`, combining lexical and semantic ranking signals.
 
 ## Headline
 
@@ -76,7 +76,7 @@ cuemap start
 Raw run:
 
 ```bash
-bash evals/longmemeval/run_longmemeval.sh
+DATASET=/path/to/longmemeval_s_cleaned.json bash evals/longmemeval/run_longmemeval.sh
 ```
 
 Useful knobs:
@@ -89,4 +89,4 @@ Useful knobs:
 | `DELETE_PROJECTS` | `1` | Delete temporary eval projects after each record. |
 | `MODE` | `raw` | `raw`, `question-oracle`, or `product-cuebridge`; BEAM is the recommended CueBridge showcase. |
 
-The wrapper writes fresh output under `evals/longmemeval/results/` by default. The metrics above came from the latest v0.7.2 raw hybrid run: 470 scored questions with 30 abstention cases excluded.
+The wrapper writes fresh output under `evals/longmemeval/results/` by default. The metrics above cover a raw hybrid run: 470 scored questions with 30 abstention cases excluded.

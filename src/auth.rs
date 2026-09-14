@@ -14,6 +14,7 @@ use tracing::info;
 pub struct AuthConfig {
     api_keys: HashSet<String>,
     require_auth: bool,
+    pub allowed_origins: Vec<String>,
 }
 
 impl AuthConfig {
@@ -64,6 +65,7 @@ impl AuthConfig {
         Self {
             api_keys,
             require_auth,
+            allowed_origins: config.allowed_origins.clone(),
         }
     }
 
@@ -78,6 +80,26 @@ impl AuthConfig {
 
         self.api_keys.contains(key)
     }
+}
+
+pub async fn browser_origin_middleware(
+    State(auth_config): State<AuthConfig>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let headers = request.headers();
+    let allowed = if let Some(origin) = headers.get("origin") {
+        origin.to_str().ok().is_some_and(|origin| {
+            origin != "null" && auth_config.allowed_origins.iter().any(|allowed| allowed == origin)
+        })
+    } else {
+        // Browser fetches without Origin must not bypass the origin policy.
+        headers.get("sec-fetch-site").is_none_or(|site| site == "none")
+    };
+    if !allowed {
+        return (StatusCode::FORBIDDEN, "Browser origin is not allowed").into_response();
+    }
+    next.run(request).await
 }
 
 /// Middleware to validate API keys
