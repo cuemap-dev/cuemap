@@ -9,7 +9,10 @@ dist/
 data/nlprule/
 data/reports/
 data/snapshots/
-tests/data/
+tests/data/*
+!tests/data/
+!tests/data/verbs.csv
+!tests/data/nouns.csv
 snapshots/
 __pycache__/
 *.py[cod]
