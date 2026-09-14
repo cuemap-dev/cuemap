@@ -128,7 +128,7 @@ jobs:
           "ORT_PREFER_DYNAMIC_LINK=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Test publication guards
-        run: node --test scripts/publish-native-artifacts.test.cjs
+        run: node --test scripts/publish-native-artifacts.test.cjs scripts/stage-onnxruntime-dll.test.cjs
 
       - name: Test Rust Engine
         run: cargo test --locked --all-targets -- --test-threads=1
@@ -152,9 +152,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/$native_binary" "$package_dir/bin/$packaged_binary"
           cp scripts/npm-native-wrapper.cjs "$package_dir/bin/cuemap"
           if [[ "${{ matrix.npm_os }}" == "win32" ]]; then
-            runtime_dll="$(find "target/${{ matrix.target }}/release" -maxdepth 1 \( -type f -o -type l \) -iname 'onnxruntime*.dll' -print -quit)"
-            test -n "$runtime_dll"
-            cp "$runtime_dll" "$package_dir/bin/"
+            node scripts/stage-onnxruntime-dll.cjs "target/${{ matrix.target }}/release" "$package_dir/bin"
           fi
           cp scripts/npm-native-README.md "$package_dir/README.md"
           cp LICENSE "$package_dir/LICENSE"
@@ -214,6 +212,7 @@ jobs:
           test -f bin/cuemap
           if [[ "${{ matrix.npm_os }}" == "win32" ]]; then
             test -f bin/cuemap-native.exe
+            test -f bin/onnxruntime.dll
           else
             test -f bin/cuemap-native
           fi
