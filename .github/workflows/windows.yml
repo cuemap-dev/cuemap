@@ -27,6 +27,34 @@ jobs:
       - name: Check all targets with the default feature set
         run: cargo check --locked --all-targets
 
+      - name: Install nlprule tokenizer
+        shell: pwsh
+        env:
+          TOKENIZER_URL: https://cuemap.dev/assets/en_tokenizer.bin.gz
+          TOKENIZER_SHA256: f54fd31ec463f8646d0239bb531a64e0210ed1ae02bf5e3b42aeeb9bff8305ba
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'en_tokenizer.bin.gz'
+          $tokenizer = Join-Path $env:RUNNER_TEMP 'en_tokenizer.bin'
+          Invoke-WebRequest -Uri $env:TOKENIZER_URL -OutFile $archive
+          $actualHash = (Get-FileHash -Algorithm SHA256 -Path $archive).Hash.ToLowerInvariant()
+          if ($actualHash -ne $env:TOKENIZER_SHA256.ToLowerInvariant()) {
+            throw "Tokenizer checksum mismatch: expected $env:TOKENIZER_SHA256, got $actualHash"
+          }
+          $sourceStream = [System.IO.File]::OpenRead($archive)
+          $targetStream = [System.IO.File]::Create($tokenizer)
+          $gzipStream = [System.IO.Compression.GzipStream]::new(
+            $sourceStream,
+            [System.IO.Compression.CompressionMode]::Decompress
+          )
+          try {
+            $gzipStream.CopyTo($targetStream)
+          } finally {
+            $gzipStream.Dispose()
+            $targetStream.Dispose()
+            $sourceStream.Dispose()
+          }
+          "TOKENIZER_PATH=$tokenizer" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Run Windows-compatible tests without the optional encoder
         run: cargo test --locked --no-default-features --all-targets -- --test-threads=1
 
