@@ -168,9 +168,13 @@ jobs:
             chmod +x "$package_dir/bin/cuemap" "$package_dir/bin/$packaged_binary"
           fi
 
-          tokenizer_url="https://cuemap.dev/assets/en_tokenizer.bin.gz"
           tokenizer_sha256="f54fd31ec463f8646d0239bb531a64e0210ed1ae02bf5e3b42aeeb9bff8305ba"
-          curl -fsSL --retry 3 "$tokenizer_url" -o "$package_dir/assets/en_tokenizer.bin.gz"
+          if [[ "${{ matrix.npm_os }}" == "win32" ]]; then
+            tokenizer_archive="$(cygpath -u "$RUNNER_TEMP")/en_tokenizer.bin.gz"
+          else
+            tokenizer_archive="$RUNNER_TEMP/en_tokenizer.bin.gz"
+          fi
+          cp "$tokenizer_archive" "$package_dir/assets/en_tokenizer.bin.gz"
           node -e '
             const fs = require("node:fs");
             const crypto = require("node:crypto");

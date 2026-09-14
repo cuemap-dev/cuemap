@@ -97,21 +97,28 @@ async fn extract_and_ingest_preserves_metadata_for_ordered_recall() {
         })
         .await;
 
-    for _ in 0..250 {
-        if let Some(memory_id) = ctx.main.memory_id_for_source_key("thread-job:7") {
-            let memory = ctx.main.get_memory(memory_id).unwrap();
-            assert_eq!(
-                memory
-                    .metadata
-                    .get("source_session_id")
-                    .and_then(|value| value.as_str()),
-                Some("thread-job")
-            );
-            assert_eq!(ctx.main.ordered_entries_for_session("thread-job", 10).len(), 1);
-            return;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while session.get_progress().writes_completed < 1 {
+            sleep(Duration::from_millis(20)).await;
         }
-        sleep(Duration::from_millis(20)).await;
-    }
+    })
+    .await
+    .expect("metadata-preserving ExtractAndIngest job did not complete");
 
-    panic!("metadata-preserving ExtractAndIngest job did not complete");
+    let memory_id = ctx
+        .main
+        .memory_id_for_source_key("thread-job:7")
+        .expect("completed write should expose the source key");
+    let memory = ctx.main.get_memory(memory_id).unwrap();
+    assert_eq!(
+        memory
+            .metadata
+            .get("source_session_id")
+            .and_then(|value| value.as_str()),
+        Some("thread-job")
+    );
+    let entries = ctx.main.ordered_entries_for_session("thread-job", 10);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].memory_id, memory_id);
+    assert_eq!(entries[0].order, 7);
 }
