@@ -5,13 +5,14 @@ const { createHash } = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 
 function publishArtifact(file, run = spawnSync) {
-  const manifestResult = run('tar', ['-xOf', file, 'package/package.json'], { encoding: 'utf8' });
+  const tarball = path.resolve(file);
+  const manifestResult = run('tar', ['-xOf', tarball, 'package/package.json'], { encoding: 'utf8' });
   if (manifestResult.error) throw manifestResult.error;
   assert.equal(manifestResult.status, 0, manifestResult.stderr);
   const manifest = JSON.parse(manifestResult.stdout);
   assert.match(manifest.name, /^@cuemap-dev\/engine-(linux-(x64|arm64)|darwin-(x64|arm64)|win32-x64)$/);
   assert.match(manifest.version, /^\d+\.\d+\.\d+$/);
-  const integrity = `sha512-${createHash('sha512').update(fs.readFileSync(file)).digest('base64')}`;
+  const integrity = `sha512-${createHash('sha512').update(fs.readFileSync(tarball)).digest('base64')}`;
   const existing = run('npm', ['view', `${manifest.name}@${manifest.version}`, 'dist.integrity', '--json', '--registry=https://registry.npmjs.org'], { encoding: 'utf8' });
   if (existing.error) throw existing.error;
   if (existing.status === 0) {
@@ -22,7 +23,7 @@ function publishArtifact(file, run = spawnSync) {
   let error;
   try { error = JSON.parse(existing.stdout).error; } catch {}
   assert.equal(error?.code, 'E404', `Cannot verify registry state: ${existing.stderr || existing.stdout}`);
-  const result = run('npm', ['publish', file, '--access', 'public', '--provenance'], { stdio: 'inherit' });
+  const result = run('npm', ['publish', tarball, '--access', 'public', '--provenance'], { stdio: 'inherit' });
   if (result.error) throw result.error;
   assert.equal(result.status, 0, `Publication failed for ${manifest.name}`);
 }

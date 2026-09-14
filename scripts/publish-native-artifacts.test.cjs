@@ -28,3 +28,23 @@ for (const scenario of ['same', 'different', 'absent', 'network-error']) {
     } finally { fs.rmSync(directory, { recursive:true, force:true }); }
   });
 }
+
+test('publication passes npm an absolute tarball path', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'cuemap-publish-test-'));
+  const file = path.join(directory, 'candidate.tgz');
+  fs.writeFileSync(file, 'candidate fixture');
+  const commands = [];
+  const run = (command, args) => {
+    commands.push({ command, args });
+    if (command === 'tar') return { status: 0, stdout: JSON.stringify({ name: '@cuemap-dev/engine-linux-x64', version: '0.7.3' }) };
+    if (args[0] === 'view') return { status: 1, stdout: JSON.stringify({ error: { code: 'E404' } }) };
+    return { status: 0 };
+  };
+  try {
+    publishArtifact(path.relative(process.cwd(), file), run);
+    assert.equal(commands[0].args[1], file);
+    assert.equal(commands[2].args[1], file);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
