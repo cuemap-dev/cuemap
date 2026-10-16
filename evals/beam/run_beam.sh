@@ -81,11 +81,26 @@ args=(
   --output "$OUTPUT"
 )
 
+if [[ "${RECALL_ONLY:-0}" == "1" ]]; then
+  args+=(--recall-only)
+fi
+if [[ -n "${REUSE_PROJECTS_FROM:-}" ]]; then
+  args+=(--reuse-projects-from "$REUSE_PROJECTS_FROM")
+fi
+
 if [[ "$INGEST_MODE" == "long-form" ]]; then
   args+=(--ingest-long-form)
 fi
 
-if [[ "${DELETE_PROJECTS:-1}" == "1" ]]; then
+if [[ -n "${EXPANSION_DEPTH:-}" ]]; then
+  args+=(--expansion-depth "$EXPANSION_DEPTH")
+fi
+
+if [[ "${SOURCE_ORDER_METADATA:-0}" == "1" ]]; then
+  args+=(--source-order-metadata)
+fi
+
+if [[ "${DELETE_PROJECTS:-0}" == "1" ]]; then
   args+=(--delete-project-after-record)
 fi
 

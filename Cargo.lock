@@ -675,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "cuemap"
-version = "0.7.3"
+version = "0.7.5"
 dependencies = [
  "ahash",
  "aho-corasick 1.1.4",

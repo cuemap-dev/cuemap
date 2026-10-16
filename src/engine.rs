@@ -478,6 +478,19 @@ fn should_index_value_alias(cue: &str) -> bool {
     !is_generated_memory_facet(cue)
 }
 
+/// Counts from [`CueMapEngine::reclassify_memory_types`].
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct MemoryTypeReclassification {
+    pub memories: usize,
+    pub classified: usize,
+    pub already_current: usize,
+    /// Assistant, tool and system messages, and empty memories.
+    pub not_applicable: usize,
+    pub failed: usize,
+    /// Primary intent of the newly classified memories.
+    pub primary: std::collections::BTreeMap<String, usize>,
+}
+
 #[derive(Clone)]
 pub struct CueMapEngine<T>
 where
@@ -595,11 +608,21 @@ where
     }
 
     pub fn set_semantic_encoder(&mut self, encoder: Option<Arc<dyn SemanticEncoder>>) {
+        let semantic = self.config.semantic.clone();
         let classifier = encoder.as_ref().and_then(|encoder| {
             match IntentClassifier::new(
                 encoder.clone(),
                 self.config.semantic.model_version.clone(),
-            ) {
+            )
+            .and_then(|classifier| {
+                if !semantic.memory_type_head {
+                    return Ok(classifier);
+                }
+                match crate::semantic::load_memory_typing_assets(&semantic)? {
+                    Some(assets) => classifier.with_custom_memory_head(assets.encoder, &assets.head, assets.version),
+                    None => classifier.with_memory_head(),
+                }
+            }) {
                 Ok(classifier) => Some(Arc::new(classifier)),
                 Err(error) => {
                     tracing::warn!(error = %error, "Intent classifier unavailable");
@@ -708,6 +731,142 @@ where
         } else {
             false
         }
+    }
+
+    /// Model version stored on memory types while the memory-type head is on.
+    pub fn memory_type_version(&self) -> Option<String> {
+        self.intent_classifier.read().ok().and_then(|classifier| {
+            classifier
+                .as_ref()
+                .filter(|classifier| classifier.memory_head_enabled())
+                .map(|classifier| classifier.memory_model_version())
+        })
+    }
+
+    /// True when memories are typed by the memory-type head
+    /// (`SemanticConfig::memory_type_head`).
+    pub fn memory_type_head_enabled(&self) -> bool {
+        self.intent_classifier
+            .read()
+            .ok()
+            .and_then(|classifier| classifier.as_ref().map(|classifier| classifier.memory_head_enabled()))
+            .unwrap_or(false)
+    }
+
+    /// The memory-type head was trained on what users write, so it types every memory
+    /// except assistant, tool and system messages.
+    fn memory_type_head_applies(memory: &Memory<T>) -> bool {
+        !matches!(
+            Self::conversation_role_of(memory),
+            Some(
+                crate::conversation::ConversationRole::Assistant
+                    | crate::conversation::ConversationRole::Tool
+                    | crate::conversation::ConversationRole::System
+            )
+        )
+    }
+
+    /// Memory text without a leading "role:" label that repeats the role metadata
+    /// (conversation imports store messages as "user: …").
+    fn memory_body<'a>(memory: &Memory<T>, content: &'a str) -> &'a str {
+        let trimmed = content.trim_start();
+        let Some(role) = Self::metadata_string_value(&memory.metadata, &["source_role", "role", "speaker", "author_role"]) else {
+            return trimmed;
+        };
+        match (trimmed.get(..role.len()), trimmed.get(role.len()..)) {
+            (Some(label), Some(rest)) if label.eq_ignore_ascii_case(&role) && rest.starts_with(':') => rest[1..].trim_start(),
+            _ => trimmed,
+        }
+    }
+
+    /// Types one memory with the memory-type head, sentence by sentence. `Ok(None)` when
+    /// the head is off or does not apply to the memory's role.
+    pub fn classify_memory_type(&self, memory: &Memory<T>) -> Result<Option<IntentClassification>, String> {
+        let classifier = match self
+            .intent_classifier
+            .read()
+            .map_err(|_| "intent classifier lock poisoned".to_string())?
+            .clone()
+        {
+            Some(classifier) if classifier.memory_head_enabled() => classifier,
+            _ => return Ok(None),
+        };
+        if !Self::memory_type_head_applies(memory) {
+            return Ok(None);
+        }
+        let content = self.read_memory_content(memory)?;
+        let body = Self::memory_body(memory, &content);
+        let mut sentences = crate::sentences::sentences(body);
+        if sentences.is_empty() {
+            let text = body.trim();
+            if text.is_empty() {
+                return Ok(None);
+            }
+            sentences.push(text.chars().take(2_000).collect());
+        }
+        sentences.truncate(crate::intent::MEMORY_MAX_SENTENCES);
+        classifier.classify_memory_sentences(body, &sentences).map(Some)
+    }
+
+    pub fn attach_memory_type_classification(
+        &self,
+        memory_id: MemoryId,
+        classification: Option<IntentClassification>,
+    ) -> bool {
+        if let Some(mut memory) = self.memories.get_mut(&memory_id) {
+            memory.memory_type_classification = classification;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Types every memory whose memory-type classification is missing or from another
+    /// model version. Synchronous: meant for `POST /intent/reclassify` on existing
+    /// projects (new memories are typed by the `ClassifyMemory` job).
+    pub fn reclassify_memory_types(&self) -> MemoryTypeReclassification {
+        let mut report = MemoryTypeReclassification::default();
+        let Some(expected) = self.memory_type_version() else {
+            return report;
+        };
+        let ids: Vec<MemoryId> = self.memories.iter().map(|entry| *entry.key()).collect();
+        for memory_id in ids {
+            let Some(memory) = self.get_memory(memory_id) else { continue };
+            report.memories += 1;
+            if memory.memory_type_classification.as_ref().is_some_and(|classification| {
+                classification.model_version == expected && classification.taxonomy_version == INTENT_TAXONOMY_VERSION
+            }) {
+                report.already_current += 1;
+                continue;
+            }
+            match self.classify_memory_type(&memory) {
+                Ok(Some(classification)) => {
+                    *report.primary.entry(classification.primary_intent.clone()).or_default() += 1;
+                    self.attach_memory_type_classification(memory_id, Some(classification));
+                    report.classified += 1;
+                }
+                Ok(None) => report.not_applicable += 1,
+                Err(_) => report.failed += 1,
+            }
+        }
+        report
+    }
+
+    /// The classification intent reranking uses for a memory: the memory-type head's for
+    /// memories it applies to when the head is on, otherwise the intent probe's. `None`
+    /// when that classification is missing or from another model version.
+    fn reranking_intent<'a>(
+        memory: &'a Memory<T>,
+        model_version: &str,
+        memory_head_version: Option<&str>,
+    ) -> Option<&'a IntentClassification> {
+        let (classification, expected) = match memory_head_version {
+            Some(version) if Self::memory_type_head_applies(memory) => (memory.memory_type_classification.as_ref(), version),
+            _ => (memory.intent_classification.as_ref(), model_version),
+        };
+        classification.filter(|classification| {
+            classification.taxonomy_version == INTENT_TAXONOMY_VERSION && classification.model_version == expected
+        })
     }
 
     /// Return `(total, annotated, missing_current_version, stale_version)` for
@@ -1151,6 +1310,125 @@ where
     pub fn source_order_for_memory(&self, memory_id: MemoryId) -> Option<(String, i64)> {
         let memory = self.memories.get(&memory_id)?;
         Self::source_order_link_for_memory(memory.value())
+    }
+
+    /// Role of a conversation message: `source_role` metadata (or an alias), else a
+    /// `source_role:` cue. See `conversation::classify_role`.
+    fn conversation_role_of(memory: &Memory<T>) -> Option<crate::conversation::ConversationRole> {
+        Self::metadata_string_value(&memory.metadata, &["source_role", "role", "speaker", "author_role"])
+            .or_else(|| {
+                memory
+                    .cues
+                    .iter()
+                    .find_map(|cue| cue.strip_prefix("source_role:").map(str::to_string))
+            })
+            .and_then(|role| crate::conversation::classify_role(&role))
+    }
+
+    /// Position of a memory within a message split across several memories:
+    /// `source_part_index` metadata, else the `chunk_idx:` cue.
+    fn message_part_index(memory: &Memory<T>) -> Option<i64> {
+        Self::metadata_string_value(&memory.metadata, &["source_part_index", "part_index"])
+            .and_then(|value| value.parse::<i64>().ok())
+            .or_else(|| {
+                memory.cues.iter().find_map(|cue| {
+                    cue.strip_prefix("chunk_idx:").and_then(|value| value.parse::<i64>().ok())
+                })
+            })
+    }
+
+    /// The memories holding the message that `memory_id` replies to, in part order
+    /// (see `conversation::round_partner_index`). Messages are identified by session and
+    /// order metadata, never by ingestion order; empty when that metadata or a role is
+    /// missing, or when no partner lies within the lookback.
+    pub fn conversation_round_partner(&self, memory_id: MemoryId) -> Vec<MemoryId> {
+        self.conversation_neighbour(memory_id, false)
+    }
+
+    /// The memories holding the message that replies to `memory_id`, in part order (see
+    /// `conversation::round_reply_index`): the assistant answer to a user message, or in
+    /// human-to-human chats the next message by someone else. Same metadata rules and
+    /// lookahead as [`Self::conversation_round_partner`].
+    pub fn conversation_round_reply(&self, memory_id: MemoryId) -> Vec<MemoryId> {
+        self.conversation_neighbour(memory_id, true)
+    }
+
+    fn conversation_neighbour(&self, memory_id: MemoryId, forward: bool) -> Vec<MemoryId> {
+        use crate::conversation::{ConversationRole, ROUND_LOOKBACK_ENTRIES, ROUND_LOOKBACK_MESSAGES};
+        let Some((session, order, role)) = self.memories.get(&memory_id).and_then(|memory| {
+            let (session, order) = Self::source_order_link_for_memory(memory.value())?;
+            Some((session, order, Self::conversation_role_of(memory.value())?))
+        }) else {
+            return Vec::new();
+        };
+        let has_neighbour = if forward {
+            matches!(role, ConversationRole::User | ConversationRole::Speaker(_))
+        } else {
+            matches!(role, ConversationRole::Assistant | ConversationRole::Speaker(_))
+        };
+        if !has_neighbour {
+            return Vec::new();
+        }
+        // Entries of the conversation before (or after) this message, nearest first. The
+        // index is sorted by (order, memory id); entries sharing an order are parts of one
+        // message.
+        let nearby: Vec<SourceOrderEntry> = match self.source_order_index.get(&session) {
+            Some(entries) if forward => {
+                let start = entries.partition_point(|entry| entry.order <= order);
+                entries[start..].iter().take(ROUND_LOOKBACK_ENTRIES).copied().collect()
+            }
+            Some(entries) => {
+                let end = entries.partition_point(|entry| entry.order < order);
+                entries[..end].iter().rev().take(ROUND_LOOKBACK_ENTRIES).copied().collect()
+            }
+            None => return Vec::new(),
+        };
+        let mut messages: Vec<(i64, Vec<MemoryId>)> = Vec::new();
+        for entry in nearby {
+            if messages.last().map_or(true, |(message_order, _)| *message_order != entry.order) {
+                if messages.len() == ROUND_LOOKBACK_MESSAGES {
+                    break;
+                }
+                messages.push((entry.order, Vec::new()));
+            }
+            if let Some((_, parts)) = messages.last_mut() {
+                parts.push(entry.memory_id);
+            }
+        }
+        let roles: Vec<Option<ConversationRole>> = messages
+            .iter()
+            .map(|(_, parts)| {
+                parts.iter().find_map(|id| {
+                    self.memories
+                        .get(id)
+                        .and_then(|memory| Self::conversation_role_of(memory.value()))
+                })
+            })
+            .collect();
+        let found = if forward {
+            crate::conversation::round_reply_index(&role, &roles)
+        } else {
+            crate::conversation::round_partner_index(&role, &roles)
+        };
+        let Some(index) = found else {
+            return Vec::new();
+        };
+        let mut parts: Vec<(Option<i64>, MemoryId)> = messages[index]
+            .1
+            .iter()
+            .map(|id| {
+                let part = self.memories.get(id).and_then(|memory| Self::message_part_index(memory.value()));
+                (part, *id)
+            })
+            .collect();
+        parts.sort_unstable();
+        parts.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// Stored text of a memory, or `None` when it is missing or cannot be read.
+    pub fn memory_content(&self, memory_id: MemoryId) -> Option<String> {
+        let memory = self.memories.get(&memory_id)?;
+        self.read_memory_content(memory.value()).ok()
     }
 
     pub fn ordered_entries_for_session(
@@ -1649,7 +1927,6 @@ where
                     // (though attach_cues re-acquires check, better safe)
                 }
             }
-
             if overwrite_cues {
                 // Remove old cues from index + Replace cues
                 // We need to get old cues first
@@ -2350,7 +2627,7 @@ where
         )
     }
 
-    fn recall_weighted_profiled_with_options(
+    pub fn recall_weighted_profiled_with_options(
         &self,
         query_cues: Vec<(String, f64)>,
         limit: usize,
@@ -2415,15 +2692,10 @@ where
         timing.scanned_posting_count = search_timing.scanned_posting_count;
         timing.adaptive_scan_limit = search_timing.adaptive_scan_limit;
         timing.max_posting_len = search_timing.max_posting_len;
-
         if semantic_rerank_only {
             let config = self.config.semantic.resolved();
             let rerank_limit = config.semantic_rerank_candidate_limit.max(limit);
-            results.sort_unstable_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            results.sort_unstable_by(|a,b| b.score.total_cmp(&a.score).then_with(|| a.memory_id.cmp(&b.memory_id)));
             results.truncate(rerank_limit);
             timing.semantic_rerank_candidate_limit = rerank_limit;
             timing.semantic_rerank_candidate_count = results.len();
@@ -2477,8 +2749,8 @@ where
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.memory_id.cmp(&b.memory_id))
         });
-
         results.truncate(limit);
         timing.sort_truncate_ms = phase_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -2646,16 +2918,8 @@ where
 
         let mut scored = Vec::new();
         for (index, candidate) in results.iter_mut().enumerate() {
-            let Some(memory) = self.memories.get(&candidate.memory_id) else {
-                continue;
-            };
-            let Some(vector) = memory.semantic_vector.as_ref() else {
-                continue;
-            };
-            let Ok(similarity) = vector.cosine_similarity_normalized(&normalized_query) else {
-                continue;
-            };
-
+            let Some(similarity)=self.memories.get(&candidate.memory_id).and_then(|memory| memory.semantic_vector.as_ref()
+                .and_then(|vector| vector.cosine_similarity_normalized(&normalized_query).ok())) else { continue; };
             candidate.semantic_similarity = similarity;
             scored.push((index, similarity));
         }
@@ -2696,6 +2960,11 @@ where
             return scored.len();
         }
 
+        if config.fusion == crate::semantic::HybridFusion::Rrf {
+            self.apply_rank_fusion(results, &scored, lexical_min, lexical_range, &config);
+            return scored.len();
+        }
+
         let lexical_weight = 1.0 - semantic_weight;
         for (index, similarity) in scored.iter().copied() {
             let candidate = &mut results[index];
@@ -2713,6 +2982,60 @@ where
         }
 
         scored.len()
+    }
+
+    /// Reciprocal rank fusion over the bounded hybrid slate.
+    ///
+    /// The lexical lane ranks candidates by their score without the intent
+    /// bonus, counting only candidates with positive lexical evidence; the
+    /// semantic lane ranks candidates that have a vector by similarity. Each
+    /// lane adds 1 / (k + rank), with equal weight. The fused value is mapped
+    /// back into the slate's lexical score range so results still merge with
+    /// other recall passes on a comparable scale; the intent bonus is added
+    /// afterwards when `rrf_keep_intent` is set. Ties break by memory ID.
+    fn apply_rank_fusion(
+        &self,
+        results: &mut [ScoredMemoryCandidate],
+        scored: &[(usize, f32)],
+        lexical_min: f64,
+        lexical_range: f64,
+        config: &crate::semantic::SemanticConfig,
+    ) {
+        let rank_constant = config.rrf_rank_constant.max(1) as f64;
+        let lexical = results.iter()
+            .map(|candidate| candidate.score - candidate.intent_rerank_bonus)
+            .collect::<Vec<_>>();
+        let mut fused = vec![0.0f64; results.len()];
+
+        let mut lexical_order = (0..results.len())
+            .filter(|&index| lexical[index] > 0.0)
+            .collect::<Vec<_>>();
+        lexical_order.sort_unstable_by(|&a, &b| lexical[b].total_cmp(&lexical[a])
+            .then_with(|| results[a].memory_id.cmp(&results[b].memory_id)));
+        for (rank, &index) in lexical_order.iter().enumerate() {
+            fused[index] += 1.0 / (rank_constant + (rank + 1) as f64);
+        }
+
+        let mut semantic_order = scored.to_vec();
+        semantic_order.sort_unstable_by(|a, b| b.1.total_cmp(&a.1)
+            .then_with(|| results[a.0].memory_id.cmp(&results[b.0].memory_id)));
+        for (rank, (index, _)) in semantic_order.iter().enumerate() {
+            fused[*index] += 1.0 / (rank_constant + (rank + 1) as f64);
+        }
+
+        let fused_min = fused.iter().copied().fold(f64::INFINITY, f64::min);
+        let fused_max = fused.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let fused_range = fused_max - fused_min;
+        for (index, candidate) in results.iter_mut().enumerate() {
+            let quality = if fused_range > f64::EPSILON { (fused[index] - fused_min) / fused_range } else { 1.0 };
+            if !config.rrf_keep_intent {
+                candidate.intent_rerank_bonus = 0.0;
+            }
+            let final_score = lexical_min + quality * lexical_range + candidate.intent_rerank_bonus;
+            let delta = final_score - candidate.score;
+            candidate.score = final_score;
+            candidate.rerank_bonus += delta;
+        }
     }
 
     fn merge_semantic_candidates(
@@ -2859,18 +3182,16 @@ where
         }
 
         let query_weight = f64::from(query_intent.confidence_weight);
+        let memory_head_version = self.memory_type_version();
         for candidate in results {
             let Some(memory) = self.memories.get(&candidate.memory_id) else {
                 continue;
             };
-            let Some(memory_intent) = memory.intent_classification.as_ref() else {
+            let Some(memory_intent) =
+                Self::reranking_intent(&memory, &config.model_version, memory_head_version.as_deref())
+            else {
                 continue;
             };
-            if memory_intent.taxonomy_version != crate::intent::INTENT_TAXONOMY_VERSION
-                || memory_intent.model_version != config.model_version
-            {
-                continue;
-            }
             let compatibility = intent_compatibility(query_intent, memory_intent);
             let memory_weight = f64::from(memory_intent.confidence_weight);
             let positive = compatibility
@@ -3084,7 +3405,7 @@ where
                 let mut total_recency = 0.0;
                 let mut total_w_rec = 0.0;
                 let mut total_w_freq = 0.0;
-                let match_count = positions_info.len() as f64;
+                let match_count = (positions_info.len() as f64).max(1.0);
 
                 for (pos, list_len, _weight, _) in &positions_info {
                     let pos_f64 = *pos as f64;
@@ -3406,6 +3727,7 @@ where
             "cue_global_counts".to_string(),
             serde_json::json!(self.cue_global_counts.len()),
         );
+        stats.insert("semantic_model".to_string(),serde_json::json!(self.config.semantic.resolved().model_version));
 
         stats
     }
@@ -3991,6 +4313,90 @@ mod tests {
         assert_eq!(results[0].semantic_similarity, 1.0);
     }
 
+    fn rank_fusion_engine(keep_intent: bool) -> CueMapEngine<MainStats> {
+        let mut engine = CueMapEngine::<MainStats>::new();
+        let mut config = SemanticConfig::default();
+        config.enabled = true;
+        config.dimensions = 3;
+        config.storage = crate::semantic::SemanticStorage::F32;
+        config.index = crate::semantic::SemanticIndexMode::Exact;
+        config.fusion = crate::semantic::HybridFusion::Rrf;
+        config.rrf_keep_intent = keep_intent;
+        engine.set_semantic_config(config);
+        engine
+    }
+
+    fn add_vector_memory(engine: &CueMapEngine<MainStats>, text: &str, vector: Vec<f32>) -> MemoryId {
+        engine.add_memory_with_event_time_and_vector(
+            text.to_string(),
+            vec!["topic".to_string()],
+            None,
+            MainStats::default(),
+            true,
+            None,
+            Some(vector),
+        )
+    }
+
+    #[test]
+    fn rank_fusion_orders_by_combined_lexical_and_semantic_ranks() {
+        let engine = rank_fusion_engine(true);
+        // Lexical order a > b > c; semantic order b > c > a.
+        let a = add_vector_memory(&engine, "lexically strongest", vec![0.0, 1.0, 0.0]);
+        let b = add_vector_memory(&engine, "semantically strongest", vec![1.0, 0.0, 0.0]);
+        let c = add_vector_memory(&engine, "weakest lexical", vec![0.6, 0.8, 0.0]);
+        let mut results = vec![candidate(a, 300.0), candidate(b, 200.0), candidate(c, 100.0)];
+
+        let count = engine.rerank_existing_semantic_candidates(&mut results, &[1.0, 0.0, 0.0]);
+        assert_eq!(count, 3);
+
+        // RRF with k=60: b = 1/62 + 1/61, a = 1/61 + 1/63, c = 1/63 + 1/62.
+        results.sort_by(|x, y| y.score.total_cmp(&x.score));
+        assert_eq!(results.iter().map(|r| r.memory_id).collect::<Vec<_>>(), vec![b, a, c]);
+        // Fused values are mapped back onto the slate's lexical range.
+        assert_eq!(results[0].score, 300.0);
+        assert_eq!(results[2].score, 100.0);
+        assert!(results[1].score > 100.0 && results[1].score < 300.0);
+    }
+
+    #[test]
+    fn rank_fusion_adds_or_drops_intent_bonus_by_config() {
+        for keep_intent in [true, false] {
+            let engine = rank_fusion_engine(keep_intent);
+            let a = add_vector_memory(&engine, "first", vec![1.0, 0.0, 0.0]);
+            let b = add_vector_memory(&engine, "second", vec![0.0, 1.0, 0.0]);
+            let mut boosted = candidate(a, 1064.0);
+            boosted.intent_rerank_bonus = 64.0;
+            let mut results = vec![boosted, candidate(b, 0.5)];
+
+            engine.rerank_existing_semantic_candidates(&mut results, &[1.0, 0.0, 0.0]);
+
+            // `a` leads both lanes, so it maps to the top of the lexical range.
+            let expected_intent = if keep_intent { 64.0 } else { 0.0 };
+            assert_eq!(results[0].intent_rerank_bonus, expected_intent);
+            assert_eq!(results[0].score, 1000.0 + expected_intent);
+            assert_eq!(results[1].score, 0.5);
+        }
+    }
+
+    #[test]
+    fn rank_fusion_is_deterministic_for_tied_candidates() {
+        let engine = rank_fusion_engine(true);
+        let a = add_vector_memory(&engine, "tie one", vec![1.0, 0.0, 0.0]);
+        let b = add_vector_memory(&engine, "tie two", vec![1.0, 0.0, 0.0]);
+        let c = add_vector_memory(&engine, "anchor", vec![0.0, 1.0, 0.0]);
+        let run = |order: [MemoryId; 3]| {
+            let mut results = order.iter()
+                .map(|&id| candidate(id, if id == c { 10.0 } else { 50.0 }))
+                .collect::<Vec<_>>();
+            engine.rerank_existing_semantic_candidates(&mut results, &[1.0, 0.0, 0.0]);
+            let mut scores = results.iter().map(|r| (r.memory_id, r.score)).collect::<Vec<_>>();
+            scores.sort_by(|x, y| x.0.cmp(&y.0));
+            scores
+        };
+        assert_eq!(run([a, b, c]), run([c, b, a]));
+    }
+
     #[test]
     fn structured_helpers_cover_facet_families_and_fallbacks() {
         let generated = [
@@ -4098,6 +4504,106 @@ mod tests {
         let engine = CueMapEngine::<MainStats>::new();
         assert!(engine.ordered_entries_for_session("!!!", 10).is_empty());
         assert!(engine.source_order_window("!!!", 0, 2).is_empty());
+    }
+
+    fn add_message(
+        engine: &CueMapEngine<MainStats>,
+        session: &str,
+        turn: i64,
+        role: &str,
+        part: Option<i64>,
+        text: &str,
+    ) -> MemoryId {
+        let mut metadata = HashMap::new();
+        metadata.insert("source_session_id".to_string(), serde_json::json!(session));
+        metadata.insert("source_turn_index".to_string(), serde_json::json!(turn));
+        metadata.insert("source_role".to_string(), serde_json::json!(role));
+        if let Some(part) = part {
+            metadata.insert("source_part_index".to_string(), serde_json::json!(part));
+        }
+        engine.add_memory(text.to_string(), vec![format!("turn{turn}")], Some(metadata), MainStats::default(), true)
+    }
+
+    #[test]
+    fn conversation_round_partner_follows_message_metadata_not_ingestion_order() {
+        let engine = CueMapEngine::<MainStats>::new();
+        // Ingested out of order on purpose: the partner comes from turn metadata.
+        let answer = add_message(&engine, "chat-1", 4, "assistant", None, "Golden Retrievers like Max");
+        let tool = add_message(&engine, "chat-1", 3, "tool", None, "search results");
+        let prompt_b = add_message(&engine, "chat-1", 2, "user", Some(1), "part two of the prompt");
+        let prompt_a = add_message(&engine, "chat-1", 2, "user", Some(0), "part one of the prompt");
+        let earlier_answer = add_message(&engine, "chat-1", 1, "assistant", None, "earlier answer");
+        let first_prompt = add_message(&engine, "chat-1", 0, "user", None, "first prompt");
+        let other_session = add_message(&engine, "chat-2", 3, "user", None, "different chat");
+
+        // The tool message between prompt and answer stays inside the round, and both
+        // parts of the split prompt come back in part order.
+        assert_eq!(engine.conversation_round_partner(answer), vec![prompt_a, prompt_b]);
+        assert_eq!(engine.conversation_round_partner(tool), Vec::<MemoryId>::new());
+        assert_eq!(engine.conversation_round_partner(earlier_answer), vec![first_prompt]);
+        // User messages open a round and have no partner; nor does a missing memory.
+        assert!(engine.conversation_round_partner(prompt_a).is_empty());
+        assert!(engine.conversation_round_partner(other_session).is_empty());
+        assert!(engine.conversation_round_partner(9_999).is_empty());
+        assert_eq!(engine.memory_content(first_prompt).as_deref(), Some("first prompt"));
+    }
+
+    #[test]
+    fn conversation_round_reply_mirrors_the_partner() {
+        let engine = CueMapEngine::<MainStats>::new();
+        let first_prompt = add_message(&engine, "chat-1", 0, "user", None, "first prompt");
+        let first_answer = add_message(&engine, "chat-1", 1, "assistant", None, "first answer");
+        let lone_prompt = add_message(&engine, "chat-1", 2, "user", None, "a prompt without an answer");
+        let prompt = add_message(&engine, "chat-1", 3, "user", None, "second prompt");
+        let tool = add_message(&engine, "chat-1", 4, "tool", None, "search results");
+        // Ingested out of order: the reply comes from turn metadata.
+        let answer_b = add_message(&engine, "chat-1", 5, "assistant", Some(1), "answer, part two");
+        let answer_a = add_message(&engine, "chat-1", 5, "assistant", Some(0), "answer, part one");
+        assert_eq!(engine.conversation_round_reply(first_prompt), vec![first_answer]);
+        assert_eq!(engine.conversation_round_reply(prompt), vec![answer_a, answer_b]);
+        // The next user message ends a round without an answer; answers and tools get none.
+        assert!(engine.conversation_round_reply(lone_prompt).is_empty());
+        assert!(engine.conversation_round_reply(first_answer).is_empty());
+        assert!(engine.conversation_round_reply(tool).is_empty());
+        assert!(engine.conversation_round_reply(9_999).is_empty());
+        // The partner is unchanged by the shared lookup.
+        assert_eq!(engine.conversation_round_partner(answer_a), vec![prompt]);
+
+        let a1 = add_message(&engine, "dm", 0, "Caroline", None, "I went to a support group");
+        let a2 = add_message(&engine, "dm", 1, "Caroline", None, "It was powerful");
+        let b1 = add_message(&engine, "dm", 2, "Melanie", None, "That's great to hear");
+        assert_eq!(engine.conversation_round_reply(a1), vec![b1]);
+        assert_eq!(engine.conversation_round_reply(a2), vec![b1]);
+        assert!(engine.conversation_round_reply(b1).is_empty());
+    }
+
+    #[test]
+    fn conversation_round_partner_handles_speakers_and_missing_metadata() {
+        let engine = CueMapEngine::<MainStats>::new();
+        let a1 = add_message(&engine, "dm", 0, "Caroline", None, "I went to a support group");
+        let b1 = add_message(&engine, "dm", 1, "Melanie", None, "How was it?");
+        let b2 = add_message(&engine, "dm", 2, "Melanie", None, "Tell me everything");
+        let a2 = add_message(&engine, "dm", 3, "Caroline", None, "It was powerful");
+        assert_eq!(engine.conversation_round_partner(a2), vec![b2]);
+        assert_eq!(engine.conversation_round_partner(b2), vec![a1]);
+        assert_eq!(engine.conversation_round_partner(b1), vec![a1]);
+        assert!(engine.conversation_round_partner(a1).is_empty());
+
+        // No session/order metadata: never falls back to the previously stored memory.
+        let plain_user = engine.add_memory("user: hello".to_string(), vec!["source_role:user".to_string()], None, MainStats::default(), true);
+        let plain_answer = engine.add_memory("assistant: hi".to_string(), vec!["source_role:assistant".to_string()], None, MainStats::default(), true);
+        assert!(engine.conversation_round_partner(plain_answer).is_empty());
+        let _ = plain_user;
+
+        // A message without a role between the answer and the prompt stops the search.
+        let prompt = add_message(&engine, "mixed", 0, "user", None, "prompt");
+        let mut no_role = HashMap::new();
+        no_role.insert("source_session_id".to_string(), serde_json::json!("mixed"));
+        no_role.insert("source_turn_index".to_string(), serde_json::json!(1));
+        engine.add_memory("unlabelled".to_string(), vec!["x".to_string()], Some(no_role), MainStats::default(), true);
+        let answer = add_message(&engine, "mixed", 2, "assistant", None, "answer");
+        assert!(engine.conversation_round_partner(answer).is_empty());
+        let _ = prompt;
     }
 
     #[test]
@@ -4291,6 +4797,82 @@ mod tests {
         engine.attach_intent_classification(stale_id, stale);
         assert_eq!(engine.intent_coverage(), (2, 2, 1, 1));
         assert!(engine.attach_intent_classification(INVALID_MEMORY_ID, classification("preference", 1.0, true)) == false);
+    }
+
+    #[test]
+    fn memory_type_head_types_user_memories_and_drives_reranking_intent() {
+        struct FixedEncoder;
+        impl SemanticEncoder for FixedEncoder {
+            fn dimensions(&self) -> usize { 384 }
+            fn encode(&self, text: &str) -> Result<Vec<f32>, String> {
+                let mut vector = vec![0.0; 384];
+                vector[text.len() % 384] = 1.0;
+                Ok(vector)
+            }
+        }
+        let role = |value: &str| Some(HashMap::from([("source_role".to_string(), serde_json::json!(value))]));
+        let mut engine = CueMapEngine::<MainStats>::new();
+        let mut config = SemanticConfig::default();
+        config.model_version = "bundled-qint8-minilm-l3".to_string();
+        config.memory_type_head = true;
+        engine.set_semantic_config(config.clone());
+        engine.set_semantic_encoder(Some(Arc::new(FixedEncoder)));
+        assert!(engine.memory_type_head_enabled());
+
+        let user = engine.add_memory("user: I prefer green tea over coffee. Can you suggest a brand?".to_string(), vec!["tea".to_string()], role("user"), MainStats::default(), true);
+        let assistant = engine.add_memory("assistant: Sure, here are three brands.".to_string(), vec!["tea".to_string()], role("assistant"), MainStats::default(), true);
+        let note = engine.add_memory("Remember the dentist appointment on Friday morning.".to_string(), vec!["dentist".to_string()], None, MainStats::default(), true);
+        engine.attach_intent_classification(assistant, classification("action_or_command", 1.0, false));
+
+        let first = engine.reclassify_memory_types();
+        assert_eq!((first.memories, first.classified, first.already_current, first.not_applicable, first.failed), (3, 2, 0, 1, 0));
+        assert_eq!(first.primary.values().sum::<usize>(), 2);
+        let again = engine.reclassify_memory_types();
+        assert_eq!((again.classified, again.already_current, again.not_applicable), (0, 2, 1));
+
+        let head_version = crate::intent::memory_model_version(&config.model_version);
+        let user_memory = engine.get_memory(user).unwrap();
+        let typed = user_memory.memory_type_classification.as_ref().unwrap();
+        assert_eq!(typed.model_version, head_version);
+        assert!(user_memory.intent_classification.is_none());
+        assert!(engine.get_memory(note).unwrap().memory_type_classification.is_some());
+        let assistant_memory = engine.get_memory(assistant).unwrap();
+        assert!(assistant_memory.memory_type_classification.is_none());
+
+        // With the head on, user memories rerank by their memory type; assistant
+        // memories keep the intent probe's classification. With it off, nothing changes.
+        let pick = |memory: &Memory<MainStats>, head: Option<&str>| {
+            CueMapEngine::<MainStats>::reranking_intent(memory, &config.model_version, head).map(|c| c.model_version.clone())
+        };
+        assert_eq!(pick(&user_memory, Some(&head_version)), Some(head_version.clone()));
+        assert_eq!(pick(&user_memory, None), None);
+        assert_eq!(pick(&assistant_memory, Some(&head_version)), Some(config.model_version.clone()));
+        assert_eq!(pick(&assistant_memory, None), Some(config.model_version.clone()));
+
+        // Role labels that repeat the metadata are not part of what the user wrote.
+        assert_eq!(CueMapEngine::<MainStats>::memory_body(&user_memory, "user: hello there"), "hello there");
+        assert_eq!(CueMapEngine::<MainStats>::memory_body(&user_memory, "  USER:  hello"), "hello");
+        assert_eq!(CueMapEngine::<MainStats>::memory_body(&assistant_memory, "user: hello"), "user: hello");
+
+        let mut off = CueMapEngine::<MainStats>::new();
+        off.set_semantic_config(SemanticConfig { memory_type_head: false, ..config.clone() });
+        off.set_semantic_encoder(Some(Arc::new(FixedEncoder)));
+        assert!(!off.memory_type_head_enabled());
+        let id = off.add_memory("user: I prefer tea.".to_string(), vec!["tea".to_string()], role("user"), MainStats::default(), true);
+        assert_eq!(off.reclassify_memory_types().memories, 0);
+        assert!(off.classify_memory_type(&off.get_memory(id).unwrap()).unwrap().is_none());
+
+        // A local head file gets its own version, so memories typed by another head are redone.
+        let head_file = std::env::temp_dir().join(format!("cuemap-head-{}.head", uuid::Uuid::new_v4()));
+        std::fs::write(&head_file, include_bytes!("../assets/all-MiniLM-L3-v2/memory_type_probe_qint8.head")).unwrap();
+        let mut local = engine;
+        local.set_semantic_config(SemanticConfig { memory_type_head_path: head_file.display().to_string(), ..config.clone() });
+        local.set_semantic_encoder(Some(Arc::new(FixedEncoder)));
+        let local_version = local.memory_type_version().unwrap();
+        assert!(local_version.starts_with("bundled-qint8-minilm-l3+memtype-local-"), "{local_version}");
+        let redo = local.reclassify_memory_types();
+        assert_eq!((redo.classified, redo.already_current, redo.not_applicable), (2, 0, 1));
+        std::fs::remove_file(head_file).unwrap();
     }
 
     #[test]

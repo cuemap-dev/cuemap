@@ -190,219 +190,6 @@
         assert_eq!(merged.len(), 1);
     }
 
-    #[test]
-    fn projection_helpers_cover_source_instruction_preference_and_decision_paths() {
-        let ctx = ProjectContext::new(
-            NormalizationConfig::default(),
-            Taxonomy::default(),
-            Arc::new(TuningConfig::default()),
-            crate::config::ServerConfig::default(),
-            "api-projection-paths".to_string(),
-        );
-
-        let mut assistant_meta = HashMap::new();
-        assistant_meta.insert("source_role".to_string(), serde_json::json!("assistant"));
-        assistant_meta.insert(
-            "source_session_id".to_string(),
-            serde_json::json!("projection-session"),
-        );
-        assistant_meta.insert("source_turn_index".to_string(), serde_json::json!(2));
-        let assistant_id = ctx.main.add_memory(
-            "Dessert migration answer with probability details.".to_string(),
-            vec![
-                "source_role:assistant".to_string(),
-                "type:answer".to_string(),
-                "has:list".to_string(),
-                "dessert".to_string(),
-                "migration".to_string(),
-                "probability".to_string(),
-            ],
-            Some(assistant_meta.clone()),
-            MainStats::default(),
-            true,
-        );
-
-        let mut user_meta = HashMap::new();
-        user_meta.insert("source_role".to_string(), serde_json::json!("user"));
-        user_meta.insert(
-            "source_session_id".to_string(),
-            serde_json::json!("projection-session"),
-        );
-        user_meta.insert("source_turn_index".to_string(), serde_json::json!(1));
-        let user_id = ctx.main.add_memory(
-            "User dessert migration preference.".to_string(),
-            vec![
-                "source_role:user".to_string(),
-                "dessert".to_string(),
-                "migration".to_string(),
-            ],
-            Some(user_meta),
-            MainStats::default(),
-            true,
-        );
-
-        let standing_id = ctx.main.add_memory(
-            "Always use the migration probability threshold.".to_string(),
-            vec![
-                "type:standing_instruction".to_string(),
-                "instruction:conditional".to_string(),
-                "instruction:always".to_string(),
-                "instruction_trigger:probability".to_string(),
-                "probability".to_string(),
-                "migration".to_string(),
-            ],
-            Some(assistant_meta.clone()),
-            MainStats::default(),
-            true,
-        );
-        let preference_id = ctx.main.add_memory(
-            "I prefer dessert migration options.".to_string(),
-            vec![
-                "type:preference".to_string(),
-                "preference:explicit".to_string(),
-                "preference_value:dessert".to_string(),
-                "preference_topic:dessert".to_string(),
-                "preference_contrast:migration".to_string(),
-                "dessert".to_string(),
-                "migration".to_string(),
-                "source_role:user".to_string(),
-            ],
-            Some(assistant_meta.clone()),
-            MainStats::default(),
-            true,
-        );
-        let decision_id = ctx.main.add_memory(
-            "The naming decision selected migration.".to_string(),
-            vec![
-                "type:decision".to_string(),
-                "type:selection".to_string(),
-                "type:naming".to_string(),
-                "migration".to_string(),
-            ],
-            Some(assistant_meta),
-            MainStats::default(),
-            true,
-        );
-
-        let plan = crate::facets::StructuralQueryPlan {
-            labels: vec![
-                "__semantic_facets_removed__".to_string(),
-                "source_answer".to_string(),
-                "source_assistant".to_string(),
-                "personal_recommendation_context".to_string(),
-                "naming_decision".to_string(),
-            ],
-            ..Default::default()
-        };
-        let mut assistant_result = recall_result(0.9, 3);
-        assistant_result.memory_id = assistant_id;
-        assistant_result.content = "Dessert migration answer with probability details.".to_string();
-        assistant_result.created_at = 2.0;
-        assistant_result.metadata = [
-            ("source_role".to_string(), serde_json::json!("assistant")),
-            ("source_session_id".to_string(), serde_json::json!("projection-session")),
-        ]
-        .into_iter()
-        .collect();
-        let mut user_result = recall_result(0.6, 5);
-        user_result.memory_id = user_id;
-        user_result.content = "User dessert migration preference.".to_string();
-        user_result.created_at = 1.0;
-        user_result.metadata = [
-            ("source_role".to_string(), serde_json::json!("user")),
-            ("source_session_id".to_string(), serde_json::json!("projection-session")),
-            ("user_context_projection".to_string(), serde_json::json!(true)),
-        ]
-        .into_iter()
-        .collect();
-        let all_results = vec![assistant_result.clone(), user_result.clone()];
-
-        assert!(source_answer_projection_requested(Some(&plan), Some("what did the assistant answer")));
-        assert!(!source_answer_projection_cues(&ctx, Some(&plan), Some("list the answer"), &all_results).is_empty());
-        assert!(!source_prompt_projection_cues(
-            &ctx,
-            Some(&plan),
-            Some("assistant answer about dessert migration"),
-            &all_results,
-        )
-        .is_empty());
-        assert!(user_context_projection_requested(
-            Some(&crate::facets::StructuralQueryPlan {
-                labels: vec!["__semantic_facets_removed__".to_string()],
-                ..Default::default()
-            }),
-            Some("what advice about dessert migration should I use"),
-        ));
-        assert!(!user_context_projection_cues(
-            &ctx,
-            Some(&crate::facets::StructuralQueryPlan {
-                labels: vec!["__semantic_facets_removed__".to_string(), "personal_recommendation_context".to_string()],
-                ..Default::default()
-            }),
-            Some("what advice about dessert migration should I use"),
-            &all_results,
-        )
-        .is_empty());
-
-        let standing = standing_instruction_projection_cues(
-            &ctx,
-            Some(&plan),
-            Some("what probability migration should we use"),
-        );
-        assert!(!standing.cues.is_empty());
-        assert!(!standing.anchors.is_empty());
-        let preference = preference_projection_cues(
-            &ctx,
-            Some(&plan),
-            Some("which dessert migration do I prefer"),
-        );
-        assert!(!preference.cues.is_empty());
-        assert!(!preference.anchors.is_empty());
-        assert!(!decision_projection_cues(&ctx, Some(&plan), &all_results).is_empty());
-
-        let mut projected = all_results.clone();
-        let mut standing_result = recall_result(0.4, 3);
-        standing_result.memory_id = standing_id;
-        standing_result.intersection_count = 5;
-        let mut preference_result = recall_result(0.4, 3);
-        preference_result.memory_id = preference_id;
-        preference_result.intersection_count = 5;
-        let mut decision_result = recall_result(0.4, 3);
-        decision_result.memory_id = decision_id;
-        decision_result.intersection_count = 5;
-        merge_source_answer_projection_results(&mut projected, vec![assistant_result.clone()]);
-        merge_source_prompt_projection_results(
-            &mut projected,
-            vec![user_result.clone()],
-            Some("assistant answer about dessert migration"),
-        );
-        merge_user_context_projection_results(&mut projected, vec![user_result.clone()]);
-        merge_standing_instruction_projection_results(
-            &ctx,
-            &mut projected,
-            vec![standing_result],
-            &standing.anchors,
-        );
-        merge_preference_projection_results(
-            &ctx,
-            &mut projected,
-            vec![preference_result],
-            &preference.anchors,
-        );
-        merge_decision_projection_results(&mut projected, vec![decision_result]);
-        apply_source_role_preference(&mut projected, Some(&plan));
-        apply_source_answer_adjacency_preference(&mut projected, Some(&plan));
-        apply_user_context_adjacency_preference(
-            &mut projected,
-            Some(&crate::facets::StructuralQueryPlan {
-                labels: vec!["__semantic_facets_removed__".to_string()],
-                ..Default::default()
-            }),
-            Some("what advice about dessert migration should I use"),
-        );
-        assert!(projected.iter().any(|result| result.metadata.contains_key("decision_projection")));
-    }
-
     fn recall_result(
         match_integrity: f64,
         intersection_count: usize,
@@ -1761,33 +1548,6 @@
     }
 
     #[test]
-    fn source_session_cue_is_derived_from_structured_metadata() {
-        let mut metadata = HashMap::new();
-        metadata.insert(
-            "source_session_id".to_string(),
-            serde_json::json!("Answer ShareGPT hA7AkP3 0"),
-        );
-
-        assert_eq!(
-            source_session_cue_from_metadata(&metadata).as_deref(),
-            Some("source_session:answer_sharegpt_ha7akp3_0")
-        );
-    }
-
-    #[test]
-    fn list_answer_detection_covers_ordinals_without_topic_words() {
-        assert!(query_wants_list_answer(Some(
-            "What was the 7th item you listed?"
-        )));
-        assert!(query_wants_list_answer(Some(
-            "Remind me what was in the list you provided."
-        )));
-        assert!(!query_wants_list_answer(Some(
-            "What did I purchase yesterday?"
-        )));
-    }
-
-    #[test]
     fn source_role_preference_demotes_structured_role_mismatches() {
         let mut user_result = recall_result(1.0, 3);
         user_result.score = 100.0;
@@ -1807,7 +1567,14 @@
             ..Default::default()
         };
         let mut results = vec![user_result, assistant_result];
-        apply_source_role_preference(&mut results, Some(&intent));
+        // Off by default; 0.35 restores the v0.7.3 adjustment.
+        assert_eq!(parse_source_role_mismatch_multiplier(None), 1.0);
+        assert_eq!(parse_source_role_mismatch_multiplier(Some(" 0.35 ")), 0.35);
+        assert_eq!(parse_source_role_mismatch_multiplier(Some("7")), 1.0);
+        assert_eq!(parse_source_role_mismatch_multiplier(Some("nope")), 1.0);
+        apply_source_role_preference_with(&mut results, Some(&intent), 1.0);
+        assert_eq!((results[0].score, results[1].score), (100.0, 80.0));
+        apply_source_role_preference_with(&mut results, Some(&intent), 0.35);
 
         assert!(results[0].score < results[1].score);
         assert_eq!(results[1].score, 80.0);
@@ -1940,7 +1707,6 @@
         metadata.insert("thread_id".to_string(), serde_json::json!("thread-42"));
         assert_eq!(metadata_string(&metadata, &["missing", "role"]), Some("assistant"));
         assert_eq!(source_role_from_metadata(&metadata).as_deref(), Some("assistant"));
-        assert_eq!(source_session_cue_from_metadata(&metadata).as_deref(), Some("source_session:thread_42"));
     }
 
     #[test]
@@ -1984,6 +1750,37 @@
 
     fn test_router() -> axum::Router {
         test_router_with_read_only(false)
+    }
+
+    #[tokio::test]
+    async fn reclassify_needs_a_project_the_memory_head_and_write_access() {
+        let call = |router: axum::Router, project: Option<&'static str>| async move {
+            let mut request = Request::builder().method("POST").uri("/intent/reclassify");
+            if let Some(project) = project {
+                request = request.header("X-Project-ID", project);
+            }
+            router.oneshot(request.body(Body::empty()).unwrap()).await.unwrap().status()
+        };
+        let router = test_router();
+        assert_eq!(call(router.clone(), None).await, StatusCode::BAD_REQUEST);
+        assert_eq!(call(router.clone(), Some("no-such-project")).await, StatusCode::NOT_FOUND);
+        let stored = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories")
+                    .header("content-type", "application/json")
+                    .header("X-Project-ID", "reclassify-test")
+                    .body(Body::from(r#"{"content":"I prefer tea","cues":["tea"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored.status(), StatusCode::OK);
+        // The head is off by default (and there is no encoder in this build).
+        assert_eq!(call(router, Some("reclassify-test")).await, StatusCode::CONFLICT);
+        assert_eq!(call(test_router_with_read_only(true), Some("reclassify-test")).await, StatusCode::FORBIDDEN);
     }
 
     fn test_router_with_read_only(read_only: bool) -> axum::Router {
@@ -3749,6 +3546,257 @@
         assert_eq!(recalled.status(), StatusCode::OK);
         let body = json_body(recalled).await;
         assert!(body["results"].is_array());
+    }
+
+    #[test]
+    fn conversation_round_moves_a_lower_ranked_prompt_up_to_its_reply() {
+        let ctx = ProjectContext::new(
+            NormalizationConfig::default(),
+            Taxonomy::default(),
+            Arc::new(TuningConfig::default()),
+            crate::config::ServerConfig::default(),
+            "round-move-up".to_string(),
+        );
+        let add = |turn: i64, role: &str, text: &str| {
+            let mut metadata = HashMap::new();
+            metadata.insert("source_session_id".to_string(), serde_json::json!("s"));
+            metadata.insert("source_turn_index".to_string(), serde_json::json!(turn));
+            metadata.insert("source_role".to_string(), serde_json::json!(role));
+            ctx.main.add_memory(text.to_string(), vec![format!("t{turn}")], Some(metadata), MainStats::default(), true)
+        };
+        let long_prompt = format!("second prompt {}", "word ".repeat(600)).trim().to_string();
+        let (u0, a1, u2, a3) = (add(0, "user", "first prompt"), add(1, "assistant", "first answer"),
+            add(2, "user", &long_prompt), add(3, "assistant", "second answer"));
+        let result = |id: MemoryId, content: &str| {
+            let mut r = recall_result(1.0, 1);
+            r.memory_id = id;
+            r.content = content.to_string();
+            r
+        };
+        // Backward attachment only (replies off; see the next test for replies).
+        // a3 outranks its prompt u2: u2 moves up into a3, in full, since it was already
+        // being returned. a1's prompt u0 ranks above a1: left alone.
+        let mut results = vec![result(a3, "second answer"), result(u0, "first prompt"),
+            result(u2, &long_prompt), result(a1, "first answer")];
+        assert_eq!(apply_conversation_round_expansion_with(&ctx, &mut results, 0), 1);
+        let ids: Vec<MemoryId> = results.iter().map(|r| r.memory_id).collect();
+        assert_eq!(ids, vec![a3, u0, a1]);
+        assert_eq!(results[0].content, format!("{long_prompt}\n\nsecond answer"));
+        assert!(results[0].metadata.get("expansion_truncated").is_none());
+        assert_eq!(results[0].metadata["expanded_memory_ids"], serde_json::json!([u2]));
+        assert_eq!(results[2].content, "first answer");
+
+        // A prompt that is not among the results is added, cut to the token cap.
+        let mut results = vec![result(a3, "second answer")];
+        assert_eq!(apply_conversation_round_expansion_with(&ctx, &mut results, 0), 1);
+        let added = results[0].content.strip_suffix("\n\nsecond answer").unwrap();
+        assert!(long_prompt.starts_with(added) && added.len() < long_prompt.len());
+        assert_eq!(crate::conversation::approx_token_count(added), crate::conversation::ROUND_PARTNER_TOKEN_CAP);
+        assert_eq!(results[0].metadata["expansion_truncated"], true);
+
+        // Another memory of the same answer (same turn): the prompt is attached once, to the higher one.
+        let a1b = add(1, "assistant", "first answer, continued");
+        let mut results = vec![result(a1, "first answer"), result(a1b, "first answer, continued")];
+        assert_eq!(apply_conversation_round_expansion_with(&ctx, &mut results, 0), 1);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].content, "first prompt\n\nfirst answer");
+        assert_eq!(results[1].content, "first answer, continued");
+    }
+
+    #[test]
+    fn conversation_round_can_append_the_reply_to_the_top_results() {
+        let ctx = ProjectContext::new(
+            NormalizationConfig::default(),
+            Taxonomy::default(),
+            Arc::new(TuningConfig::default()),
+            crate::config::ServerConfig::default(),
+            "round-reply".to_string(),
+        );
+        let add = |turn: i64, role: &str, text: &str| {
+            let mut metadata = HashMap::new();
+            metadata.insert("source_session_id".to_string(), serde_json::json!("s"));
+            metadata.insert("source_turn_index".to_string(), serde_json::json!(turn));
+            metadata.insert("source_role".to_string(), serde_json::json!(role));
+            ctx.main.add_memory(text.to_string(), vec![format!("t{turn}")], Some(metadata), MainStats::default(), true)
+        };
+        let long_answer = format!("first answer {}", "word ".repeat(600)).trim().to_string();
+        let (u0, a1, u2, a3) = (add(0, "user", "first prompt"), add(1, "assistant", &long_answer),
+            add(2, "user", "second prompt"), add(3, "assistant", "second answer"));
+        let result = |id: MemoryId, content: &str| {
+            let mut r = recall_result(1.0, 1);
+            r.memory_id = id;
+            r.content = content.to_string();
+            r
+        };
+        // On for the first result unless CUEMAP_ROUND_REPLY_TOP says otherwise.
+        assert_eq!(parse_round_reply_top(None), 1);
+        assert_eq!(parse_round_reply_top(Some(" 0 ")), 0);
+        assert_eq!(parse_round_reply_top(Some("2")), 2);
+        assert_eq!(parse_round_reply_top(Some("many")), 1);
+
+        // Off (0): user prompts stay as they are.
+        let mut results = vec![result(u0, "first prompt"), result(u2, "second prompt")];
+        assert_eq!(apply_conversation_round_expansion_with(&ctx, &mut results, 0), 0);
+        assert_eq!(results[0].content, "first prompt");
+
+        // Top 1: the first prompt gets its answer in full; the second prompt does not.
+        let mut results = vec![result(u0, "first prompt"), result(u2, "second prompt")];
+        assert_eq!(apply_conversation_round_expansion_with(&ctx, &mut results, 1), 1);
+        assert_eq!(results[0].content, format!("first prompt\n\n{long_answer}"));
+        assert_eq!(results[0].metadata["reply_memory_ids"], serde_json::json!([a1]));
+        assert_eq!(results[1].content, "second prompt");
+
+        // A reply ranked lower moves up into the prompt and leaves the list. An answer on top
+        // gets its prompt (backward) and no reply.
+        let mut results = vec![result(u2, "second prompt"), result(u0, "first prompt"), result(a3, "second answer")];
+        assert_eq!(apply_conversation_round_expansion_with(&ctx, &mut results, 2), 2);
+        let ids: Vec<MemoryId> = results.iter().map(|r| r.memory_id).collect();
+        assert_eq!(ids, vec![u2, u0]);
+        assert_eq!(results[0].content, "second prompt\n\nsecond answer");
+        let mut results = vec![result(a3, "second answer"), result(u0, "first prompt")];
+        assert_eq!(apply_conversation_round_expansion_with(&ctx, &mut results, 1), 1);
+        assert_eq!(results[0].content, "second prompt\n\nsecond answer");
+        assert!(results[0].metadata.get("reply_memory_ids").is_none());
+    }
+
+    #[test]
+    fn conversation_round_leaves_memories_without_conversation_metadata_unchanged() {
+        let ctx = ProjectContext::new(
+            NormalizationConfig::default(),
+            Taxonomy::default(),
+            Arc::new(TuningConfig::default()),
+            crate::config::ServerConfig::default(),
+            "round-plain".to_string(),
+        );
+        let first = ctx.main.add_memory("plain note one".to_string(), vec!["one".to_string()], None, MainStats::default(), true);
+        let second = ctx.main.add_memory("plain note two".to_string(), vec!["two".to_string()], None, MainStats::default(), true);
+        let mut results = vec![recall_result(1.0, 1), recall_result(0.9, 1)];
+        results[0].memory_id = first;
+        results[0].content = "plain note one".to_string();
+        results[1].memory_id = second;
+        results[1].content = "plain note two".to_string();
+        let before: Vec<(MemoryId, String)> = results.iter().map(|r| (r.memory_id, r.content.clone())).collect();
+        assert_eq!(apply_conversation_round_expansion_with(&ctx, &mut results, 1), 0);
+        let after: Vec<(MemoryId, String)> = results.iter().map(|r| (r.memory_id, r.content.clone())).collect();
+        assert_eq!(before, after);
+        assert!(results.iter().all(|r| r.metadata.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn conversation_round_expansion_attaches_the_replied_to_message_once() {
+        let router = test_router();
+        let mut ids = Vec::new();
+        for (turn, role, content, cues) in [
+            (0, "user", "I adopted a puppy named Max last spring.", vec!["puppy", "max"]),
+            (1, "assistant", "Golden retrievers like Max need daily walks.", vec!["golden", "retriever", "walks"]),
+            (2, "user", "Which collar should I buy for him?", vec!["collar"]),
+            (3, "assistant", "A leather collar with a name tag suits a golden retriever.", vec!["collar", "leather", "golden", "retriever"]),
+        ] {
+            let stored = router.clone().oneshot(Request::builder().method("POST").uri("/memories")
+                .header("X-Project-ID", "round-test").header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"content": content, "cues": cues, "disable_temporal_chunking": true,
+                    "metadata": {"source_session_id": "chat-7", "source_turn_index": turn, "source_role": role}}).to_string()))
+                .unwrap()).await.unwrap();
+            assert_eq!(stored.status(), StatusCode::OK);
+            ids.push(json_body(stored).await["id"].as_u64().unwrap());
+        }
+        let recall = |query: &str, depth: serde_json::Value| {
+            let router = router.clone();
+            let payload = serde_json::json!({"query_text": query, "cues": query.split(' ').collect::<Vec<_>>(),
+                "semantic_mode": "lexical", "limit": 2, "expansion_depth": depth, "explain": true});
+            async move {
+                router.oneshot(Request::builder().method("POST").uri("/recall")
+                    .header("X-Project-ID", "round-test").header("content-type", "application/json")
+                    .body(Body::from(payload.to_string())).unwrap()).await.unwrap()
+            }
+        };
+
+        // Both answers are recalled; each carries the user message that opened its round.
+        let response = recall("golden retriever", serde_json::json!("conversation_round")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let results = body["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        for (answer, prompt, prompt_text) in [(ids[1], ids[0], "I adopted a puppy named Max last spring."),
+            (ids[3], ids[2], "Which collar should I buy for him?")] {
+            let hit = results.iter().find(|r| r["memory_id"].as_u64() == Some(answer)).unwrap();
+            assert!(hit["content"].as_str().unwrap().starts_with(&format!("{prompt_text}\n\n")));
+            assert_eq!(hit["metadata"]["expansion"], "conversation_round");
+            assert_eq!(hit["metadata"]["expanded_memory_ids"], serde_json::json!([prompt]));
+        }
+        assert_eq!(body["explain"]["expansion"]["conversation_round_applied_count"], 2);
+
+        // When the prompt is itself a result, it appears once: on its own if it ranks
+        // above the answer, otherwise moved into the answer.
+        let body = json_body(recall("collar", serde_json::json!("conversation_round")).await).await;
+        let results = body["results"].as_array().unwrap();
+        let prompt_text = "Which collar should I buy for him?";
+        let occurrences: usize = results.iter().map(|r| r["content"].as_str().unwrap().matches(prompt_text).count()).sum();
+        assert_eq!(occurrences, 1);
+        let answer = results.iter().find(|r| r["memory_id"].as_u64() == Some(ids[3])).unwrap();
+        let prompt_alone = results.iter().any(|r| r["memory_id"].as_u64() == Some(ids[2]));
+        assert_eq!(answer["metadata"].get("expanded_memory_ids").is_some(), !prompt_alone);
+
+        // Numbers keep their meaning; unknown modes are rejected.
+        let body = json_body(recall("golden retriever", serde_json::json!(1)).await).await;
+        for hit in body["results"].as_array().unwrap() {
+            assert!(hit["metadata"].get("expansion").is_none());
+        }
+        assert_eq!(body["explain"]["expansion"]["depth"], 1);
+        assert_eq!(recall("golden retriever", serde_json::json!("sideways")).await.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn conversation_segmenter_ingests_messages_that_round_expansion_can_follow() {
+        // Ingestion jobs only run when background processing is on.
+        let snapshots = std::env::temp_dir().join(format!("cuemap-api-test-{}", uuid::Uuid::new_v4()));
+        let mt_engine = Arc::new(MultiTenantEngine::with_snapshots_dir(&snapshots, TuningConfig::default()));
+        let metrics = Arc::new(MetricsCollector::new());
+        let provider: Arc<dyn crate::jobs::ProjectProvider> = mt_engine.clone();
+        let job_queue = Arc::new(JobQueue::new(provider, Some(metrics.clone()), false));
+        let agent_manager = Arc::new(crate::agent::manager::AgentManager::new(job_queue.clone(), mt_engine.clone()));
+        let router = routes(mt_engine, job_queue, metrics, AuthConfig::from_config(&crate::config::SecurityConfig::default()),
+            false, snapshots.to_string_lossy().to_string(), None, None, agent_manager);
+        let transcript = "User: I adopted a puppy named Max last spring.\nAssistant: Golden retrievers like Max need daily walks.\nUser: ok\nAssistant: ok";
+        let post = |uri: &'static str, payload: serde_json::Value| {
+            let router = router.clone();
+            async move {
+                router.oneshot(Request::builder().method("POST").uri(uri)
+                    .header("X-Project-ID", "segmenter-test").header("content-type", "application/json")
+                    .body(Body::from(payload.to_string())).unwrap()).await.unwrap()
+            }
+        };
+        let ingested = post("/ingest/content", serde_json::json!({"content": transcript, "filename": "chat.txt",
+            "source_key": "chat.txt", "segmenter": "conversation", "metadata": {"source_session_id": "chat-42"}})).await;
+        assert_eq!(ingested.status(), StatusCode::OK);
+        let body = json_body(ingested).await;
+        assert_eq!((body["conversations"].as_u64(), body["messages"].as_u64(), body["chunks"].as_u64()), (Some(1), Some(4), Some(4)));
+        assert_eq!(body["memory_ids"][0], "chat.txt#chat-42/0/0");
+
+        let mut results = Vec::new();
+        for _ in 0..100 {
+            let recalled = post("/recall", serde_json::json!({"query_text": "golden retrievers walks", "semantic_mode": "lexical",
+                "limit": 1, "expansion_depth": "conversation_round"})).await;
+            results = json_body(recalled).await["results"].as_array().cloned().unwrap_or_default();
+            if !results.is_empty() && results[0]["metadata"].get("expansion").is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["metadata"]["source_role"], "assistant");
+        assert_eq!(results[0]["metadata"]["source_session_id"], "chat-42");
+        assert_eq!(results[0]["metadata"]["source_turn_index"], 1);
+        assert_eq!(
+            results[0]["content"],
+            "user: I adopted a puppy named Max last spring.\n\nassistant: Golden retrievers like Max need daily walks."
+        );
+
+        let rejected = post("/ingest/content", serde_json::json!({"content": "Plain prose, no speakers.", "segmenter": "conversation"})).await;
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        let debug = post("/debug/analyze-text", serde_json::json!({"text": transcript, "segmenter": "conversation"})).await;
+        assert_eq!(debug.status(), StatusCode::OK);
+        assert_eq!(json_body(debug).await["chunks"].as_array().unwrap().len(), 4);
     }
 
     #[tokio::test]

@@ -323,6 +323,7 @@ class CueMapNLBenchmark:
         include_metadata: bool = False,
         batch_writes: bool = False,
         semantic_mode: str = "lexical",
+        expansion_depth: str = "1",
     ):
         if semantic_mode not in {"lexical", "semantic", "hybrid"}:
             raise ValueError("semantic_mode must be lexical, semantic, or hybrid")
@@ -340,6 +341,9 @@ class CueMapNLBenchmark:
         self.include_metadata = include_metadata
         self.batch_writes = batch_writes
         self.semantic_mode = semantic_mode
+        # "default" omits the field so the engine default applies; otherwise a number or
+        # "conversation_round".
+        self.expansion_depth = expansion_depth
         self.synthetic_counter = 0
         
     def _get_headers(self) -> dict:
@@ -534,11 +538,13 @@ class CueMapNLBenchmark:
                     "disable_alias_expansion": True,
                     "disable_cuebridge_artifacts": True,
                     "depth": 1,
-                    "expansion_depth": 1,
                     "parent_fusion": "off",
                     "ordered_reconstruction": "off",
                     "evidence_coverage": "off",
                 })
+                if self.expansion_depth != "default":
+                    payload["expansion_depth"] = (int(self.expansion_depth)
+                        if self.expansion_depth.isdigit() else self.expansion_depth)
 
                 payloads.append(payload)
 
@@ -764,6 +770,7 @@ async def main():
     parser.add_argument('--include-metadata', action='store_true', help='Include per-memory benchmark metadata during writes')
     parser.add_argument('--batch-writes', action='store_true', help='Write each payload buffer through /memories/batch instead of one POST per memory')
     parser.add_argument('--semantic-mode', choices=('lexical', 'semantic', 'hybrid'), default='lexical', help='Rust recall mode; lexical is the release sparse-core benchmark default')
+    parser.add_argument('--expansion-depth', default='1', help='Recall expansion_depth: 1 (lean, the v0.7.3 benchmark setting), a larger number, conversation_round, or "default" to omit the field and use the engine default')
     args = parser.parse_args()
     
     print("CueMap NL Benchmark: Python vs Rust")
@@ -817,6 +824,7 @@ async def main():
         include_metadata=args.include_metadata,
         batch_writes=args.batch_writes,
         semantic_mode=args.semantic_mode,
+        expansion_depth=args.expansion_depth,
     )
     
     try:

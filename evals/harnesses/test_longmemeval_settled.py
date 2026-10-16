@@ -362,6 +362,8 @@ def build_recall_cmd(
         cmd.extend(["--cuepacks", args.cuepacks])
     if query_time:
         cmd.extend(["--query-time", query_time])
+    if args.expansion_depth is not None:
+        cmd.extend(["--expansion-depth", str(args.expansion_depth)])
     cmd.append(question)
     return cmd
 
@@ -449,6 +451,16 @@ def evaluate():
         help="Allow installed CueBridge artifacts during recall. Disabled by default for core evals.",
     )
     parser.add_argument("--no-auto-reinforce", action="store_true")
+    parser.add_argument(
+        "--expansion-depth",
+        default=None,
+        help="Pass through cuemap recall --expansion-depth: a number or conversation_round.",
+    )
+    parser.add_argument(
+        "--source-order-metadata",
+        action="store_true",
+        help="Attach source_turn_index (message position within its session) to each message.",
+    )
     parser.add_argument(
         "--cuepacks",
         default=None,
@@ -580,7 +592,7 @@ def evaluate():
                     if turn_idx < len(haystack_session_ids)
                     else None
                 )
-                for message in turn:
+                for message_idx, message in enumerate(turn):
                     role = message.get("role", "")
                     content = message.get("content", "")
                     text_to_add = f"{role}: {content}"
@@ -589,6 +601,8 @@ def evaluate():
                         metadata["source_date"] = source_date
                     if source_session_id:
                         metadata["source_session_id"] = source_session_id
+                        if args.source_order_metadata:
+                            metadata["source_turn_index"] = message_idx
                     add_cmd = [
                         "cuemap",
                         "add",

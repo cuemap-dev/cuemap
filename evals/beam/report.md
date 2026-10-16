@@ -126,6 +126,22 @@ Raw 128K:
 CONTEXT=128k bash evals/beam/run_beam.sh
 ```
 
+For the learned knowledge sidecar, use the release binary from the branch
+containing the bundled head, leave background jobs enabled, and wait for its
+build on each record before recall:
+
+```bash
+KNOWLEDGE_BUILD=183190220 CONTEXT=128k SEMANTIC_MODE=hybrid TRACE_TIMING=1 \
+  OUTPUT=evals/beam/results/beam_128k_knowledge.json \
+  bash evals/beam/run_beam.sh
+```
+
+`KNOWLEDGE_BUILD` is a harness readiness check, not a server feature flag.
+The server loads the bundled head by default. The harness prints enriched
+memory, mention, frame, and link counts for each record before scoring it.
+`TRACE_TIMING=1` writes per-query engine and HTTP timings and prints their
+summary after the run.
+
 The wrapper defaults to message-level ingestion (`cuemap add` / `/memories`),
 which preserves one indexed memory per BEAM turn. To reproduce the older
 segmented long-form path explicitly, set `INGEST_MODE=long-form`.

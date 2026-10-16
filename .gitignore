@@ -9,6 +9,7 @@ dist/
 data/nlprule/
 data/reports/
 data/snapshots/
+data/knowledge_training/
 tests/data/*
 !tests/data/
 !tests/data/verbs.csv
@@ -24,7 +25,9 @@ assets/all-MiniLM-L6-v2/
 coverage/
 lcov.info
 codecov.json
-evals/intent/
+evals/intent/*
+!evals/intent/wildchat/
+evals/intent/wildchat/**/*.onnx
 vendor/
 
 # Local release outputs and helpers

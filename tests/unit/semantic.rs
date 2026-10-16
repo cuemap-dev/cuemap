@@ -99,3 +99,26 @@
         };
         assert!((model.score(&[0.5, 0.25]) - 1.0).abs() < f32::EPSILON);
     }
+
+    #[test]
+    fn local_memory_typing_assets_need_a_head_and_are_versioned_by_content() {
+        let dir = std::env::temp_dir().join(format!("cuemap-typing-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let head = dir.join("head.bin");
+        std::fs::write(&head, b"not checked here").unwrap();
+        let mut config = SemanticConfig::default();
+        assert!(load_memory_typing_assets(&config).unwrap().is_none());
+        config.memory_type_model_path = dir.join("model.onnx").display().to_string();
+        assert!(load_memory_typing_assets(&config).is_err());
+        config.memory_type_model_path.clear();
+        config.memory_type_head_path = head.display().to_string();
+        let assets = load_memory_typing_assets(&config).unwrap().unwrap();
+        assert!(assets.encoder.is_none());
+        assert_eq!(assets.head.as_slice(), b"not checked here");
+        assert!(assets.version.starts_with("memtype-local-") && assets.version.len() == "memtype-local-".len() + 12);
+        assert_eq!(load_memory_typing_assets(&config).unwrap().unwrap().version, assets.version);
+        config.memory_type_head_path = dir.join("missing.bin").display().to_string();
+        assert!(load_memory_typing_assets(&config).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
