@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.7.5] - 2026-10-14
+
+### Added
+- **Conversation rounds**: recall `expansion_depth` accepts `"conversation_round"` as well as a number, and `conversation_round` is now the default (memories without session, turn and role metadata are returned unchanged, as with `1`). Each result gets the message it replies to (for an assistant reply, the user message that opened its round; in human-to-human chats, the nearest earlier message from another speaker), capped at 512 approx-tokens and never duplicated across results: a message ranked below its reply is moved up into it, so fewer results than `limit` can come back. It runs after ranking and adds `expansion` / `expanded_memory_ids` metadata. Supported in the HTTP API (single-project, cross-project and grounded recall), CLI, SDKs and MCP.
+- **Conversation segmenter**: `/ingest/content` accepts `"segmenter": "conversation"` for Claude and ChatGPT exports, JSON message lists and role- or speaker-labelled transcripts. It stores one memory per message, splits long messages into ordered parts, and writes conversation, turn, role, part, message-id and date metadata.
+- **Reply for the top result**: with `expansion_depth: "conversation_round"`, the first result also gets the message that replies to it appended in full (the assistant answer to a user prompt; in human-to-human chats the next message by someone else), found by session and order metadata like the round partner. A reply ranked lower moves up into the result. Results carry `reply_memory_ids`. `CUEMAP_ROUND_REPLY_TOP=n` changes how many of the top results get replies; 0 turns it off. On BEAM 128k this raised Any@1 from 49.6 to 58.9 for about 600 more approx-tokens in the top 20; replies on the first 5 results add a little more evidence for about 30% more context.
+
+### Changed
+- **Source-role rule off by default**: results whose source role differs from the query's perspective are no longer down-weighted. `CUEMAP_SOURCE_ROLE_PENALTY=0.35` restores the v0.7.3 behaviour. With the rule off, BEAM 128k Any@20 rose from 84.2 to 87.0 and Frac@20 from 69.5 to 73.3; LongMemEval and LoCoMo stayed within noise.
+- **CoreML off by default** for the bundled encoder (`CUEMAP_SEMANTIC_COREML_ENABLED=true` re-enables it). On Apple silicon, query encoding drops from about 6.7 ms to 1.1 ms and mean engine latency on BEAM 128k from 9.9 ms to 4.4 ms, with the same accuracy.
+- `CUEMAP_SEMANTIC_FUSION=rrf` selects reciprocal rank fusion for the hybrid slate (default `minmax`).
+- The CLI `--expansion-depth` option defaults to `conversation_round`.
+
+### Removed
+- The six projection recall passes (source answer, source prompt, user context, standing instruction, preference and decision) and their adjacency preferences. They were switched off before v0.7.3 and never ran; their `*_projection_ms` timing fields and explain fields are gone.
+
 ## [0.7.3] - 2026-09-14
 
 ### Added

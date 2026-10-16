@@ -134,7 +134,7 @@ mod tests {
             evidence_coverage_limit: 100,
             evidence_coverage_session_scan_limit: 4096,
             evidence_coverage_max_sessions: 3,
-            expansion_depth: 1,
+            expansion_depth: cuemap::conversation::ExpansionDepth::Depth(1),
             enable_alias_expansion: false,
             disable_cuebridge_artifacts: false,
             cuebridge_gap_limit: 6,
@@ -1738,8 +1738,12 @@ struct RecallArgs {
     /// Maximum sessions to inspect during evidence coverage
     #[arg(long, default_value_t = 3)]
     evidence_coverage_max_sessions: usize,
-    #[arg(long, default_value_t = 1)]
-    pub expansion_depth: usize,
+    /// Neighbour context: "conversation_round" (default) attaches the message each result
+    /// replies to, and the reply to the top result, when memories carry conversation
+    /// metadata; or a number (1 = matched memory only; n > 1 adds source-ordered neighbours
+    /// within radius n - 1).
+    #[arg(long, default_value = "conversation_round")]
+    pub expansion_depth: cuemap::conversation::ExpansionDepth,
 
     /// Enable alias expansion (default: disabled)
     #[arg(long)]

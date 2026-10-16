@@ -7,8 +7,8 @@
 <p align="center">Fast, accurate, and explainable temporal-associative memory for agents.</p>
 
 <p align="center">
-  <a href="https://github.com/cuemap-dev/cuemap/actions/workflows/coverage.yml"><img src="https://github.com/cuemap-dev/cuemap/actions/workflows/coverage.yml/badge.svg?branch=v0.7.3" alt="CI"></a>
-  <a href="https://app.codecov.io/github/cuemap-dev/cuemap"><img src="https://codecov.io/github/cuemap-dev/cuemap/branch/v0.7.3/graph/badge.svg?flag=rust-engine" alt="Coverage"></a>
+  <a href="https://github.com/cuemap-dev/cuemap/actions/workflows/coverage.yml"><img src="https://github.com/cuemap-dev/cuemap/actions/workflows/coverage.yml/badge.svg?branch=v0.7.5" alt="CI"></a>
+  <a href="https://app.codecov.io/github/cuemap-dev/cuemap"><img src="https://codecov.io/github/cuemap-dev/cuemap/branch/v0.7.5/graph/badge.svg?flag=rust-engine" alt="Coverage"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-5e5ce6" alt="License"></a>
 </p>
 
@@ -50,8 +50,8 @@ CueMap treats the nlprule tokenizer as a runtime asset, not a build artifact. Se
 ### Docker
 
 ```bash
-docker build -t cuemap/engine:0.7.3 .
-docker run -p 127.0.0.1:8735:8735 -v "$(pwd)/local_snapshot_dir:/app/data" cuemap/engine:0.7.3
+docker build -t cuemap/engine:0.7.5 .
+docker run -p 127.0.0.1:8735:8735 -v "$(pwd)/local_snapshot_dir:/app/data" cuemap/engine:0.7.5
 ```
 
 The container runs as the unprivileged `cuemap` user. Ensure a bind-mounted data directory is writable by UID/GID `10001`, or use a Docker-managed volume. Runtime defaults can be overridden with `CUEMAP_HOST`, `CUEMAP_PORT`, `CUEMAP_DATA_DIR`, `CUEMAP_SNAPSHOT_INTERVAL_SECONDS`, `CUEMAP_PROJECT_INACTIVITY_TIMEOUT_SECONDS`, `CUEMAP_PROJECT_UNLOAD_CHECK_INTERVAL_SECONDS`, `TOKENIZER_PATH`, and `RUST_LOG`.
@@ -409,11 +409,11 @@ To optimize storage efficiency, especially for large textual memories, CueMap em
 
 ## Performance
 
-### Benchmark Results (v0.7.3)
+### Benchmark Results (v0.7.5)
 
 Tests performed on **Real-World Data** (Wikipedia Articles), processing full natural language sentences with the complete NLP pipeline.
 
-**Hardware:** MacBook Pro M-series, 64GB RAM, single node. The v0.7.3 release table below records completed lexical and hybrid runs at 10K, 100K, and 1M memories. Lexical runs isolate the sparse core with the semantic encoder disabled; hybrid runs include the bundled local encoder. P95 is the release headline percentile, while P99 remains available in the JSON diagnostics.
+**Hardware:** MacBook Pro M-series, 64GB RAM, single node. The v0.7.5 release runs cover lexical and hybrid writes and reads at 10K, 100K, and 1M memories. Lexical runs isolate the sparse core with the semantic encoder disabled; hybrid runs use the v0.7.5 defaults, including the bundled local encoder. P95 is the release headline percentile, while P99 remains available in the JSON diagnostics.
 
 #### Benchmark Methodology
 
@@ -443,54 +443,69 @@ python benchmarks/benchmark_nl.py \
 ```
 
 Restart the engine without `CUEMAP_SEMANTIC_ENCODER_ENABLED=false`, then run the
-same command with `--semantic-mode hybrid` to produce the hybrid comparison. The
+same command with `--semantic-mode hybrid --expansion-depth default` to measure
+the v0.7.5 defaults (the bundled encoder on the CPU, semantic reranking of up to
+200 candidates, and the default `conversation_round` expansion, which leaves
+Wikipedia snippets unchanged because they carry no conversation metadata). The
 dataset is downloaded only once and reused from the local cache on subsequent
 runs.
 
-#### v0.7.3 latency comparison
+#### v0.7.5 latency
 
-The lexical release rerun now covers 10K, 100K, and 1M writes plus lean recall
-queries. The compact comparison below records the 10K, 100K, and 1M hybrid
-runs as well.
+| Mode | Scale | Write avg | Write P50 | Write P95 | Write throughput | Read avg | Read P50 | Read P95 | Read throughput |
+|:---|:---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Lexical | **10,000** | 2.44 ms | 2.04 ms | 4.25 ms | 409 ops/s | 1.05 ms | 0.99 ms | 1.64 ms | 947 ops/s |
+| Lexical | **100,000** | 2.65 ms | 2.20 ms | 4.89 ms | 378 ops/s | 1.94 ms | 1.77 ms | 3.07 ms | 511 ops/s |
+| Lexical | **1,000,000** | 2.83 ms | 2.33 ms | 5.30 ms | 353 ops/s | 2.43 ms | 1.91 ms | 3.64 ms | 409 ops/s |
+| Hybrid | **10,000** | 3.74 ms | 3.30 ms | 6.34 ms | 267 ops/s | 1.73 ms | 1.68 ms | 2.48 ms | 574 ops/s |
+| Hybrid | **100,000** | 3.79 ms | 3.35 ms | 6.49 ms | 264 ops/s | 2.32 ms | 2.22 ms | 3.35 ms | 430 ops/s |
+| Hybrid | **1,000,000** | 4.03 ms | 3.49 ms | 7.28 ms | 248 ops/s | 3.64 ms | 3.09 ms | 5.68 ms | 273 ops/s |
 
-| Mode | Write avg | Write P50 | Write P95 | Write throughput | Read avg | Read P50 | Read P95 | Read throughput |
-|:---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Lexical | 2.13 ms | 1.88 ms | 4.13 ms | 470 ops/s | 1.05 ms | 1.01 ms | 1.60 ms | 939 ops/s |
-| Hybrid | 11.52 ms | 10.38 ms | 17.45 ms | 87 ops/s | 6.54 ms | 6.80 ms | 8.41 ms | 152 ops/s |
+Writes measure HTTP ingestion, deterministic cue/facet extraction, memory allocation, and indexing (plus one local embedding per memory in hybrid mode). Reads measure query parsing, deterministic cue resolution, sparse candidate scoring and, in hybrid mode, query encoding (about 0.5 ms per query) and semantic reranking of up to 200 candidates. Write latency stays mostly flat with project size; read latency grows slowly with it.
 
-The script still stores p99 in the JSON result for diagnostics, but p95 is the
-headline percentile used by the console output and release chart.
+Against v0.7.3 at 1M memories:
 
-| Hybrid scale | Write avg | Write P50 | Write P95 | Write throughput | Read avg | Read P50 | Read P95 | Read throughput |
-|:---|---:|---:|---:|---:|---:|---:|---:|---:|
-| **10,000** | 11.52 ms | 10.38 ms | 17.45 ms | 87 ops/s | 6.54 ms | 6.80 ms | 8.41 ms | 152 ops/s |
-| **100,000** | 11.21 ms | 10.27 ms | 16.43 ms | 89 ops/s | 6.94 ms | 7.14 ms | 8.83 ms | 144 ops/s |
-| **1,000,000** | 11.28 ms | 10.38 ms | 16.81 ms | 89 ops/s | 8.36 ms | 8.12 ms | 10.67 ms | 119 ops/s |
+| Mode | v0.7.3 write avg | v0.7.5 write avg | v0.7.3 read avg / P95 | v0.7.5 read avg / P95 |
+|:---|---:|---:|---:|---:|
+| Lexical | 3.33 ms | 2.83 ms | 2.63 / 3.72 ms | 2.43 / 3.64 ms |
+| Hybrid | 11.28 ms | 4.03 ms | 8.36 / 10.67 ms | 3.64 / 5.68 ms |
 
-#### 1. Ingestion (Write) Performance — lexical
-*Measures HTTP ingestion, deterministic cue/facet extraction, memory allocation, and indexing.*
-
-| Dataset Scale | Avg Latency | P50 | P95 | Throughput |
-|:---|:---|:---|:---|:---|
-| **10,000** | 2.13 ms | 1.88 ms | 4.13 ms | 470 ops/s |
-| **100,000** | 2.92 ms | 2.41 ms | 5.70 ms | 343 ops/s |
-| **1,000,000** | 3.33 ms | 2.74 ms | 6.18 ms | 301 ops/s |
-
-Write latency remains mostly flat with project size; the dominant cost is per-memory extraction/indexing rather than corpus scan time.
-
-#### 2. Recall (Read) Performance — lexical
-*Measures the time to parse a query, resolve deterministic cues, and score sparse candidate intersections.*
-
-| Dataset Scale | Avg Latency | P50 | P95 | Throughput |
-|:---|:---|:---|:---|---:|
-| **10,000** | 1.05 ms | 1.01 ms | 1.60 ms | 939 ops/s |
-| **100,000** | 1.86 ms | 1.71 ms | 3.16 ms | 535 ops/s |
-| **1,000,000** | 2.63 ms | 2.06 ms | 3.72 ms | 378 ops/s |
+The hybrid speed-up comes from running the bundled encoder on the CPU instead of CoreML by default (`CUEMAP_SEMANTIC_COREML_ENABLED=true` re-enables CoreML).
 
 **Key Metrics**:
-- **Low-latency recall:** The lexical v0.7.3 1M run measured 2.63ms average with 3.72ms p95; hybrid measurements remain separate because they include bundled encoder work.
+- **Low-latency recall:** 1M memories in 2.43 ms average (3.64 ms p95) lexical and 3.64 ms average (5.68 ms p95) with the default hybrid reranking.
 - **Numeric ID memory reduction:** 1M in-memory footprint dropped from about 5.25GB to about 1.93GB after the v0.7 numeric memory-ID refactor.
-- **Controlled hot path:** the release benchmark disables the local semantic encoder, LLMs, network services, and disk scans; normal v0.7.3 hybrid recall can use the bundled local encoder for bounded reranking.
+- **Controlled hot path:** no LLMs, network services, or disk scans on the recall path; candidate generation is deterministic, and the bundled local encoder only reranks a bounded candidate set.
+
+## Retrieval evaluations (v0.7.5)
+
+Raw retrieval metrics (no LLM reader or judge): Any@k is the share of questions with at least one evidence item in the first k results, All@k the share with every evidence item, and Frac@k the mean fraction of evidence items. Tokens are approximate tokens in the first 20 results. Settings:
+
+- **Matched only** (`expansion_depth: 1`): the matched memories alone.
+- **Default** (`conversation_round`, the v0.7.5 default): each result also gets the message it replies to, and the top result gets its answer.
+- **Replies on 5** (`CUEMAP_ROUND_REPLY_TOP=5`): the first five results get their answers.
+- **Window ±9** (`expansion_depth: 10`, LoCoMo only): nine source-ordered neighbours on each side, the setting behind earlier LoCoMo numbers.
+
+| Benchmark | Setting | Any@1 | Any@20 | All@20 | Frac@20 | Tokens in top 20 | Recall (mean) |
+|:---|:---|---:|---:|---:|---:|---:|---:|
+| LoCoMo (1,986 questions) | Matched only | 58.3 | 92.7 | 84.4 | 88.7 | 650 | |
+| | **Default** | **59.7** | **93.0** | **84.7** | **89.0** | 1,211 | |
+| | Replies on 5 | 59.8 | 93.1 | 84.9 | 89.1 | 1,303 | |
+| | Window ±9 | 65.9 | 96.2 | 88.9 | 92.8 | 10,043 | |
+| LongMemEval (470 questions) | Matched only | 57.0 | 96.2 | 87.9 | 92.8 | 3,902 | |
+| | **Default** | **61.1** | **97.9** | **90.4** | **94.6** | 4,135 | |
+| | Replies on 5 | 61.1 | 97.9 | 90.4 | 94.6 | 4,616 | |
+| BEAM 128K (355 questions) | Matched only | 49.3 | 87.3 | 58.0 | 73.3 | 6,874 | 4.4 ms |
+| | **Default** | **58.6** | **90.7** | **63.4** | **78.2** | 8,076 | 3.2 ms |
+| | Replies on 5 | 58.6 | 91.5 | 65.9 | 79.4 | 10,328 | 4.9 ms |
+| BEAM 1M (625 questions) | Matched only | 37.3 | 81.9 | 34.6 | 55.4 | 3,298 | 5.3 ms |
+| | **Default** | **50.6** | **86.7** | **37.3** | **59.3** | 4,228 | 4.4 ms |
+| | Replies on 5 | 50.6 | 88.2 | 39.0 | 62.7 | 7,437 | 5.9 ms |
+| BEAM 10M (176 questions) | Matched only | 33.5 | 67.6 | 25.0 | 39.2 | 1,592 | 13.5 ms |
+| | **Default** | **38.6** | **68.2** | **26.1** | **40.2** | 2,420 | 12.0 ms |
+| | Replies on 5 | 38.6 | 71.0 | 27.3 | 42.2 | 6,127 | 14.2 ms |
+
+All runs ingest one memory per message with conversation metadata, use hybrid recall, and score the same projects under each setting. Recall latency is the engine's mean per query on the MacBook Pro above (BEAM 10M excludes the first query after each engine start, which loads the 10M-token project's caches). Harnesses and run scripts live in [`evals/`](evals/); `evals/run_release_evals.sh` reproduces this table.
 
 ## Architecture
 
@@ -576,6 +591,11 @@ CueMap keeps advanced recall behavior deterministic and inspectable:
 
 #### Source-Order Context and Episodes
 Long-form ingests, chat logs, files, and agent chunks preserve parent/session/order metadata. Recall can use `expansion_depth` to include nearby source-order chunks, and add-time temporal episode cues can be disabled on memory writes with `disable_temporal_chunking: true`.
+
+#### Conversation Rounds
+`/ingest/content` with `"segmenter": "conversation"` stores a chat history as one memory per message (long messages become ordered parts), with `source_session_id`, `source_turn_index`, `source_role` and part metadata. It reads Claude and ChatGPT exports (keeping the displayed branch, without system messages or tool traffic), JSON message lists, and transcripts whose messages start with `User:`/`Assistant:` or speaker names.
+
+Recall uses `expansion_depth: "conversation_round"` by default (pass a number to get the previous behaviour; `1` returns matched memories only). It prepends to each result the message it replies to: for an assistant reply, the user message that opened its round; in human-to-human chats, the nearest earlier message from someone else. The attachment is capped at 512 approx-tokens and leaves the order of results unchanged. A message already ranked above its reply is not repeated; one ranked below is moved up into the reply, so a round appears at the rank of its best result and fewer results than `limit` can come back. Results gain `expansion` and `expanded_memory_ids` metadata. The first result also gets the message that replies to it, appended in full: the assistant answer to a user prompt, or in human-to-human chats the next message from someone else. A reply ranked lower is moved up the same way, and those results carry `reply_memory_ids`; `CUEMAP_ROUND_REPLY_TOP=n` changes how many of the top results get replies (0 turns it off; 5 gives more context per recall, at a token cost). Messages are matched by session, turn and role metadata, never by ingestion order, so memories without that metadata are returned as they are.
 
 #### Adaptive Salience Bias
 Not all memories are created equal. The engine calculates a **Salience Multiplier** based on cue density, reinforcement frequency, and rare cue combinations. High-signal memories rank above routine events when other structural evidence is comparable. Can be disabled per-recall via `disable_salience_bias: true`.

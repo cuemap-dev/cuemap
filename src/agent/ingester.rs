@@ -1027,6 +1027,45 @@ impl Ingester {
     }
 }
 
+/// Enqueues chunks from `conversation_import` for ingestion. Each chunk's metadata is
+/// layered over `base_metadata` (the chunk's own keys win), and its source key is
+/// `{source}#{chunk.key}`: re-ingesting the same export updates the same memories, and
+/// repeated text in different messages stays separate. Returns the source keys.
+pub async fn enqueue_conversation_chunks(
+    job_queue: &JobQueue,
+    project_id: &str,
+    source: &str,
+    chunks: Vec<crate::agent::conversation_import::ConversationChunk>,
+    base_metadata: Option<HashMap<String, serde_json::Value>>,
+    embeddings: Option<Vec<Vec<f32>>>,
+) -> Vec<String> {
+    let session = job_queue.session_manager.get_or_create(project_id);
+    for _ in &chunks {
+        session.expect_write();
+    }
+    let mut source_keys = Vec::with_capacity(chunks.len());
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        let mut metadata = base_metadata.clone().unwrap_or_default();
+        metadata.extend(chunk.metadata);
+        let source_key = format!("{source}#{}", chunk.key);
+        job_queue
+            .enqueue(Job::ExtractAndIngest {
+                project_id: project_id.to_string(),
+                source_key: source_key.clone(),
+                content: chunk.content,
+                file_path: source.to_string(),
+                structural_cues: chunk.structural_cues,
+                metadata: Some(metadata),
+                embedding: embeddings.as_ref().and_then(|vectors| vectors.get(index).cloned()),
+                category: crate::agent::chunker::ChunkCategory::Conversation,
+            })
+            .await;
+        source_keys.push(source_key);
+    }
+    debug!("Enqueued {} conversation chunks from {}", source_keys.len(), source);
+    source_keys
+}
+
 /// Result of a recursive URL crawl
 #[derive(Debug, Clone)]
 pub struct CrawlResult {

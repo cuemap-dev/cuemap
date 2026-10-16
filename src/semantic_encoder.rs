@@ -5,7 +5,7 @@
 //! never downloads models: empty paths select the assets embedded in the
 //! binary, while non-empty paths provide an explicit local override.
 
-use crate::semantic::{SemanticConfig, SemanticEncoder};
+use crate::semantic::{SemanticConfig, SemanticEncoder, TokenStates};
 use ort::{session::Session, value::Tensor};
 use std::sync::Mutex;
 use tokenizers::{
@@ -99,7 +99,7 @@ impl SemanticEncoder for OnnxSemanticEncoder {
         self.dimensions
     }
 
-    fn encode(&self, text: &str) -> Result<Vec<f32>, String> {
+    fn encode_tokens(&self, text: &str) -> Result<TokenStates, String> {
         let mut encoding = self
             .tokenizer
             .encode(text, true)
@@ -112,6 +112,14 @@ impl SemanticEncoder for OnnxSemanticEncoder {
         }
 
         let sequence_length = encoding.len();
+        let offsets = encoding.get_offsets().iter().zip(encoding.get_special_tokens_mask())
+            .map(|(&(start, end), &special)| {
+                if special != 0 || start == end { None }
+                else {
+                    Some((start as u32, end as u32))
+                }
+            }).collect();
+        let active = encoding.get_attention_mask().iter().map(|&mask| mask != 0).collect();
         let input_ids = encoding
             .get_ids()
             .iter()
@@ -170,19 +178,28 @@ impl SemanticEncoder for OnnxSemanticEncoder {
             ));
         }
 
-        // Sentence-Transformers' mean pooling: average token embeddings using
-        // the attention mask, then normalize for cosine retrieval.
+        Ok(TokenStates {
+            dimensions: self.dimensions,
+            vectors: hidden[..expected_values].to_vec(),
+            offsets,
+            active,
+        })
+    }
+
+    fn encode(&self, text: &str) -> Result<Vec<f32>, String> {
+        let states = self.encode_tokens(text)?;
+        // Sentence-Transformers' mean pooling: average active token embeddings,
+        // then normalize for cosine retrieval.
         let mut pooled = vec![0.0f32; self.dimensions];
         let mut token_count = 0.0f32;
-        for token_index in 0..sequence_length {
-            let mask = encoding.get_attention_mask()[token_index];
-            if mask == 0 {
+        for (token_index, active) in states.active.iter().enumerate() {
+            if !active {
                 continue;
             }
             token_count += 1.0;
             let offset = token_index * self.dimensions;
             for dimension in 0..self.dimensions {
-                pooled[dimension] += hidden[offset + dimension];
+                pooled[dimension] += states.vectors[offset + dimension];
             }
         }
         if token_count <= 0.0 {

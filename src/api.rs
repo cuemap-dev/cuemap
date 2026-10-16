@@ -108,8 +108,9 @@ pub struct RecallRequest {
     pub trace_timing: bool,
     #[serde(default)]
     pub disable_salience_bias: bool,
-    #[serde(default = "default_expansion_depth")]
-    pub expansion_depth: usize,
+    /// A number (1 = no expansion) or "conversation_round" (the default).
+    #[serde(default)]
+    pub expansion_depth: crate::conversation::ExpansionDepth,
     #[serde(default = "default_true")]
     pub disable_alias_expansion: bool,
     #[serde(default = "default_depth")]
@@ -1342,8 +1343,7 @@ fn build_slate_rerank_candidates(
             let role = evidence_coverage_role(&memory.cues)
                 .or_else(|| source_role_from_metadata(&memory.metadata))
                 .or_else(|| source_role_from_metadata(&result.metadata));
-            let tagged_standing_instruction = memory_cues.contains("type:standing_instruction")
-                || result.metadata.contains_key("standing_instruction_projection");
+            let tagged_standing_instruction = memory_cues.contains("type:standing_instruction");
 
             Some(SlateRerankCandidate {
                 idx,
@@ -2070,1461 +2070,192 @@ fn metadata_string<'a>(
     None
 }
 
-fn source_session_cue_from_metadata(
-    metadata: &HashMap<String, serde_json::Value>,
-) -> Option<String> {
-    metadata_string(
-        metadata,
-        &[
-            "source_session_id",
-            "session_id",
-            "conversation_id",
-            "thread_id",
-        ],
-    )
-    .and_then(normalize_source_value)
-    .map(|value| format!("source_session:{}", value))
-}
-
 fn source_role_from_metadata(metadata: &HashMap<String, serde_json::Value>) -> Option<String> {
     metadata_string(metadata, &["source_role", "role", "speaker", "author_role"])
         .and_then(normalize_source_value)
 }
 
-fn source_answer_projection_requested(
-    query_plan: Option<&crate::facets::StructuralQueryPlan>,
-    query_text: Option<&str>,
-) -> bool {
-    let Some(intent) = query_plan else {
-        return false;
-    };
-    if !intent
-        .labels
-        .iter()
-        .any(|label| label == "__semantic_facets_removed__")
-    {
-        return false;
-    }
-    let has_assistant_source = intent.labels.iter().any(|label| label == "source_assistant");
-    if has_assistant_source {
-        return true;
-    }
-
-    if !intent.labels.iter().any(|label| label == "source_answer") {
-        return false;
-    }
-
-    let lower = query_text.unwrap_or_default().to_lowercase();
-    lower.contains("assistant")
-        || lower.contains("your answer")
-        || lower.contains("the answer you gave")
-}
-
-fn query_wants_list_answer(query_text: Option<&str>) -> bool {
-    let lower = query_text.unwrap_or_default().to_lowercase();
-    lower.contains(" list")
-        || lower.contains("listed")
-        || lower.contains("1st")
-        || lower.contains("2nd")
-        || lower.contains("3rd")
-        || lower.contains("4th")
-        || lower.contains("5th")
-        || lower.contains("6th")
-        || lower.contains("7th")
-        || lower.contains("8th")
-        || lower.contains("9th")
-        || lower.contains(" first ")
-        || lower.contains(" second ")
-        || lower.contains(" third ")
-        || lower.contains(" fourth ")
-        || lower.contains(" fifth ")
-        || lower.contains(" sixth ")
-        || lower.contains(" seventh ")
-        || lower.contains(" eighth ")
-        || lower.contains(" ninth ")
-}
-
-fn source_answer_projection_cues(
+/// `expansion_depth: "conversation_round"`: prepend to each result the message it
+/// replies to (see `conversation::round_partner_index`), cut to
+/// `ROUND_PARTNER_TOKEN_CAP` approx-tokens. Runs on the final, ordered results, so the
+/// order of results is unchanged; a round is shown at the rank of its best result.
+/// - A message already ranked above the result, or already attached to a higher
+///   result, is not added again.
+/// - A message ranked below the result is moved up: it is attached here in full (it
+///   was already being returned) and its own entry is removed, so fewer results than
+///   requested can come back.
+/// - The first `ROUND_REPLY_TOP` (1) results also get the message that replies to them
+///   appended in full (see `conversation::round_reply_index`), so a top-ranked prompt
+///   comes with its answer; `CUEMAP_ROUND_REPLY_TOP=n` changes the number, 0 turns it off.
+///   The same rules apply: a reply already shown above is not added again, and a reply
+///   ranked lower moves up into the result.
+/// Returns the number of results that received a message.
+fn apply_conversation_round_expansion(
     ctx: &crate::projects::ProjectContext,
-    query_plan: Option<&crate::facets::StructuralQueryPlan>,
-    query_text: Option<&str>,
-    all_results: &[crate::engine::RecallResult],
-) -> Vec<(String, f64)> {
-    if !source_answer_projection_requested(query_plan, query_text) {
-        return Vec::new();
-    }
-    if ctx.main.get_cue_frequency("source_role:assistant") == 0 {
-        return Vec::new();
-    }
+    results: &mut Vec<crate::engine::RecallResult>,
+) -> usize {
+    apply_conversation_round_expansion_with(ctx, results, round_reply_top())
+}
 
-    let mut seen_sessions = std::collections::HashSet::new();
-    let mut cues = Vec::new();
-    for result in all_results.iter().take(8) {
-        if result.intersection_count < 2 && result.match_integrity < 0.20 {
+/// How many of the top results get their reply appended under `conversation_round`:
+/// `CUEMAP_ROUND_REPLY_TOP` when set to a number (0 turns it off), else `ROUND_REPLY_TOP`.
+fn round_reply_top() -> usize {
+    static TOP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TOP.get_or_init(|| parse_round_reply_top(std::env::var("CUEMAP_ROUND_REPLY_TOP").ok().as_deref()))
+}
+
+fn parse_round_reply_top(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(crate::conversation::ROUND_REPLY_TOP)
+}
+
+fn apply_conversation_round_expansion_with(
+    ctx: &crate::projects::ProjectContext,
+    results: &mut Vec<crate::engine::RecallResult>,
+    reply_top: usize,
+) -> usize {
+    use crate::conversation::{cap_approx_tokens, ROUND_PARTNER_TOKEN_CAP};
+    let mut position: HashMap<MemoryId, usize> = HashMap::new();
+    for (rank, result) in results.iter().enumerate() {
+        position.entry(result.memory_id).or_insert(rank);
+    }
+    let mut attached: HashSet<MemoryId> = HashSet::new();
+    let mut moved: HashSet<MemoryId> = HashSet::new();
+    let mut applied = 0usize;
+    for (rank, result) in results.iter_mut().enumerate() {
+        if moved.contains(&result.memory_id) {
             continue;
         }
-        let Some(session_cue) = source_session_cue_from_metadata(&result.metadata) else {
-            continue;
+        let partner = ctx.main.conversation_round_partner(result.memory_id);
+        let shown_above = |id: &MemoryId| {
+            attached.contains(id) || position.get(id).is_some_and(|&at| at < rank)
         };
-        if !seen_sessions.insert(session_cue.clone()) {
+        if partner.is_empty() || partner.iter().any(shown_above) {
             continue;
         }
-        cues.push((session_cue, 4.0));
-        if seen_sessions.len() >= 3 {
-            break;
-        }
-    }
-
-    if cues.is_empty() {
-        return Vec::new();
-    }
-
-    cues.push(("source_role:assistant".to_string(), 3.0));
-    if query_wants_list_answer(query_text) {
-        if ctx.main.get_cue_frequency("has:list") > 0 {
-            cues.push(("has:list".to_string(), 2.8));
-        }
-        if ctx.main.get_cue_frequency("has:number") > 0 {
-            cues.push(("has:number".to_string(), 1.0));
-        }
-    }
-    cues
-}
-
-fn source_prompt_projection_cues(
-    ctx: &crate::projects::ProjectContext,
-    query_plan: Option<&crate::facets::StructuralQueryPlan>,
-    query_text: Option<&str>,
-    all_results: &[crate::engine::RecallResult],
-) -> Vec<(String, f64)> {
-    let Some(intent) = query_plan else {
-        return Vec::new();
-    };
-    if !intent
-        .labels
-        .iter()
-        .any(|label| label == "__semantic_facets_removed__")
-    {
-        return Vec::new();
-    }
-    if !intent.labels.iter().any(|label| label == "source_answer")
-        || !intent.labels.iter().any(|label| label == "source_assistant")
-    {
-        return Vec::new();
-    }
-    if ctx.main.get_cue_frequency("source_role:user") == 0 {
-        return Vec::new();
-    }
-
-    let anchors = source_prompt_anchor_cues(query_text);
-    if anchors.len() < 2 {
-        return Vec::new();
-    }
-
-    let mut seen_sessions = std::collections::HashSet::new();
-    let mut cues = Vec::new();
-    for result in all_results.iter().take(8) {
-        if source_role_from_metadata(&result.metadata).as_deref() != Some("assistant") {
-            continue;
-        }
-        if result.intersection_count < 2 && result.match_integrity < 0.20 {
-            continue;
-        }
-        let Some(session_cue) = source_session_cue_from_metadata(&result.metadata) else {
-            continue;
-        };
-        if !seen_sessions.insert(session_cue.clone()) {
-            continue;
-        }
-        cues.push((session_cue, 4.0));
-        if seen_sessions.len() >= 3 {
-            break;
-        }
-    }
-
-    if cues.is_empty() {
-        return Vec::new();
-    }
-
-    cues.push(("source_role:user".to_string(), 3.0));
-    for anchor in anchors.into_iter().take(8) {
-        if ctx.main.get_cue_frequency(&anchor) > 0 {
-            cues.push((anchor, 1.8));
-        }
-    }
-    cues
-}
-
-fn user_context_projection_requested(
-    query_plan: Option<&crate::facets::StructuralQueryPlan>,
-    query_text: Option<&str>,
-) -> bool {
-    if !query_plan
-        .is_some_and(|intent| intent.labels.iter().any(|label| label == "__semantic_facets_removed__"))
-    {
-        return false;
-    }
-    if query_plan
-        .map(|intent| {
-            intent.labels.iter().any(|label| {
-                matches!(
-                    label.as_str(),
-                    "source_answer" | "source_assistant" | "source_user" | "decision_selection"
-                )
-            })
-        })
-        .unwrap_or(false)
-    {
-        return false;
-    }
-
-    let lower = query_text.unwrap_or_default().to_lowercase();
-    let explicit_recommendation = lower.contains("recommend") || lower.contains("suggest");
-    let generic_recommendation_request = explicit_recommendation
-        && (lower.contains("something")
-            || lower.contains("anything")
-            || lower.contains("some recommendations")
-            || lower.contains("some suggestions"));
-
-    lower.contains("tip")
-        || lower.contains("advice")
-        || generic_recommendation_request
-        || lower.contains("what should")
-        || lower.contains("should i")
-        || lower.contains("trouble")
-        || lower.contains("problem")
-        || lower.contains("help with")
-        || lower.contains("looking for")
-}
-
-fn projection_anchor_is_generic(cue: &str) -> bool {
-    if cue.starts_with("type:")
-        || cue.starts_with("has:")
-        || cue.starts_with("temporal:")
-        || cue.starts_with("source_")
-    {
-        return true;
-    }
-
-    if cue.contains('_') {
-        let parts = cue.split('_').collect::<Vec<_>>();
-        let generic_count = parts
+        let Some(parts) = partner
             .iter()
-            .filter(|part| projection_anchor_is_generic(part))
-            .count();
-        let specific_count = parts.len().saturating_sub(generic_count);
-        return generic_count == parts.len() || (generic_count > 0 && specific_count <= 1);
-    }
-
-    matches!(
-        cue,
-        "can"
-            | "could"
-            | "would"
-            | "should"
-            | "please"
-            | "recommend"
-            | "recommendation"
-            | "suggest"
-            | "suggestion"
-            | "idea"
-            | "ideas"
-            | "tip"
-            | "tips"
-            | "advice"
-            | "help"
-            | "helpful"
-            | "useful"
-            | "good"
-            | "best"
-            | "some"
-            | "any"
-            | "thing"
-            | "something"
-            | "bit"
-            | "get"
-            | "got"
-            | "getting"
-            | "around"
-            | "show"
-            | "shows"
-            | "movie"
-            | "movies"
-            | "watch"
-            | "tonight"
-            | "new"
-            | "current"
-            | "recent"
-            | "lately"
-    )
-}
-
-fn projection_anchor_cues(query_text: Option<&str>) -> Vec<String> {
-    let Some(query_text) = query_text else {
-        return Vec::new();
-    };
-
-    let mut seen = std::collections::HashSet::new();
-    let mut anchors = Vec::new();
-    for cue in crate::nl::tokenize_to_cues(query_text) {
-        let cue = cue.trim().to_lowercase();
-        if cue.len() <= 2 || projection_anchor_is_generic(&cue) || !seen.insert(cue.clone()) {
-            continue;
-        }
-        anchors.push(cue);
-        if anchors.len() >= 8 {
-            break;
-        }
-    }
-    anchors
-}
-
-fn source_prompt_anchor_is_generic(cue: &str) -> bool {
-    if cue.starts_with("type:")
-        || cue.starts_with("has:")
-        || cue.starts_with("temporal:")
-        || cue.starts_with("source_")
-    {
-        return true;
-    }
-
-    if cue.contains('_') {
-        let parts = cue.split('_').collect::<Vec<_>>();
-        return parts.iter().all(|part| source_prompt_anchor_is_generic(part));
-    }
-
-    matches!(
-        cue,
-        "can"
-            | "could"
-            | "would"
-            | "should"
-            | "please"
-            | "look"
-            | "back"
-            | "go"
-            | "going"
-            | "previous"
-            | "conversation"
-            | "chat"
-            | "wonder"
-            | "wondering"
-            | "remind"
-            | "remember"
-            | "tell"
-            | "ask"
-            | "asked"
-            | "answer"
-            | "answered"
-            | "response"
-            | "respond"
-            | "said"
-    )
-}
-
-fn source_prompt_anchor_cues(query_text: Option<&str>) -> Vec<String> {
-    let Some(query_text) = query_text else {
-        return Vec::new();
-    };
-
-    let mut seen = std::collections::HashSet::new();
-    let mut anchors = Vec::new();
-    for cue in crate::nl::tokenize_to_cues(query_text) {
-        let cue = cue.trim().to_lowercase();
-        if cue.len() <= 2 || source_prompt_anchor_is_generic(&cue) || !seen.insert(cue.clone()) {
-            continue;
-        }
-        anchors.push(cue);
-        if anchors.len() >= 12 {
-            break;
-        }
-    }
-    anchors
-}
-
-fn projection_anchor_match_count(content: &str, anchors: &[String]) -> usize {
-    if anchors.is_empty() {
-        return 0;
-    }
-    let content_cues = crate::nl::tokenize_to_cues(content)
-        .into_iter()
-        .collect::<std::collections::HashSet<_>>();
-    anchors
-        .iter()
-        .filter(|anchor| content_cues.contains(anchor.as_str()))
-        .count()
-}
-
-fn projection_pivot_matches_context(
-    content: &str,
-    intersection_count: usize,
-    anchor_cues: &[String],
-    allow_high_confidence_pivot: bool,
-) -> bool {
-    if anchor_cues.len() >= 2 {
-        return projection_anchor_match_count(content, anchor_cues) >= 2;
-    }
-
-    allow_high_confidence_pivot && intersection_count >= 4
-}
-
-fn suppress_user_context_projection_for_intent(
-    query_plan: Option<&crate::facets::StructuralQueryPlan>,
-) -> bool {
-    query_plan
-        .map(|intent| {
-            intent
-                .labels
-                .iter()
-                .any(|label| label == "vague_interest_recommendation")
-        })
-        .unwrap_or(false)
-}
-
-fn user_context_projection_cues(
-    ctx: &crate::projects::ProjectContext,
-    query_plan: Option<&crate::facets::StructuralQueryPlan>,
-    query_text: Option<&str>,
-    all_results: &[crate::engine::RecallResult],
-) -> Vec<(String, f64)> {
-    if !query_plan
-        .is_some_and(|intent| intent.labels.iter().any(|label| label == "__semantic_facets_removed__"))
-    {
-        return Vec::new();
-    }
-    if !user_context_projection_requested(query_plan, query_text) {
-        return Vec::new();
-    }
-    if ctx.main.get_cue_frequency("source_role:user") == 0 {
-        return Vec::new();
-    }
-
-    if suppress_user_context_projection_for_intent(query_plan) {
-        return Vec::new();
-    }
-
-    let allow_high_confidence_pivot = query_plan
-        .map(|intent| {
-            intent
-                .labels
-                .iter()
-                .any(|label| label == "personal_recommendation_context")
-                && !intent
-                    .labels
-                    .iter()
-                    .any(|label| label == "vague_interest_recommendation")
-        })
-        .unwrap_or(false);
-    let anchor_cues = projection_anchor_cues(query_text);
-    if anchor_cues.len() < 2 && !allow_high_confidence_pivot {
-        return Vec::new();
-    }
-
-    let mut seen_sessions = std::collections::HashSet::new();
-    let mut cues = Vec::new();
-    for result in all_results.iter().take(10) {
-        if source_role_from_metadata(&result.metadata).as_deref() != Some("assistant") {
-            continue;
-        }
-        if result.intersection_count < 2 {
-            continue;
-        }
-        if !projection_pivot_matches_context(
-            &result.content,
-            result.intersection_count,
-            &anchor_cues,
-            allow_high_confidence_pivot,
-        ) {
-            continue;
-        }
-        let Some(session_cue) = source_session_cue_from_metadata(&result.metadata) else {
-            continue;
-        };
-        if !seen_sessions.insert(session_cue.clone()) {
-            continue;
-        }
-        cues.push((session_cue, 4.0));
-        if seen_sessions.len() >= 2 {
-            break;
-        }
-    }
-
-    if cues.is_empty() {
-        return Vec::new();
-    }
-
-    cues.push(("source_role:user".to_string(), 3.0));
-    cues
-}
-
-fn merge_source_answer_projection_results(
-    all_results: &mut Vec<crate::engine::RecallResult>,
-    mut projection_results: Vec<crate::engine::RecallResult>,
-) {
-    for result in &mut projection_results {
-        result.metadata.insert(
-            "source_answer_projection".to_string(),
-            serde_json::json!(true),
-        );
-    }
-
-    for result in projection_results {
-        if let Some(existing) = all_results
-            .iter_mut()
-            .find(|existing| existing.memory_id == result.memory_id)
-        {
-            if result.score > existing.score {
-                existing.score = result.score;
-                existing.match_integrity = result.match_integrity;
-                existing.intersection_count = result.intersection_count;
-                existing.recency_score = result.recency_score;
-                existing.reinforcement_score = result.reinforcement_score;
-                existing.salience_score = result.salience_score;
-                existing.explain = result.explain.clone();
-            }
-            existing.metadata.insert(
-                "source_answer_projection".to_string(),
-                serde_json::json!(true),
-            );
-        } else {
-            all_results.push(result);
-        }
-    }
-}
-
-fn source_prompt_projection_min_intersection(query_text: Option<&str>) -> usize {
-    let anchors = source_prompt_anchor_cues(query_text);
-    if anchors.len() >= 4 {
-        4
-    } else {
-        3
-    }
-}
-
-fn merge_source_prompt_projection_results(
-    all_results: &mut Vec<crate::engine::RecallResult>,
-    mut projection_results: Vec<crate::engine::RecallResult>,
-    query_text: Option<&str>,
-) {
-    let min_intersection = source_prompt_projection_min_intersection(query_text);
-    for result in &mut projection_results {
-        result.metadata.insert(
-            "source_prompt_projection".to_string(),
-            serde_json::json!(true),
-        );
-        let bonus = (result.intersection_count.saturating_sub(1) as f64) * 700.0;
-        result.score += bonus;
-        result.metadata.insert(
-            "source_prompt_projection_boost".to_string(),
-            serde_json::json!({
-                "min_intersection": min_intersection,
-                "bonus": bonus
-            }),
-        );
-    }
-
-    for result in projection_results {
-        if source_role_from_metadata(&result.metadata).as_deref() != Some("user") {
-            continue;
-        }
-        if result.intersection_count < min_intersection {
-            continue;
-        }
-        if let Some(existing) = all_results
-            .iter_mut()
-            .find(|existing| existing.memory_id == result.memory_id)
-        {
-            if result.score > existing.score {
-                existing.score = result.score;
-                existing.match_integrity = result.match_integrity;
-                existing.intersection_count = result.intersection_count;
-                existing.recency_score = result.recency_score;
-                existing.reinforcement_score = result.reinforcement_score;
-                existing.salience_score = result.salience_score;
-                existing.explain = result.explain.clone();
-            }
-            existing.metadata.insert(
-                "source_prompt_projection".to_string(),
-                serde_json::json!(true),
-            );
-        } else {
-            all_results.push(result);
-        }
-    }
-}
-
-fn merge_user_context_projection_results(
-    all_results: &mut Vec<crate::engine::RecallResult>,
-    mut projection_results: Vec<crate::engine::RecallResult>,
-) {
-    for result in &mut projection_results {
-        result.metadata.insert(
-            "user_context_projection".to_string(),
-            serde_json::json!(true),
-        );
-    }
-
-    for result in projection_results {
-        if source_role_from_metadata(&result.metadata).as_deref() != Some("user") {
-            continue;
-        }
-        if let Some(existing) = all_results
-            .iter_mut()
-            .find(|existing| existing.memory_id == result.memory_id)
-        {
-            if result.score > existing.score {
-                existing.score = result.score;
-                existing.match_integrity = result.match_integrity;
-                existing.intersection_count = result.intersection_count;
-                existing.recency_score = result.recency_score;
-                existing.reinforcement_score = result.reinforcement_score;
-                existing.salience_score = result.salience_score;
-                existing.explain = result.explain.clone();
-            }
-            existing.metadata.insert(
-                "user_context_projection".to_string(),
-                serde_json::json!(true),
-            );
-        } else {
-            all_results.push(result);
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-struct StandingInstructionProjection {
-    cues: Vec<(String, f64)>,
-    anchors: Vec<String>,
-}
-
-fn standing_instruction_projection_requested(
-    query_plan: Option<&crate::facets::StructuralQueryPlan>,
-) -> bool {
-    query_plan
-        .map(|intent| {
-            intent
-                .labels
-                .iter()
-                .any(|label| label == "__semantic_facets_removed__")
-        })
-        .unwrap_or(false)
-}
-
-fn standing_instruction_anchor_is_generic(cue: &str) -> bool {
-    if cue.starts_with("type:")
-        || cue.starts_with("has:")
-        || cue.starts_with("temporal:")
-        || cue.starts_with("source_")
-    {
-        return true;
-    }
-
-    if cue.contains('_') {
-        let parts = cue.split('_').collect::<Vec<_>>();
-        return parts.iter().all(|part| standing_instruction_anchor_is_generic(part));
-    }
-
-    crate::nl::get_stopwords().contains(cue)
-        || matches!(
-            cue,
-            "what"
-                | "which"
-                | "how"
-                | "should"
-                | "could"
-                | "would"
-                | "can"
-                | "explain"
-                | "help"
-                | "recommend"
-                | "show"
-                | "tell"
-                | "know"
-                | "consider"
-                | "thing"
-                | "things"
-                | "way"
-                | "ways"
-                | "good"
-                | "common"
-                | "typical"
-                | "current"
-                | "recent"
-                | "problem"
-                | "problems"
-        )
-}
-
-fn projection_anchor_variants(cue: &str) -> Vec<String> {
-    let mut variants = Vec::new();
-
-    if matches!(cue, "chance" | "odds" | "likelihood" | "probability") {
-        variants.extend(
-            ["chance", "odds", "likelihood", "probability"]
-                .iter()
-                .map(|variant| (*variant).to_string()),
-        );
-    }
-
-    if cue.len() > 3 {
-        if let Some(stem) = cue.strip_suffix('s') {
-            variants.push(stem.to_string());
-        } else {
-            variants.push(format!("{cue}s"));
-        }
-    }
-    if let Some(stem) = cue.strip_suffix("ing") {
-        if stem.len() > 2 {
-            variants.push(stem.to_string());
-            variants.push(format!("{stem}e"));
-        }
-    }
-    if let Some(stem) = cue.strip_suffix("ed") {
-        if stem.len() > 2 {
-            variants.push(stem.to_string());
-            variants.push(format!("{stem}e"));
-        }
-    }
-    if let Some(stem) = cue.strip_suffix("ize") {
-        if stem.len() > 2 {
-            variants.push(format!("{stem}ization"));
-        }
-    }
-    if let Some(stem) = cue.strip_suffix("ise") {
-        if stem.len() > 2 {
-            variants.push(format!("{stem}isation"));
-        }
-    }
-    if let Some(stem) = cue.strip_suffix("ate") {
-        if stem.len() > 2 {
-            variants.push(format!("{stem}ation"));
-        }
-    }
-    if let Some(stem) = cue.strip_suffix("ure") {
-        if stem.len() > 2 {
-            variants.push(format!("{stem}uration"));
-        }
-    }
-    if cue.len() > 4 && cue.ends_with('t') {
-        variants.push(format!("{cue}ation"));
-    }
-    if let Some(stem) = cue.strip_suffix("ization") {
-        if stem.len() > 2 {
-            variants.push(format!("{stem}ize"));
-        }
-    }
-    if let Some(stem) = cue.strip_suffix("isation") {
-        if stem.len() > 2 {
-            variants.push(format!("{stem}ise"));
-        }
-    }
-    if let Some(stem) = cue.strip_suffix("ation") {
-        if stem.len() > 2 {
-            variants.push(stem.to_string());
-            variants.push(format!("{stem}ate"));
-        }
-    }
-
-    variants.retain(|variant| variant != cue && variant.len() > 2);
-    variants.sort();
-    variants.dedup();
-    variants
-}
-
-fn standing_instruction_projection_anchors(query_text: Option<&str>) -> Vec<String> {
-    let Some(query_text) = query_text else {
-        return Vec::new();
-    };
-
-    let mut base_seen = std::collections::HashSet::new();
-    let mut base_anchors = Vec::new();
-    for cue in crate::nl::tokenize_to_cues(query_text) {
-        let cue = cue.trim().to_lowercase();
-        if cue.len() <= 2
-            || standing_instruction_anchor_is_generic(&cue)
-            || !base_seen.insert(cue.clone())
-        {
-            continue;
-        }
-        base_anchors.push(cue);
-        if base_anchors.len() >= 10 {
-            break;
-        }
-    }
-
-    let mut seen = std::collections::HashSet::new();
-    let mut anchors = Vec::new();
-    'outer: for cue in base_anchors {
-        for candidate in std::iter::once(cue.clone()).chain(projection_anchor_variants(&cue)) {
-            if candidate.len() <= 2
-                || standing_instruction_anchor_is_generic(&candidate)
-                || !seen.insert(candidate.clone())
-            {
-                continue;
-            }
-            anchors.push(candidate);
-            if anchors.len() >= 18 {
-                break 'outer;
-            }
-        }
-    }
-    anchors
-}
-
-fn standing_instruction_projection_cues(
-    ctx: &crate::projects::ProjectContext,
-    query_plan: Option<&crate::facets::StructuralQueryPlan>,
-    query_text: Option<&str>,
-) -> StandingInstructionProjection {
-    if !standing_instruction_projection_requested(query_plan) {
-        return StandingInstructionProjection::default();
-    }
-    if ctx.main.get_cue_frequency("type:standing_instruction") == 0 {
-        return StandingInstructionProjection::default();
-    }
-
-    let anchors = standing_instruction_projection_anchors(query_text);
-    if anchors.is_empty() {
-        return StandingInstructionProjection::default();
-    }
-
-    let mut cues = vec![("type:standing_instruction".to_string(), 6.0)];
-    if ctx.main.get_cue_frequency("instruction:conditional") > 0 {
-        cues.push(("instruction:conditional".to_string(), 2.4));
-    }
-    if ctx.main.get_cue_frequency("instruction:always") > 0 {
-        cues.push(("instruction:always".to_string(), 2.2));
-    }
-
-    let mut specific_cues = 0usize;
-    let mut seen = std::collections::HashSet::new();
-    for anchor in &anchors {
-        let trigger_cue = format!("instruction_trigger:{anchor}");
-        if ctx.main.get_cue_frequency(&trigger_cue) > 0 && seen.insert(trigger_cue.clone()) {
-            cues.push((trigger_cue, 5.0));
-            specific_cues += 1;
-        }
-        if ctx.main.get_cue_frequency(anchor) > 0 && seen.insert(anchor.clone()) {
-            cues.push((anchor.clone(), 1.8));
-            specific_cues += 1;
-        }
-    }
-
-    if specific_cues == 0 {
-        return StandingInstructionProjection::default();
-    }
-
-    StandingInstructionProjection { cues, anchors }
-}
-
-fn standing_instruction_projection_matched_anchors(
-    memory_cues: &[String],
-    anchors: &[String],
-) -> Vec<String> {
-    let memory_cues = memory_cues
-        .iter()
-        .map(|cue| cue.as_str())
-        .collect::<std::collections::HashSet<_>>();
-    let mut matched = Vec::new();
-    for anchor in anchors {
-        let trigger = format!("instruction_trigger:{anchor}");
-        if memory_cues.contains(trigger.as_str()) || memory_cues.contains(anchor.as_str()) {
-            matched.push(anchor.clone());
-        }
-    }
-    matched.sort();
-    matched.dedup();
-    matched
-}
-
-fn merge_standing_instruction_projection_results(
-    ctx: &crate::projects::ProjectContext,
-    all_results: &mut Vec<crate::engine::RecallResult>,
-    mut projection_results: Vec<crate::engine::RecallResult>,
-    anchors: &[String],
-) {
-    for result in &mut projection_results {
-        let Some(memory) = ctx.main.get_memory(result.memory_id) else {
-            continue;
-        };
-        if !memory
-            .cues
-            .iter()
-            .any(|cue| cue == "type:standing_instruction")
-        {
-            continue;
-        }
-        let matched = standing_instruction_projection_matched_anchors(&memory.cues, anchors);
-        if matched.is_empty() {
-            continue;
-        }
-
-        let bonus = 900.0 + (matched.len() as f64 * 220.0);
-        result.score += bonus;
-        result.metadata.insert(
-            "standing_instruction_projection".to_string(),
-            serde_json::json!(true),
-        );
-        result.metadata.insert(
-            "standing_instruction_projection_matched_anchors".to_string(),
-            serde_json::json!(matched),
-        );
-        result.metadata.insert(
-            "standing_instruction_projection_boost".to_string(),
-            serde_json::json!(bonus),
-        );
-    }
-
-    for result in projection_results {
-        if !result
-            .metadata
-            .contains_key("standing_instruction_projection")
-        {
-            continue;
-        }
-        if let Some(existing) = all_results
-            .iter_mut()
-            .find(|existing| existing.memory_id == result.memory_id)
-        {
-            if result.score > existing.score {
-                existing.score = result.score;
-                existing.match_integrity = result.match_integrity;
-                existing.intersection_count = result.intersection_count;
-                existing.recency_score = result.recency_score;
-                existing.reinforcement_score = result.reinforcement_score;
-                existing.salience_score = result.salience_score;
-                existing.explain = result.explain.clone();
-            }
-            existing.metadata.insert(
-                "standing_instruction_projection".to_string(),
-                serde_json::json!(true),
-            );
-            if let Some(matched) = result
-                .metadata
-                .get("standing_instruction_projection_matched_anchors")
-                .cloned()
-            {
-                existing.metadata.insert(
-                    "standing_instruction_projection_matched_anchors".to_string(),
-                    matched,
-                );
-            }
-        } else {
-            all_results.push(result);
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-struct PreferenceProjection {
-    cues: Vec<(String, f64)>,
-    anchors: Vec<String>,
-}
-
-fn preference_projection_requested(query_plan: Option<&crate::facets::StructuralQueryPlan>) -> bool {
-    query_plan
-        .map(|intent| {
-            intent
-                .labels
-                .iter()
-                .any(|label| label == "__semantic_facets_removed__")
-        })
-        .unwrap_or(false)
-}
-
-fn preference_projection_anchor_is_generic(cue: &str) -> bool {
-    if cue.starts_with("type:")
-        || cue.starts_with("has:")
-        || cue.starts_with("temporal:")
-        || cue.starts_with("source_")
-    {
-        return true;
-    }
-
-    if cue.contains('_') {
-        let parts = cue.split('_').collect::<Vec<_>>();
-        return parts.iter().all(|part| preference_projection_anchor_is_generic(part));
-    }
-
-    crate::nl::get_stopwords().contains(cue)
-        || matches!(
-            cue,
-            "what"
-                | "which"
-                | "how"
-                | "should"
-                | "could"
-                | "would"
-                | "can"
-                | "explain"
-                | "help"
-                | "recommend"
-                | "show"
-                | "suggest"
-                | "walk"
-                | "tell"
-                | "know"
-                | "consider"
-                | "thing"
-                | "things"
-                | "way"
-                | "ways"
-                | "good"
-                | "common"
-                | "typical"
-                | "current"
-                | "recent"
-                | "try"
-                | "trying"
-                | "option"
-                | "options"
-                | "step"
-                | "steps"
-                | "plan"
-                | "planning"
-                | "prepare"
-                | "experience"
-                | "use"
-                | "using"
-                | "find"
-                | "get"
-        )
-}
-
-fn preference_projection_anchors(query_text: Option<&str>) -> Vec<String> {
-    let Some(query_text) = query_text else {
-        return Vec::new();
-    };
-
-    let mut base_seen = std::collections::HashSet::new();
-    let mut base_anchors = Vec::new();
-    for cue in crate::nl::tokenize_to_cues(query_text) {
-        let cue = cue.trim().to_lowercase();
-        if cue.len() <= 2
-            || preference_projection_anchor_is_generic(&cue)
-            || !base_seen.insert(cue.clone())
-        {
-            continue;
-        }
-        base_anchors.push(cue);
-        if base_anchors.len() >= 12 {
-            break;
-        }
-    }
-
-    let mut seen = std::collections::HashSet::new();
-    let mut anchors = Vec::new();
-    'outer: for cue in base_anchors {
-        for candidate in std::iter::once(cue.clone()).chain(projection_anchor_variants(&cue)) {
-            if candidate.len() <= 2
-                || preference_projection_anchor_is_generic(&candidate)
-                || !seen.insert(candidate.clone())
-            {
-                continue;
-            }
-            anchors.push(candidate);
-            if anchors.len() >= 20 {
-                break 'outer;
-            }
-        }
-    }
-    anchors
-}
-
-fn preference_projection_cues(
-    ctx: &crate::projects::ProjectContext,
-    query_plan: Option<&crate::facets::StructuralQueryPlan>,
-    query_text: Option<&str>,
-) -> PreferenceProjection {
-    if !preference_projection_requested(query_plan) {
-        return PreferenceProjection::default();
-    }
-
-    let has_preference = ctx.main.get_cue_frequency("type:preference") > 0;
-    let has_dislike = ctx.main.get_cue_frequency("type:dislike") > 0;
-    if !has_preference && !has_dislike {
-        return PreferenceProjection::default();
-    }
-
-    let anchors = preference_projection_anchors(query_text);
-    if anchors.is_empty() {
-        return PreferenceProjection::default();
-    }
-
-    let mut cues = Vec::new();
-    if has_preference {
-        cues.push(("type:preference".to_string(), 4.8));
-    }
-    if has_dislike {
-        cues.push(("type:dislike".to_string(), 2.0));
-    }
-    if ctx.main.get_cue_frequency("source_role:user") > 0 {
-        cues.push(("source_role:user".to_string(), 1.6));
-    }
-    if ctx.main.get_cue_frequency("preference:explicit") > 0 {
-        cues.push(("preference:explicit".to_string(), 2.4));
-    }
-
-    let mut specific_cues = 0usize;
-    let mut seen = std::collections::HashSet::new();
-    for anchor in &anchors {
-        for (prefix, weight) in [
-            ("preference_value", 4.2),
-            ("preference_topic", 4.0),
-            ("preference_contrast", 1.4),
-        ] {
-            let cue = format!("{prefix}:{anchor}");
-            if ctx.main.get_cue_frequency(&cue) > 0 && seen.insert(cue.clone()) {
-                cues.push((cue, weight));
-                specific_cues += 1;
-            }
-        }
-        if ctx.main.get_cue_frequency(anchor) > 0 && seen.insert(anchor.clone()) {
-            cues.push((anchor.clone(), 1.7));
-            specific_cues += 1;
-        }
-    }
-
-    if specific_cues == 0 {
-        return PreferenceProjection::default();
-    }
-
-    PreferenceProjection { cues, anchors }
-}
-
-fn preference_projection_matched_anchors(
-    memory_cues: &[String],
-    anchors: &[String],
-) -> (Vec<String>, usize) {
-    let memory_cues = memory_cues
-        .iter()
-        .map(|cue| cue.as_str())
-        .collect::<std::collections::HashSet<_>>();
-    let mut matched = Vec::new();
-    let mut preference_specific = 0usize;
-    for anchor in anchors {
-        let value = format!("preference_value:{anchor}");
-        let topic = format!("preference_topic:{anchor}");
-        let contrast = format!("preference_contrast:{anchor}");
-        let specific_match = memory_cues.contains(value.as_str())
-            || memory_cues.contains(topic.as_str())
-            || memory_cues.contains(contrast.as_str());
-        if specific_match {
-            preference_specific += 1;
-        }
-        if specific_match || memory_cues.contains(anchor.as_str()) {
-            matched.push(anchor.clone());
-        }
-    }
-    matched.sort();
-    matched.dedup();
-    (matched, preference_specific)
-}
-
-fn merge_preference_projection_results(
-    ctx: &crate::projects::ProjectContext,
-    all_results: &mut Vec<crate::engine::RecallResult>,
-    mut projection_results: Vec<crate::engine::RecallResult>,
-    anchors: &[String],
-) {
-    for result in &mut projection_results {
-        let Some(memory) = ctx.main.get_memory(result.memory_id) else {
-            continue;
-        };
-        let is_preference_memory = memory
-            .cues
-            .iter()
-            .any(|cue| cue == "type:preference" || cue == "type:dislike");
-        if !is_preference_memory {
-            continue;
-        }
-
-        let (matched, preference_specific) =
-            preference_projection_matched_anchors(&memory.cues, anchors);
-        if matched.is_empty() || (preference_specific == 0 && matched.len() < 2) {
-            continue;
-        }
-
-        let bonus = 650.0 + (matched.len() as f64 * 180.0) + (preference_specific as f64 * 120.0);
-        result.score += bonus;
-        result.metadata.insert(
-            "preference_projection".to_string(),
-            serde_json::json!(true),
-        );
-        result.metadata.insert(
-            "preference_projection_matched_anchors".to_string(),
-            serde_json::json!(matched),
-        );
-        result.metadata.insert(
-            "preference_projection_boost".to_string(),
-            serde_json::json!(bonus),
-        );
-    }
-
-    for result in projection_results {
-        if !result.metadata.contains_key("preference_projection") {
-            continue;
-        }
-        if let Some(existing) = all_results
-            .iter_mut()
-            .find(|existing| existing.memory_id == result.memory_id)
-        {
-            if result.score > existing.score {
-                existing.score = result.score;
-                existing.match_integrity = result.match_integrity;
-                existing.intersection_count = result.intersection_count;
-                existing.recency_score = result.recency_score;
-                existing.reinforcement_score = result.reinforcement_score;
-                existing.salience_score = result.salience_score;
-                existing.explain = result.explain.clone();
-            }
-            existing.metadata.insert(
-                "preference_projection".to_string(),
-                serde_json::json!(true),
-            );
-            if let Some(matched) = result
-                .metadata
-                .get("preference_projection_matched_anchors")
-                .cloned()
-            {
-                existing.metadata.insert(
-                    "preference_projection_matched_anchors".to_string(),
-                    matched,
-                );
-            }
-        } else {
-            all_results.push(result);
-        }
-    }
-}
-
-fn apply_user_context_adjacency_preference(
-    all_results: &mut [crate::engine::RecallResult],
-    query_plan: Option<&crate::facets::StructuralQueryPlan>,
-    query_text: Option<&str>,
-) {
-    if !query_plan
-        .is_some_and(|intent| intent.labels.iter().any(|label| label == "__semantic_facets_removed__"))
-    {
-        return;
-    }
-    const MAX_ADJACENCY_PIVOTS: usize = 4;
-
-    if !user_context_projection_requested(query_plan, query_text) {
-        return;
-    }
-
-    let projected_sessions = all_results
-        .iter()
-        .filter_map(|result| {
-            if source_role_from_metadata(&result.metadata).as_deref() != Some("user") {
-                return None;
-            }
-            if !result.metadata.contains_key("user_context_projection") {
-                return None;
-            }
-            source_session_cue_from_metadata(&result.metadata)
-        })
-        .collect::<std::collections::HashSet<_>>();
-    if projected_sessions.is_empty() {
-        return;
-    }
-
-    let mut pivots = all_results
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, result)| {
-            if source_role_from_metadata(&result.metadata).as_deref() != Some("assistant") {
-                return None;
-            }
-            if result.intersection_count < 2 {
-                return None;
-            }
-            let session = source_session_cue_from_metadata(&result.metadata)?;
-            if !projected_sessions.contains(&session) {
-                return None;
-            }
-            Some((idx, session, result.created_at, result.score))
-        })
-        .collect::<Vec<_>>();
-    pivots.sort_by(|(_, _, _, left), (_, _, _, right)| {
-        right
-            .partial_cmp(left)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let mut boosts = Vec::new();
-    for (pivot_idx, pivot_session, _, pivot_score) in
-        pivots.into_iter().take(MAX_ADJACENCY_PIVOTS)
-    {
-        let mut session_positions = all_results
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, result)| {
-                if source_session_cue_from_metadata(&result.metadata).as_deref()
-                    == Some(pivot_session.as_str())
-                {
-                    Some((idx, result.created_at))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        session_positions.sort_by(|(_, left), (_, right)| {
-            left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        let Some(pivot_position) = session_positions
-            .iter()
-            .position(|(idx, _)| *idx == pivot_idx)
+            .map(|id| ctx.main.memory_content(*id))
+            .collect::<Option<Vec<String>>>()
         else {
             continue;
         };
-
-        for (position, (idx, _)) in session_positions
-            .iter()
-            .enumerate()
-            .take(pivot_position)
-            .rev()
-            .take(2)
-        {
-            let distance = pivot_position - position;
-            if distance > 4 {
-                break;
-            }
-            if source_role_from_metadata(&all_results[*idx].metadata).as_deref() != Some("user") {
-                continue;
-            }
-            if !all_results[*idx]
-                .metadata
-                .contains_key("user_context_projection")
-            {
-                continue;
-            }
-            let bonus = (pivot_score * 2.0) / (distance * distance) as f64;
-            boosts.push((*idx, pivot_session.clone(), distance, bonus));
-        }
-    }
-
-    let mut best_boosts = std::collections::BTreeMap::new();
-    for (idx, pivot_session, distance, bonus) in boosts {
-        let replace = best_boosts
-            .get(&idx)
-            .map(|(_, _, existing_bonus): &(String, usize, f64)| bonus > *existing_bonus)
-            .unwrap_or(true);
-        if replace {
-            best_boosts.insert(idx, (pivot_session, distance, bonus));
-        }
-    }
-
-    for (idx, (pivot_session, distance, bonus)) in best_boosts {
-        all_results[idx].score += bonus;
-        all_results[idx].metadata.insert(
-            "user_context_adjacency_boost".to_string(),
-            serde_json::json!({
-                "pivot_session": pivot_session,
-                "distance": distance,
-                "bonus": bonus
-            }),
-        );
-    }
-}
-
-fn decision_projection_requested(query_plan: Option<&crate::facets::StructuralQueryPlan>) -> bool {
-    query_plan
-        .map(|intent| {
-            intent
-                .labels
-                .iter()
-                .any(|label| label == "__semantic_facets_removed__")
-        })
-        .unwrap_or(false)
-}
-
-fn decision_projection_cues(
-    ctx: &crate::projects::ProjectContext,
-    query_plan: Option<&crate::facets::StructuralQueryPlan>,
-    all_results: &[crate::engine::RecallResult],
-) -> Vec<(String, f64)> {
-    if !decision_projection_requested(query_plan) {
-        return Vec::new();
-    }
-
-    let mut seen_sessions = std::collections::HashSet::new();
-    let mut cues = Vec::new();
-    for result in all_results.iter().take(8) {
-        if result.intersection_count < 2 && result.match_integrity < 0.20 {
-            continue;
-        }
-        let Some(session_cue) = source_session_cue_from_metadata(&result.metadata) else {
-            continue;
+        let text = parts.join("\n");
+        let moving = partner.iter().any(|id| position.contains_key(id));
+        let (kept, _) = if moving {
+            (text.as_str(), 0)
+        } else {
+            cap_approx_tokens(&text, ROUND_PARTNER_TOKEN_CAP)
         };
-        if !seen_sessions.insert(session_cue.clone()) {
-            continue;
+        if kept.len() < text.len() {
+            result
+                .metadata
+                .insert("expansion_truncated".to_string(), serde_json::json!(true));
         }
-        cues.push((session_cue, 4.0));
-        if seen_sessions.len() >= 3 {
-            break;
-        }
-    }
-
-    if cues.is_empty() {
-        return Vec::new();
-    }
-
-    if ctx.main.get_cue_frequency("type:decision") > 0 {
-        cues.push(("type:decision".to_string(), 3.0));
-    }
-    if ctx.main.get_cue_frequency("type:selection") > 0 {
-        cues.push(("type:selection".to_string(), 2.6));
-    }
-    if query_plan
-        .map(|intent| intent.labels.iter().any(|label| label == "naming_decision"))
-        .unwrap_or(false)
-        && ctx.main.get_cue_frequency("type:naming") > 0
-    {
-        cues.push(("type:naming".to_string(), 2.4));
-    }
-    cues
-}
-
-fn merge_decision_projection_results(
-    all_results: &mut Vec<crate::engine::RecallResult>,
-    mut projection_results: Vec<crate::engine::RecallResult>,
-) {
-    for result in &mut projection_results {
+        result.content = format!("{kept}\n\n{}", result.content);
         result
             .metadata
-            .insert("decision_projection".to_string(), serde_json::json!(true));
-    }
-
-    for result in projection_results {
-        if let Some(existing) = all_results
-            .iter_mut()
-            .find(|existing| existing.memory_id == result.memory_id)
-        {
-            if result.score > existing.score {
-                existing.score = result.score;
-                existing.match_integrity = result.match_integrity;
-                existing.intersection_count = result.intersection_count;
-                existing.recency_score = result.recency_score;
-                existing.reinforcement_score = result.reinforcement_score;
-                existing.salience_score = result.salience_score;
-                existing.explain = result.explain.clone();
+            .insert("expansion".to_string(), serde_json::json!("conversation_round"));
+        result
+            .metadata
+            .insert("expanded_memory_ids".to_string(), serde_json::json!(partner));
+        for id in partner {
+            if position.contains_key(&id) {
+                moved.insert(id);
             }
-            existing
-                .metadata
-                .insert("decision_projection".to_string(), serde_json::json!(true));
-        } else {
-            all_results.push(result);
+            attached.insert(id);
         }
+        applied += 1;
     }
+    if !moved.is_empty() {
+        results.retain(|result| !moved.contains(&result.memory_id));
+    }
+    if reply_top == 0 {
+        return applied;
+    }
+    let mut position: HashMap<MemoryId, usize> = HashMap::new();
+    for (rank, result) in results.iter().enumerate() {
+        position.entry(result.memory_id).or_insert(rank);
+    }
+    let mut moved: HashSet<MemoryId> = HashSet::new();
+    for rank in 0..reply_top.min(results.len()) {
+        if moved.contains(&results[rank].memory_id) {
+            continue;
+        }
+        let reply = ctx.main.conversation_round_reply(results[rank].memory_id);
+        let shown_above = |id: &MemoryId| {
+            attached.contains(id) || position.get(id).is_some_and(|&at| at < rank)
+        };
+        if reply.is_empty() || reply.iter().any(shown_above) {
+            continue;
+        }
+        let Some(parts) = reply
+            .iter()
+            .map(|id| ctx.main.memory_content(*id))
+            .collect::<Option<Vec<String>>>()
+        else {
+            continue;
+        };
+        let result = &mut results[rank];
+        result.content = format!("{}\n\n{}", result.content, parts.join("\n"));
+        result
+            .metadata
+            .insert("expansion".to_string(), serde_json::json!("conversation_round"));
+        result
+            .metadata
+            .insert("reply_memory_ids".to_string(), serde_json::json!(reply));
+        for id in reply {
+            if position.contains_key(&id) {
+                moved.insert(id);
+            }
+            attached.insert(id);
+        }
+        applied += 1;
+    }
+    if !moved.is_empty() {
+        results.retain(|result| !moved.contains(&result.memory_id));
+    }
+    applied
+}
+
+/// Default multiplier for results whose source role differs from the role a
+/// query's grammatical perspective points to: 1.0, no adjustment. v0.7.3 used
+/// 0.35, which BEAM, LongMemEval and LoCoMo runs showed costs recall.
+const DEFAULT_SOURCE_ROLE_MISMATCH_MULTIPLIER: f64 = 1.0;
+
+/// Parses `CUEMAP_SOURCE_ROLE_PENALTY`: a multiplier clamped to 0..1, where
+/// 1.0 disables the adjustment and 0.35 restores v0.7.3.
+fn parse_source_role_mismatch_multiplier(value: Option<&str>) -> f64 {
+    value
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .map(|value| value.clamp(0.0, 1.0))
+        .unwrap_or(DEFAULT_SOURCE_ROLE_MISMATCH_MULTIPLIER)
+}
+
+fn source_role_mismatch_multiplier() -> f64 {
+    static MULTIPLIER: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *MULTIPLIER.get_or_init(|| {
+        parse_source_role_mismatch_multiplier(std::env::var("CUEMAP_SOURCE_ROLE_PENALTY").ok().as_deref())
+    })
 }
 
 fn apply_source_role_preference(
     all_results: &mut [crate::engine::RecallResult],
     query_plan: Option<&crate::facets::StructuralQueryPlan>,
 ) {
+    apply_source_role_preference_with(all_results, query_plan, source_role_mismatch_multiplier());
+}
+
+fn apply_source_role_preference_with(
+    all_results: &mut [crate::engine::RecallResult],
+    query_plan: Option<&crate::facets::StructuralQueryPlan>,
+    multiplier: f64,
+) {
+    if multiplier >= 1.0 {
+        return;
+    }
     let Some(intent) = query_plan else {
         return;
     };
@@ -3552,102 +2283,12 @@ fn apply_source_role_preference(
             continue;
         };
         if role != target_role {
-            result.score *= 0.35;
+            result.score *= multiplier;
             result.metadata.insert(
                 "source_role_mismatch_penalty".to_string(),
                 serde_json::json!(target_role),
             );
         }
-    }
-}
-
-fn apply_decision_adjacency_preference(
-    _all_results: &mut [crate::engine::RecallResult],
-    _query_plan: Option<&crate::facets::StructuralQueryPlan>,
-) {
-}
-
-fn apply_source_answer_adjacency_preference(
-    all_results: &mut [crate::engine::RecallResult],
-    query_plan: Option<&crate::facets::StructuralQueryPlan>,
-) {
-    let Some(intent) = query_plan else {
-        return;
-    };
-    if !intent
-        .labels
-        .iter()
-        .any(|label| label == "__semantic_facets_removed__")
-    {
-        return;
-    }
-    if !intent.labels.iter().any(|label| label == "source_answer")
-        || !intent.labels.iter().any(|label| label == "source_assistant")
-    {
-        return;
-    }
-
-    let Some((pivot_idx, pivot_session)) = all_results
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, result)| {
-            let role = source_role_from_metadata(&result.metadata)?;
-            if role == "assistant" {
-                return None;
-            }
-            let session = source_session_cue_from_metadata(&result.metadata)?;
-            Some((idx, session, result.score))
-        })
-        .max_by(|(_, _, left), (_, _, right)| {
-            left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|(idx, session, _)| (idx, session))
-    else {
-        return;
-    };
-
-    let mut session_positions = all_results
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, result)| {
-            if source_session_cue_from_metadata(&result.metadata).as_deref()
-                == Some(pivot_session.as_str())
-            {
-                Some((idx, result.created_at))
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-    session_positions.sort_by(|(_, left), (_, right)| {
-        left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let Some(pivot_position) = session_positions
-        .iter()
-        .position(|(idx, _)| *idx == pivot_idx)
-    else {
-        return;
-    };
-
-    for (position, (idx, _)) in session_positions.iter().enumerate().skip(pivot_position + 1) {
-        let distance = position - pivot_position;
-        if distance > 8 {
-            break;
-        }
-        if source_role_from_metadata(&all_results[*idx].metadata).as_deref() != Some("assistant") {
-            continue;
-        }
-        let bonus = 2000.0 / (distance * distance) as f64;
-        all_results[*idx].score += bonus;
-        all_results[*idx].metadata.insert(
-            "source_answer_adjacency_boost".to_string(),
-            serde_json::json!({
-                "pivot_session": pivot_session,
-                "distance": distance,
-                "bonus": bonus
-            }),
-        );
     }
 }
 
@@ -3668,8 +2309,9 @@ pub struct RecallGroundedRequest {
     pub min_intersection: Option<usize>,
     #[serde(default = "default_true")]
     pub disable_alias_expansion: bool,
-    #[serde(default = "default_expansion_depth")]
-    pub expansion_depth: usize,
+    /// A number (1 = no expansion) or "conversation_round" (the default).
+    #[serde(default)]
+    pub expansion_depth: crate::conversation::ExpansionDepth,
 }
 
 fn default_true() -> bool {
@@ -3692,10 +2334,6 @@ pub struct RecallGroundedResponse {
 
 fn default_auto_reinforce() -> bool {
     false
-}
-
-fn default_expansion_depth() -> usize {
-    1
 }
 
 fn default_limit() -> usize {
@@ -3862,6 +2500,7 @@ pub fn routes(
     let mut router = Router::new()
         .route("/", get(root))
         .route("/intent/classify", post(classify_intent))
+        .route("/intent/reclassify", post(reclassify_memory_types))
         .route("/memories", post(add_memory))
         .route("/memories/batch", post(add_memories_batch))
         .route("/recall", post(recall))
@@ -3993,6 +2632,45 @@ async fn classify_intent(
         Err(error) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"error": error})),
+        ),
+    }
+}
+
+/// Types every memory of the project with the memory-type head
+/// (`CUEMAP_MEMORY_TYPE_HEAD=1`) that does not have a current memory type yet.
+/// Synchronous; existing projects need this once after the head is turned on.
+async fn reclassify_memory_types(
+    State(state): State<EngineState>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if state.read_only {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "read-only mode"})));
+    }
+    let project_id = match extract_project_id(&headers) {
+        Ok(id) => id,
+        Err(error) => return error,
+    };
+    let Some(ctx) = state.mt_engine.get_project(&project_id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "project not found"})));
+    };
+    if !ctx.main.memory_type_head_enabled() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "the memory-type head is off; start the engine with CUEMAP_MEMORY_TYPE_HEAD=1"})),
+        );
+    }
+    let started = std::time::Instant::now();
+    let model_version = ctx.main.memory_type_version();
+    match tokio::task::spawn_blocking(move || ctx.main.reclassify_memory_types()).await {
+        Ok(report) => {
+            let mut body = serde_json::json!(report);
+            body["elapsed_ms"] = serde_json::json!(started.elapsed().as_millis() as u64);
+            body["model_version"] = serde_json::json!(model_version);
+            (StatusCode::OK, Json(body))
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("reclassification failed: {error}")})),
         ),
     }
 }
@@ -4476,37 +3154,13 @@ async fn recall(
                         let heatmap = ctx.market_heatmap.read().ok();
                         let heatmap_ref = heatmap.as_deref();
 
-                        if req.semantic_mode
-                            == crate::semantic::SemanticRecallMode::Hybrid
-                        {
-                            ctx.main
-                                .recall_weighted_with_query_embedding_rerank_only_and_intent(
-                                    expanded_cues.clone(),
-                                    current_limit,
-                                    false,
-                                    req.min_intersection,
-                                    req.expansion_depth,
-                                    req.explain,
-                                    req.disable_salience_bias,
-                                    heatmap_ref,
-                                    mandatory_cues_ref,
-                                    query_embedding.as_deref(),
-                                    query_intent.as_ref(),
-                                )
-                        } else {
-                            ctx.main.recall_weighted_with_query_embedding(
-                                expanded_cues.clone(),
-                                current_limit,
-                                false,
-                                req.min_intersection,
-                                req.expansion_depth,
-                                req.explain,
-                                req.disable_salience_bias,
-                                heatmap_ref,
-                                mandatory_cues_ref,
-                                query_embedding.as_deref(),
-                            )
-                        }
+                        ctx.main.recall_weighted_profiled_with_options(
+                            expanded_cues.clone(), current_limit, false, req.min_intersection,
+                            req.expansion_depth.engine_depth(), req.explain, req.disable_salience_bias,
+                            heatmap_ref, mandatory_cues_ref, query_embedding.as_deref(),
+                            query_intent.as_ref(), false,
+                            req.semantic_mode == crate::semantic::SemanticRecallMode::Hybrid,
+                        ).0
                     };
 
                     // Add hop metadata
@@ -4548,165 +3202,21 @@ async fn recall(
                     }
                 }
 
-                let source_answer_projection_expansions =
-                    source_answer_projection_cues(
-                        &ctx,
-                        query_plan.as_ref(),
-                        req.query_text.as_deref(),
-                        &all_results,
-                    );
-                if !source_answer_projection_expansions.is_empty() {
-                    let heatmap = ctx.market_heatmap.read().ok();
-                    let heatmap_ref = heatmap.as_deref();
-                    let projection_results = ctx.main.recall_weighted(
-                        source_answer_projection_expansions.clone(),
-                        limit.max(5).min(20),
-                        false,
-                        req.min_intersection,
-                        1,
-                        req.explain,
-                        req.disable_salience_bias,
-                        heatmap_ref,
-                        mandatory_cues_ref
-                    );
-                    merge_source_answer_projection_results(&mut all_results, projection_results);
-                }
-
-                let source_prompt_projection_expansions =
-                    source_prompt_projection_cues(
-                        &ctx,
-                        query_plan.as_ref(),
-                        req.query_text.as_deref(),
-                        &all_results,
-                    );
-                if !source_prompt_projection_expansions.is_empty() {
-                    let heatmap = ctx.market_heatmap.read().ok();
-                    let heatmap_ref = heatmap.as_deref();
-                    let projection_results = ctx.main.recall_weighted(
-                        source_prompt_projection_expansions.clone(),
-                        limit.max(5).min(20),
-                        false,
-                        req.min_intersection,
-                        1,
-                        req.explain,
-                        req.disable_salience_bias,
-                        heatmap_ref,
-                        mandatory_cues_ref
-                    );
-                    merge_source_prompt_projection_results(
-                        &mut all_results,
-                        projection_results,
-                        req.query_text.as_deref(),
-                    );
-                }
-
-                let user_context_projection_expansions =
-                    user_context_projection_cues(
-                        &ctx,
-                        query_plan.as_ref(),
-                        req.query_text.as_deref(),
-                        &all_results,
-                    );
-                if !user_context_projection_expansions.is_empty() {
-                    let heatmap = ctx.market_heatmap.read().ok();
-                    let heatmap_ref = heatmap.as_deref();
-                    let projection_results = ctx.main.recall_weighted(
-                        user_context_projection_expansions.clone(),
-                        limit.max(5).min(20),
-                        false,
-                        req.min_intersection,
-                        1,
-                        req.explain,
-                        req.disable_salience_bias,
-                        heatmap_ref,
-                        mandatory_cues_ref
-                    );
-                    merge_user_context_projection_results(&mut all_results, projection_results);
-                }
-
-                let standing_instruction_projection = standing_instruction_projection_cues(
-                    &ctx,
-                    query_plan.as_ref(),
-                    req.query_text.as_deref(),
-                );
-                if !standing_instruction_projection.cues.is_empty() {
-                    let heatmap = ctx.market_heatmap.read().ok();
-                    let heatmap_ref = heatmap.as_deref();
-                    let projection_results = ctx.main.recall_weighted(
-                        standing_instruction_projection.cues.clone(),
-                        limit.max(5).min(30),
-                        false,
-                        req.min_intersection,
-                        1,
-                        req.explain,
-                        req.disable_salience_bias,
-                        heatmap_ref,
-                        mandatory_cues_ref
-                    );
-                    merge_standing_instruction_projection_results(
-                        &ctx,
-                        &mut all_results,
-                        projection_results,
-                        &standing_instruction_projection.anchors,
-                    );
-                }
-
-                let preference_projection = preference_projection_cues(
-                    &ctx,
-                    query_plan.as_ref(),
-                    req.query_text.as_deref(),
-                );
-                if !preference_projection.cues.is_empty() {
-                    let heatmap = ctx.market_heatmap.read().ok();
-                    let heatmap_ref = heatmap.as_deref();
-                    let projection_results = ctx.main.recall_weighted(
-                        preference_projection.cues.clone(),
-                        limit.max(5).min(30),
-                        false,
-                        req.min_intersection,
-                        1,
-                        req.explain,
-                        req.disable_salience_bias,
-                        heatmap_ref,
-                        mandatory_cues_ref
-                    );
-                    merge_preference_projection_results(
-                        &ctx,
-                        &mut all_results,
-                        projection_results,
-                        &preference_projection.anchors,
-                    );
-                }
-
-                let decision_projection_expansions =
-                    decision_projection_cues(&ctx, query_plan.as_ref(), &all_results);
-                if !decision_projection_expansions.is_empty() {
-                    let heatmap = ctx.market_heatmap.read().ok();
-                    let heatmap_ref = heatmap.as_deref();
-                    let projection_results = ctx.main.recall_weighted(
-                        decision_projection_expansions.clone(),
-                        limit.max(5).min(20),
-                        false,
-                        req.min_intersection,
-                        1,
-                        req.explain,
-                        req.disable_salience_bias,
-                        heatmap_ref,
-                        mandatory_cues_ref
-                    );
-                    merge_decision_projection_results(&mut all_results, projection_results);
-                }
-
                 apply_source_role_preference(&mut all_results, query_plan.as_ref());
-                apply_source_answer_adjacency_preference(&mut all_results, query_plan.as_ref());
-                apply_user_context_adjacency_preference(
-                    &mut all_results,
-                    query_plan.as_ref(),
-                    req.query_text.as_deref(),
-                );
-                apply_decision_adjacency_preference(&mut all_results, query_plan.as_ref());
-                all_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-                let results = all_results;
+                all_results.sort_by(|a,b| b.score.total_cmp(&a.score).then_with(|| a.memory_id.cmp(&b.memory_id)));
+                let mut results = all_results;
+                let conversation_round_applied_count = if req.expansion_depth.conversation_round() {
+                    apply_conversation_round_expansion(&ctx, &mut results)
+                } else {
+                    0
+                };
+                if req.explain {
+                    for (rank, result) in results.iter_mut().enumerate() {
+                        if let Some(explanation) = result.explain.as_mut().and_then(|value| value.as_object_mut()) {
+                            explanation.insert("final_rank".into(), serde_json::json!(rank + 1));
+                        }
+                    }
+                }
 
                 let json_results: Vec<serde_json::Value> = results
                     .iter()
@@ -4733,12 +3243,10 @@ async fn recall(
                             "query_cues": cues_to_process,
                             "expanded_cues": expanded_cues,
                             "query_plan": query_plan,
-                            "source_answer_projection_cues": source_answer_projection_expansions,
-                            "source_prompt_projection_cues": source_prompt_projection_expansions,
-                            "user_context_projection_cues": user_context_projection_expansions,
-                            "standing_instruction_projection_cues": standing_instruction_projection.cues,
-                            "preference_projection_cues": preference_projection.cues,
-                            "decision_projection_cues": decision_projection_expansions
+                            "expansion": {
+                                "depth": req.expansion_depth,
+                                "conversation_round_applied_count": conversation_round_applied_count
+                            }
                         })
                     );
                 }
@@ -4976,76 +3484,14 @@ async fn recall(
             let heatmap = ctx.market_heatmap.read().ok();
             let heatmap_ref = heatmap.as_deref();
 
-            if trace_timing {
-                let (results, call_timing) = if req.semantic_mode
-                    == crate::semantic::SemanticRecallMode::Hybrid
-                {
-                    ctx.main
-                        .recall_weighted_with_query_embedding_rerank_only_with_intent_with_timing(
-                            expanded_cues.clone(),
-                            current_limit,
-                            false,
-                            req.min_intersection,
-                            req.expansion_depth,
-                            req.explain,
-                            req.disable_salience_bias,
-                            heatmap_ref,
-                            mandatory_cues_ref,
-                            query_embedding.as_deref(),
-                            query_intent.as_ref(),
-                        )
-                } else {
-                    ctx.main
-                        .recall_weighted_with_query_embedding_with_timing(
-                            expanded_cues.clone(),
-                            current_limit,
-                            false,
-                            req.min_intersection,
-                            req.expansion_depth,
-                            req.explain,
-                            req.disable_salience_bias,
-                            heatmap_ref,
-                            mandatory_cues_ref,
-                            query_embedding.as_deref(),
-                        )
-                };
-                base_recall_total_ms += call_timing.total_ms;
-                base_recall_calls += 1;
-                if base_recall_timing.is_none() {
-                    base_recall_timing = Some(call_timing);
-                }
-                results
-            } else {
-                if req.semantic_mode == crate::semantic::SemanticRecallMode::Hybrid {
-                    ctx.main
-                        .recall_weighted_with_query_embedding_rerank_only_and_intent(
-                            expanded_cues.clone(),
-                            current_limit,
-                            false,
-                            req.min_intersection,
-                            req.expansion_depth,
-                            req.explain,
-                            req.disable_salience_bias,
-                            heatmap_ref,
-                            mandatory_cues_ref,
-                            query_embedding.as_deref(),
-                            query_intent.as_ref(),
-                        )
-                } else {
-                    ctx.main.recall_weighted_with_query_embedding(
-                        expanded_cues.clone(),
-                        current_limit,
-                        false,
-                        req.min_intersection,
-                        req.expansion_depth,
-                        req.explain,
-                        req.disable_salience_bias,
-                        heatmap_ref,
-                        mandatory_cues_ref,
-                        query_embedding.as_deref(),
-                    )
-                }
-            }
+            let (results,call_timing)=ctx.main.recall_weighted_profiled_with_options(
+                expanded_cues.clone(),current_limit,false,req.min_intersection,req.expansion_depth.engine_depth(),
+                req.explain,req.disable_salience_bias,heatmap_ref,mandatory_cues_ref,
+                query_embedding.as_deref(),query_intent.as_ref(),trace_timing,
+                req.semantic_mode==crate::semantic::SemanticRecallMode::Hybrid);
+            base_recall_total_ms+=call_timing.total_ms; base_recall_calls+=1;
+            if base_recall_timing.is_none() { base_recall_timing=Some(call_timing); }
+            results
         };
 
         // Add hop metadata
@@ -5092,218 +3538,6 @@ async fn recall(
     }
 
     phase_start = Instant::now();
-    let source_answer_projection_expansions = source_answer_projection_cues(
-        &ctx,
-        query_plan.as_ref(),
-        req.query_text.as_deref(),
-        &all_results,
-    );
-    if !source_answer_projection_expansions.is_empty() {
-        let heatmap = ctx.market_heatmap.read().ok();
-        let heatmap_ref = heatmap.as_deref();
-        let projection_results = ctx.main.recall_weighted(
-            source_answer_projection_expansions.clone(),
-            limit.max(5).min(20),
-            false,
-            req.min_intersection,
-            1,
-            req.explain,
-                        req.disable_salience_bias,
-            heatmap_ref,
-            mandatory_cues_ref,
-        );
-        merge_source_answer_projection_results(&mut all_results, projection_results);
-    }
-    if trace_timing {
-        timing.insert(
-            "source_answer_projection_ms".to_string(),
-            serde_json::json!(phase_start.elapsed().as_secs_f64() * 1000.0),
-        );
-        timing.insert(
-            "source_answer_projection_cue_count".to_string(),
-            serde_json::json!(source_answer_projection_expansions.len()),
-        );
-    }
-
-    phase_start = Instant::now();
-    let source_prompt_projection_expansions = source_prompt_projection_cues(
-        &ctx,
-        query_plan.as_ref(),
-        req.query_text.as_deref(),
-        &all_results,
-    );
-    if !source_prompt_projection_expansions.is_empty() {
-        let heatmap = ctx.market_heatmap.read().ok();
-        let heatmap_ref = heatmap.as_deref();
-        let projection_results = ctx.main.recall_weighted(
-            source_prompt_projection_expansions.clone(),
-            limit.max(5).min(20),
-            false,
-            req.min_intersection,
-            1,
-            req.explain,
-                        req.disable_salience_bias,
-            heatmap_ref,
-            mandatory_cues_ref,
-        );
-        merge_source_prompt_projection_results(
-            &mut all_results,
-            projection_results,
-            req.query_text.as_deref(),
-        );
-    }
-    if trace_timing {
-        timing.insert(
-            "source_prompt_projection_ms".to_string(),
-            serde_json::json!(phase_start.elapsed().as_secs_f64() * 1000.0),
-        );
-        timing.insert(
-            "source_prompt_projection_cue_count".to_string(),
-            serde_json::json!(source_prompt_projection_expansions.len()),
-        );
-    }
-
-    phase_start = Instant::now();
-    let user_context_projection_expansions = user_context_projection_cues(
-        &ctx,
-        query_plan.as_ref(),
-        req.query_text.as_deref(),
-        &all_results,
-    );
-    if !user_context_projection_expansions.is_empty() {
-        let heatmap = ctx.market_heatmap.read().ok();
-        let heatmap_ref = heatmap.as_deref();
-        let projection_results = ctx.main.recall_weighted(
-            user_context_projection_expansions.clone(),
-            limit.max(5).min(20),
-            false,
-            req.min_intersection,
-            1,
-            req.explain,
-                        req.disable_salience_bias,
-            heatmap_ref,
-            mandatory_cues_ref,
-        );
-        merge_user_context_projection_results(&mut all_results, projection_results);
-    }
-    if trace_timing {
-        timing.insert(
-            "user_context_projection_ms".to_string(),
-            serde_json::json!(phase_start.elapsed().as_secs_f64() * 1000.0),
-        );
-        timing.insert(
-            "user_context_projection_cue_count".to_string(),
-            serde_json::json!(user_context_projection_expansions.len()),
-        );
-    }
-
-    phase_start = Instant::now();
-    let standing_instruction_projection = standing_instruction_projection_cues(
-        &ctx,
-        query_plan.as_ref(),
-        req.query_text.as_deref(),
-    );
-    if !standing_instruction_projection.cues.is_empty() {
-        let heatmap = ctx.market_heatmap.read().ok();
-        let heatmap_ref = heatmap.as_deref();
-        let projection_results = ctx.main.recall_weighted(
-            standing_instruction_projection.cues.clone(),
-            limit.max(5).min(30),
-            false,
-            req.min_intersection,
-            1,
-            req.explain,
-                        req.disable_salience_bias,
-            heatmap_ref,
-            mandatory_cues_ref,
-        );
-        merge_standing_instruction_projection_results(
-            &ctx,
-            &mut all_results,
-            projection_results,
-            &standing_instruction_projection.anchors,
-        );
-    }
-    if trace_timing {
-        timing.insert(
-            "standing_instruction_projection_ms".to_string(),
-            serde_json::json!(phase_start.elapsed().as_secs_f64() * 1000.0),
-        );
-        timing.insert(
-            "standing_instruction_projection_cue_count".to_string(),
-            serde_json::json!(standing_instruction_projection.cues.len()),
-        );
-    }
-
-    phase_start = Instant::now();
-    let preference_projection = preference_projection_cues(
-        &ctx,
-        query_plan.as_ref(),
-        req.query_text.as_deref(),
-    );
-    if !preference_projection.cues.is_empty() {
-        let heatmap = ctx.market_heatmap.read().ok();
-        let heatmap_ref = heatmap.as_deref();
-        let projection_results = ctx.main.recall_weighted(
-            preference_projection.cues.clone(),
-            limit.max(5).min(30),
-            false,
-            req.min_intersection,
-            1,
-            req.explain,
-                        req.disable_salience_bias,
-            heatmap_ref,
-            mandatory_cues_ref,
-        );
-        merge_preference_projection_results(
-            &ctx,
-            &mut all_results,
-            projection_results,
-            &preference_projection.anchors,
-        );
-    }
-    if trace_timing {
-        timing.insert(
-            "preference_projection_ms".to_string(),
-            serde_json::json!(phase_start.elapsed().as_secs_f64() * 1000.0),
-        );
-        timing.insert(
-            "preference_projection_cue_count".to_string(),
-            serde_json::json!(preference_projection.cues.len()),
-        );
-    }
-
-    phase_start = Instant::now();
-    let decision_projection_expansions =
-        decision_projection_cues(&ctx, query_plan.as_ref(), &all_results);
-    if !decision_projection_expansions.is_empty() {
-        let heatmap = ctx.market_heatmap.read().ok();
-        let heatmap_ref = heatmap.as_deref();
-        let projection_results = ctx.main.recall_weighted(
-            decision_projection_expansions.clone(),
-            limit.max(5).min(20),
-            false,
-            req.min_intersection,
-            1,
-            req.explain,
-                        req.disable_salience_bias,
-            heatmap_ref,
-            mandatory_cues_ref,
-        );
-        merge_decision_projection_results(&mut all_results, projection_results);
-    }
-    if trace_timing {
-        timing.insert(
-            "decision_projection_ms".to_string(),
-            serde_json::json!(phase_start.elapsed().as_secs_f64() * 1000.0),
-        );
-        timing.insert(
-            "decision_projection_cue_count".to_string(),
-            serde_json::json!(decision_projection_expansions.len()),
-        );
-    }
-
-    phase_start = Instant::now();
     let mut cuebridge_gap_expansions = Vec::<crate::cuebridge::CueBridgeGapExpansion>::new();
     let mut cuebridge_gap_applied_count = 0usize;
     let cuebridge_artifact_summary = ctx.cuebridge_artifact_summary();
@@ -5333,17 +3567,16 @@ async fn recall(
 
             let heatmap = ctx.market_heatmap.read().ok();
             let heatmap_ref = heatmap.as_deref();
-            let gap_results = ctx.main.recall_weighted(
+            let gap_results = ctx.main.recall_weighted_profiled_with_options(
                 expanded_cues.clone(),
                 limit,
                 false,
                 req.min_intersection,
-                req.expansion_depth,
+                req.expansion_depth.engine_depth(),
                 req.explain,
                 req.disable_salience_bias,
                 heatmap_ref,
-                mandatory_cues_ref,
-            );
+                mandatory_cues_ref, None, None, false, false).0;
             cuebridge_gap_applied_count = gap_results.len();
             merge_cuebridge_gap_results(
                 &mut all_results,
@@ -5439,7 +3672,7 @@ async fn recall(
             .max(1);
         let heatmap = ctx.market_heatmap.read().ok();
         let heatmap_ref = heatmap.as_deref();
-        let fusion_candidates = ctx.main.recall_weighted(
+        let fusion_candidates = ctx.main.recall_weighted_profiled_with_options(
             expanded_cues.clone(),
             fusion_limit,
             false,
@@ -5448,8 +3681,7 @@ async fn recall(
             req.explain,
                             req.disable_salience_bias,
             heatmap_ref,
-            mandatory_cues_ref,
-        );
+            mandatory_cues_ref, None, None, false, false).0;
         let fused_results = build_parent_fusion_results(
             &ctx,
             fusion_candidates,
@@ -5472,13 +3704,6 @@ async fn recall(
 
     phase_start = Instant::now();
     apply_source_role_preference(&mut all_results, query_plan.as_ref());
-    apply_source_answer_adjacency_preference(&mut all_results, query_plan.as_ref());
-    apply_user_context_adjacency_preference(
-        &mut all_results,
-        query_plan.as_ref(),
-        req.query_text.as_deref(),
-    );
-    apply_decision_adjacency_preference(&mut all_results, query_plan.as_ref());
     let slate_rerank_applied_count = apply_slate_rerank(
         &ctx,
         &mut all_results,
@@ -5488,12 +3713,20 @@ async fn recall(
         query_plan.as_ref(),
         limit,
     );
-    all_results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let results = all_results;
+    all_results.sort_by(|a,b| b.score.total_cmp(&a.score).then_with(|| a.memory_id.cmp(&b.memory_id)));
+    let mut results = all_results;
+    let expansion_start = Instant::now();
+    let conversation_round_applied_count = if req.expansion_depth.conversation_round() {
+        apply_conversation_round_expansion(&ctx, &mut results)
+    } else {
+        0
+    };
+    if trace_timing && req.expansion_depth.conversation_round() {
+        timing.insert(
+            "conversation_round_ms".to_string(),
+            serde_json::json!(expansion_start.elapsed().as_secs_f64() * 1000.0),
+        );
+    }
     if trace_timing {
         timing.insert(
             "postprocess_sort_ms".to_string(),
@@ -5567,6 +3800,13 @@ async fn recall(
         );
     }
 
+    if req.explain {
+        for (rank,result) in results.iter_mut().enumerate() {
+            if let Some(explanation)=result.explain.as_mut().and_then(|value| value.as_object_mut()) {
+                explanation.insert("final_rank".into(),serde_json::json!(rank+1));
+            }
+        }
+    }
     // Record metrics
     state.metrics.record_recall(engine_latency_ms);
 
@@ -5585,12 +3825,6 @@ async fn recall(
                 "query_cues": cues_to_process,
                 "expanded_cues": expanded_cues,
                 "query_plan": query_plan,
-                "source_answer_projection_cues": source_answer_projection_expansions,
-                "source_prompt_projection_cues": source_prompt_projection_expansions,
-                "user_context_projection_cues": user_context_projection_expansions,
-                "standing_instruction_projection_cues": standing_instruction_projection.cues,
-                "preference_projection_cues": preference_projection.cues,
-                "decision_projection_cues": decision_projection_expansions,
                 "cuebridge_artifacts": cuebridge_artifact_summary,
                 "cuebridge_alias_pack": {
                     "applied_count": cuebridge_alias_expansions.len(),
@@ -5627,6 +3861,10 @@ async fn recall(
                     "pool_limit": SLATE_RERANK_POOL_LIMIT,
                     "target_limit": SLATE_RERANK_TARGET_LIMIT,
                     "protected_results": SLATE_RERANK_PROTECTED_RESULTS
+                },
+                "expansion": {
+                    "depth": req.expansion_depth,
+                    "conversation_round_applied_count": conversation_round_applied_count
                 }
             }
         });
@@ -5887,7 +4125,9 @@ async fn jobs_status(
         };
 
         match mt_engine.get_or_create_project(project_id) {
-            Ok(ctx) => add_intent_coverage_to_status(&mut status, &ctx),
+            Ok(ctx) => {
+                add_intent_coverage_to_status(&mut status, &ctx);
+            },
             Err(error) => {
                 if let Some(object) = status.as_object_mut() {
                     object.insert("intent_ready".to_string(), serde_json::json!(false));
@@ -6003,18 +4243,21 @@ async fn recall_grounded(
     let heatmap = ctx.market_heatmap.read().ok();
     let heatmap_ref = heatmap.as_deref();
 
-    let results = ctx.main.recall_weighted(
+    let mut results = ctx.main.recall_weighted(
         expanded_cues.clone(),
         req.limit.max(20),
         req.auto_reinforce,
         req.min_intersection,
-        req.expansion_depth,
+        req.expansion_depth.engine_depth(),
         true, // explain
         req.disable_salience_bias,
         heatmap_ref,
         None, // mandatory_cues not exposed in RecallGroundedRequest
     );
     drop(heatmap); // Guard must be dropped before async return to satisfy Send (even if implicit)
+    if req.expansion_depth.conversation_round() {
+        apply_conversation_round_expansion(&ctx, &mut results);
+    }
 
     // 2. Apply Budgeting Logic
     let (selected, excluded, context_block) = GroundingEngine::select_memories(
@@ -7921,12 +6164,99 @@ pub struct DebugAnalyzeTextRequest {
 pub enum TextSegmenterMode {
     SentenceWindow,
     LogicalBlock,
+    /// One memory per chat message (long messages split into parts), with conversation,
+    /// turn, role and part metadata. See `agent::conversation_import`.
+    Conversation,
 }
 
 impl Default for TextSegmenterMode {
     fn default() -> Self {
         Self::SentenceWindow
     }
+}
+
+/// `/ingest/content` with `"segmenter": "conversation"`: one memory per message (or
+/// message part) with per-message metadata layered over the request's metadata.
+/// Messages that carry no conversation id of their own are grouped under the request's
+/// `source_session_id` (or `conversation_id`) metadata, else its source key.
+async fn ingest_conversation_content(
+    job_queue: Arc<JobQueue>,
+    project_id: String,
+    source: String,
+    req: IngestContentRequest,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use crate::agent::conversation_import::{segment_conversations, DEFAULT_MAX_MESSAGE_CHARS};
+    let default_conversation = req
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata_string(metadata, &["source_session_id", "session_id", "conversation_id", "thread_id"]))
+        .map(str::to_string)
+        .unwrap_or_else(|| source.clone());
+    let max_chars = req.segment_max_chunk_chars.unwrap_or(DEFAULT_MAX_MESSAGE_CHARS);
+    let mut chunks = match segment_conversations(&req.content, &default_conversation, max_chars) {
+        Ok(chunks) => chunks,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Failed to ingest content: {error}")})),
+            )
+        }
+    };
+    if let Some(embeddings) = req.embeddings.as_ref() {
+        if embeddings.len() != chunks.len() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "embeddings length ({}) must match produced chunk count ({})",
+                        embeddings.len(),
+                        chunks.len()
+                    )
+                })),
+            );
+        }
+    }
+    for chunk in &mut chunks {
+        for cue in &req.structural_cues {
+            if !chunk.structural_cues.contains(cue) {
+                chunk.structural_cues.push(cue.clone());
+            }
+        }
+    }
+    let conversations: HashSet<String> = chunks
+        .iter()
+        .filter_map(|chunk| chunk.metadata.get("source_session_id").and_then(|v| v.as_str()).map(str::to_string))
+        .collect();
+    let messages: HashSet<(String, String)> = chunks
+        .iter()
+        .map(|chunk| {
+            let session = chunk.metadata.get("source_session_id").map(|v| v.to_string()).unwrap_or_default();
+            let turn = chunk.metadata.get("source_turn_index").map(|v| v.to_string()).unwrap_or_default();
+            (session, turn)
+        })
+        .collect();
+    let memory_ids = crate::agent::ingester::enqueue_conversation_chunks(
+        &job_queue,
+        &project_id,
+        &source,
+        chunks,
+        req.metadata,
+        req.embeddings,
+    )
+    .await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ingested",
+            "filename": req.filename,
+            "source_key": source,
+            "segmenter": "conversation",
+            "conversations": conversations.len(),
+            "messages": messages.len(),
+            "chunks": memory_ids.len(),
+            "memory_ids": memory_ids
+        })),
+    )
 }
 
 fn default_filename() -> String {
@@ -8025,6 +6355,28 @@ async fn debug_analyze_text(
         TextSegmenterMode::LogicalBlock => {
             Chunker::chunk_text_logical_blocks(&req.text, &segmenter_config)
         }
+        TextSegmenterMode::Conversation => {
+            let max_chars = req
+                .segment_max_chunk_chars
+                .unwrap_or(crate::agent::conversation_import::DEFAULT_MAX_MESSAGE_CHARS);
+            match crate::agent::conversation_import::segment_conversations(&req.text, "debug", max_chars) {
+                Ok(chunks) => chunks
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, chunk)| crate::agent::chunker::Chunk {
+                        context: serde_json::to_string(&chunk.metadata).unwrap_or_default(),
+                        content: chunk.content,
+                        start_line: idx + 1,
+                        end_line: idx + 1,
+                        structural_cues: chunk.structural_cues,
+                        category: crate::agent::chunker::ChunkCategory::Conversation,
+                    })
+                    .collect(),
+                Err(error) => {
+                    return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": error})));
+                }
+            }
+        }
     };
     let chunk_summaries: Vec<serde_json::Value> = chunks
         .into_iter()
@@ -8098,6 +6450,9 @@ async fn ingest_content(
         .source_key
         .clone()
         .unwrap_or_else(|| format!("api:{}", req.filename));
+    if req.segmenter == TextSegmenterMode::Conversation {
+        return ingest_conversation_content(job_queue, project_id, source, req).await;
+    }
     let virtual_path = std::path::PathBuf::from(&req.filename);
     let segmenter_config = segmenter_config_from_request(&req);
     let mut chunks = match req.segmenter {
@@ -8115,6 +6470,7 @@ async fn ingest_content(
         TextSegmenterMode::LogicalBlock => {
             Chunker::chunk_text_logical_blocks(&req.content, &segmenter_config)
         }
+        TextSegmenterMode::Conversation => unreachable!("handled by ingest_conversation_content"),
     };
     if req.source_key.is_some() {
         Chunker::attach_parent_links(&mut chunks, &source);

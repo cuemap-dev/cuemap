@@ -38,6 +38,23 @@ const QINT8_PROBE: &[u8] =
     include_bytes!("../assets/all-MiniLM-L3-v2/intent_probe_qint8.head");
 const Q4_PROBE: &[u8] = include_bytes!("../assets/all-MiniLM-L3-v2/intent_probe_q4.head");
 
+/// Memory-type heads trained on WildChat user sentences (scheme v2 labels,
+/// `evals/intent/wildchat/`). They classify memories sentence by sentence and are used
+/// only when `SemanticConfig::memory_type_head` is on; queries always use the probes above.
+const MEMORY_QINT8_PROBE: &[u8] =
+    include_bytes!("../assets/all-MiniLM-L3-v2/memory_type_probe_qint8.head");
+const MEMORY_Q4_PROBE: &[u8] =
+    include_bytes!("../assets/all-MiniLM-L3-v2/memory_type_probe_q4.head");
+/// Appended to the model version of classifications made by the memory-type head.
+pub const MEMORY_TYPE_HEAD_VERSION: &str = "memtype-wildchat-v1";
+/// The memory heads store logits times this scale, so a softmax at this temperature
+/// gives their trained probabilities (the same temperature `intent_compatibility` uses).
+const MEMORY_SOFTMAX_TEMPERATURE: f32 = 0.08;
+/// A sentence decides a memory's type when one memory label reaches this probability.
+const MEMORY_TYPE_MIN_PROBABILITY: f32 = 0.5;
+/// Most sentences classified per memory.
+pub const MEMORY_MAX_SENTENCES: usize = 24;
+
 #[derive(Debug)]
 struct IntentProbe {
     dimensions: usize,
@@ -209,6 +226,11 @@ impl IntentClassification {
 pub struct IntentClassifier {
     encoder: Arc<dyn SemanticEncoder>,
     probe: IntentProbe,
+    memory_probe: Option<IntentProbe>,
+    /// Encoder for memory typing when it differs from `encoder` (a local typing model).
+    memory_encoder: Option<Arc<dyn SemanticEncoder>>,
+    /// Identifies the memory head and typing encoder in `memory_model_version`.
+    memory_version: String,
     model_version: String,
 }
 
@@ -238,8 +260,113 @@ impl IntentClassifier {
         Ok(Self {
             encoder,
             probe,
+            memory_probe: None,
+            memory_encoder: None,
+            memory_version: MEMORY_TYPE_HEAD_VERSION.to_string(),
             model_version,
         })
+    }
+
+    /// Adds a memory-type head from `head_bytes` (CMPINTP1), applied to the output of
+    /// `encoder` (a separate typing model) or, when `None`, of the main encoder.
+    /// `version` names this head/encoder pair in `memory_model_version`, so memories typed
+    /// by another pair are reclassified.
+    pub fn with_custom_memory_head(
+        mut self,
+        encoder: Option<Arc<dyn SemanticEncoder>>,
+        head_bytes: &[u8],
+        version: String,
+    ) -> Result<Self, String> {
+        let probe = IntentProbe::from_bytes(head_bytes)?;
+        let dimensions = encoder.as_ref().map_or(self.encoder.dimensions(), |encoder| encoder.dimensions());
+        if probe.dimensions != dimensions {
+            return Err(format!(
+                "memory-type head expects {} dimensions, the typing encoder provides {dimensions}",
+                probe.dimensions
+            ));
+        }
+        self.memory_probe = Some(probe);
+        self.memory_encoder = encoder;
+        self.memory_version = version;
+        Ok(self)
+    }
+
+    /// Adds the memory-type head for this encoder (see [`Self::classify_memory_sentences`]).
+    pub fn with_memory_head(mut self) -> Result<Self, String> {
+        let bytes = match self.model_version.as_str() {
+            "bundled-qint8-minilm-l3" => MEMORY_QINT8_PROBE,
+            "bundled-q4-minilm-l3" => MEMORY_Q4_PROBE,
+            other => {
+                return Err(format!("no memory-type head is available for semantic model {other}"))
+            }
+        };
+        let probe = IntentProbe::from_bytes(bytes)?;
+        if probe.dimensions != self.probe.dimensions {
+            return Err("memory-type head dimensions differ from the intent probe".to_string());
+        }
+        self.memory_probe = Some(probe);
+        self.memory_encoder = None;
+        self.memory_version = MEMORY_TYPE_HEAD_VERSION.to_string();
+        Ok(self)
+    }
+
+    pub fn memory_head_enabled(&self) -> bool {
+        self.memory_probe.is_some()
+    }
+
+    /// Model version stored on classifications made by the memory-type head.
+    pub fn memory_model_version(&self) -> String {
+        format!("{}+{}", self.model_version, self.memory_version)
+    }
+
+    /// Classifies a memory from its sentences with the memory-type head.
+    ///
+    /// The head was trained on single user sentences. When some sentence gives a memory
+    /// label (preference … summary_or_timeline) at least `MEMORY_TYPE_MIN_PROBABILITY`,
+    /// the memory takes that sentence's scores, so one standing instruction inside a long
+    /// request still types the memory. Otherwise the memory gets the mean of the
+    /// sentences' scores. `text` is used only for the query-side structural signals.
+    pub fn classify_memory_sentences(
+        &self,
+        text: &str,
+        sentences: &[String],
+    ) -> Result<IntentClassification, String> {
+        let probe = self
+            .memory_probe
+            .as_ref()
+            .ok_or_else(|| "memory-type head is not enabled".to_string())?;
+        if sentences.is_empty() {
+            return Err("memory has no sentences to classify".to_string());
+        }
+        let mut best: Option<(f32, Vec<f32>)> = None;
+        let mut mean = vec![0.0f32; INTENT_LABELS.len()];
+        let mut count = 0usize;
+        let encoder = self.memory_encoder.as_ref().unwrap_or(&self.encoder);
+        for sentence in sentences.iter().take(MEMORY_MAX_SENTENCES) {
+            let mut vector = encoder.encode(sentence)?;
+            normalize(&mut vector)?;
+            let scores = probe.scores(&vector)?;
+            let probabilities = softmax(&scores, MEMORY_SOFTMAX_TEMPERATURE);
+            let memory_probability = RECALL_LABELS
+                .iter()
+                .filter_map(|label| INTENT_LABELS.iter().position(|candidate| candidate == label))
+                .map(|index| probabilities[index])
+                .fold(0.0f32, f32::max);
+            if memory_probability >= MEMORY_TYPE_MIN_PROBABILITY
+                && best.as_ref().map_or(true, |(probability, _)| memory_probability > *probability)
+            {
+                best = Some((memory_probability, scores.clone()));
+            }
+            for (total, score) in mean.iter_mut().zip(&scores) {
+                *total += score;
+            }
+            count += 1;
+        }
+        let scores = match best {
+            Some((_, scores)) => scores,
+            None => mean.into_iter().map(|total| total / count as f32).collect(),
+        };
+        Ok(self.build_classification(text, scores, IntentTarget::Memory, self.memory_model_version()))
     }
 
     pub fn classify(&self, text: &str, target: IntentTarget) -> Result<IntentClassification, String> {
@@ -272,6 +399,16 @@ impl IntentClassifier {
         let mut normalized_vector = vector.to_vec();
         normalize(&mut normalized_vector)?;
         let scores = self.probe.scores(&normalized_vector)?;
+        Ok(self.build_classification(text, scores, target, self.model_version.clone()))
+    }
+
+    fn build_classification(
+        &self,
+        text: &str,
+        scores: Vec<f32>,
+        target: IntentTarget,
+        model_version: String,
+    ) -> IntentClassification {
         let signals = structural_signals(text);
 
         let mut order = (0..INTENT_LABELS.len()).collect::<Vec<_>>();
@@ -300,7 +437,7 @@ impl IntentClassifier {
             score_map.insert((*label).to_string(), scores[index]);
         }
 
-        Ok(IntentClassification {
+        IntentClassification {
             primary_intent,
             scores: score_map,
             top_intents: order
@@ -314,9 +451,9 @@ impl IntentClassifier {
             recall_eligible,
             recall_action: recall_action.to_string(),
             memory_eligible,
-            model_version: self.model_version.clone(),
+            model_version,
             taxonomy_version: INTENT_TAXONOMY_VERSION.to_string(),
-        })
+        }
     }
 
 }
@@ -470,6 +607,20 @@ fn memory_eligible(primary_intent: &str) -> bool {
     RECALL_LABELS.contains(&primary_intent)
 }
 
+/// Model version of classifications made by the bundled memory-type head on
+/// `base_model_version` (a custom head or typing encoder has its own version; see
+/// [`IntentClassifier::memory_model_version`]).
+pub fn memory_model_version(base_model_version: &str) -> String {
+    format!("{base_model_version}+{MEMORY_TYPE_HEAD_VERSION}")
+}
+
+fn softmax(scores: &[f32], temperature: f32) -> Vec<f32> {
+    let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = scores.iter().map(|score| ((score - max) / temperature).exp()).collect();
+    let total: f32 = exps.iter().sum();
+    exps.into_iter().map(|value| value / total).collect()
+}
+
 fn normalize(vector: &mut [f32]) -> Result<(), String> {
     let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
     if !norm.is_finite() || norm <= f32::EPSILON {
@@ -516,8 +667,105 @@ mod tests {
                 weights,
                 biases: vec![0.0; INTENT_LABELS.len()],
             },
+            memory_probe: None,
+            memory_encoder: None,
+            memory_version: MEMORY_TYPE_HEAD_VERSION.to_string(),
             model_version: "test-model".to_string(),
         }
+    }
+
+    /// Encodes "rule …" sentences on the standing_instruction axis and everything else
+    /// on the action_or_command axis.
+    struct SentenceEncoder;
+
+    impl SemanticEncoder for SentenceEncoder {
+        fn dimensions(&self) -> usize {
+            INTENT_LABELS.len()
+        }
+
+        fn encode(&self, text: &str) -> Result<Vec<f32>, String> {
+            let label = if text.starts_with("rule") { "standing_instruction" } else { "action_or_command" };
+            Ok(intent_axis(INTENT_LABELS.iter().position(|l| *l == label).unwrap()))
+        }
+    }
+
+    fn memory_test_classifier() -> IntentClassifier {
+        let identity = || {
+            let mut weights = vec![0.0; INTENT_LABELS.len() * INTENT_LABELS.len()];
+            for index in 0..INTENT_LABELS.len() {
+                weights[index * INTENT_LABELS.len() + index] = 1.0;
+            }
+            IntentProbe { dimensions: INTENT_LABELS.len(), score_scale: 1.0, weights, biases: vec![0.0; INTENT_LABELS.len()] }
+        };
+        IntentClassifier {
+            encoder: Arc::new(SentenceEncoder),
+            probe: identity(),
+            memory_probe: Some(identity()),
+            memory_encoder: None,
+            memory_version: MEMORY_TYPE_HEAD_VERSION.to_string(),
+            model_version: "test-model".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_custom_head_can_use_its_own_typing_encoder() {
+        let identity_bytes = {
+            let mut bytes = PROBE_MAGIC.to_vec();
+            bytes.extend((INTENT_LABELS.len() as u32).to_le_bytes());
+            bytes.extend((INTENT_LABELS.len() as u32).to_le_bytes());
+            bytes.extend(1.0f32.to_le_bytes());
+            for row in 0..INTENT_LABELS.len() {
+                for column in 0..INTENT_LABELS.len() {
+                    bytes.extend((if row == column { 1.0f32 } else { 0.0 }).to_le_bytes());
+                }
+            }
+            for _ in 0..INTENT_LABELS.len() {
+                bytes.extend(0.0f32.to_le_bytes());
+            }
+            bytes
+        };
+        // The main encoder only produces action vectors; the typing encoder sees rules.
+        let classifier = test_classifier()
+            .with_custom_memory_head(Some(Arc::new(SentenceEncoder)), &identity_bytes, "custom-abc".to_string())
+            .unwrap();
+        assert_eq!(classifier.memory_model_version(), "test-model+custom-abc");
+        let typed = classifier.classify_memory_sentences("rule one", &["rule one".to_string()]).unwrap();
+        assert_eq!(typed.primary_intent, "standing_instruction");
+        assert_eq!(typed.model_version, "test-model+custom-abc");
+        // A head whose width does not match the typing encoder is rejected.
+        assert!(test_classifier().with_custom_memory_head(None, MEMORY_QINT8_PROBE, "x".to_string()).is_err());
+    }
+
+    #[test]
+    fn bundled_memory_heads_are_well_formed() {
+        for bytes in [MEMORY_QINT8_PROBE, MEMORY_Q4_PROBE] {
+            let probe = IntentProbe::from_bytes(bytes).unwrap();
+            assert_eq!(probe.dimensions, 384);
+            assert_eq!(probe.biases.len(), INTENT_LABELS.len());
+            assert!((probe.score_scale - MEMORY_SOFTMAX_TEMPERATURE).abs() < 1e-6);
+        }
+        let error = IntentClassifier::new(Arc::new(AxisEncoder), "unknown-model");
+        assert!(error.is_err());
+    }
+
+    #[test]
+    fn one_memory_sentence_types_the_whole_memory() {
+        let classifier = memory_test_classifier();
+        assert!(classifier.memory_head_enabled());
+        let sentences = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let typed = classifier
+            .classify_memory_sentences("ask one. rule two.", &sentences(&["ask one", "rule two", "ask three"]))
+            .unwrap();
+        assert_eq!(typed.primary_intent, "standing_instruction");
+        assert!(typed.memory_eligible);
+        assert_eq!(typed.model_version, "test-model+memtype-wildchat-v1");
+        let plain = classifier
+            .classify_memory_sentences("ask one. ask two.", &sentences(&["ask one", "ask two"]))
+            .unwrap();
+        assert_eq!(plain.primary_intent, "action_or_command");
+        assert!(!plain.memory_eligible);
+        assert!(classifier.classify_memory_sentences("", &[]).is_err());
+        assert!(test_classifier().classify_memory_sentences("x", &sentences(&["rule x"])).is_err());
     }
 
     #[test]

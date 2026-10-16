@@ -446,7 +446,6 @@ impl JobQueue {
         let background_processing = jobs_config.background_processing;
         let jobs_config_for_worker = jobs_config.clone();
         let tx_worker = tx.clone();
-
         tokio::spawn(async move {
             while let Some(job) = rx.recv().await {
                 // Determine if this job should signal a session write completion
@@ -1326,6 +1325,10 @@ async fn process_job(
                         .attach_intent_classification(memory_id, classification)
                     {
                         return Err("memory disappeared while attaching intent".to_string());
+                    }
+                    if ctx_clone.main.memory_type_head_enabled() {
+                        let memory_type = ctx_clone.main.classify_memory_type(&memory)?;
+                        ctx_clone.main.attach_memory_type_classification(memory_id, memory_type);
                     }
                     Ok::<(), String>(())
                 })

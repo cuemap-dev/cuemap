@@ -2,6 +2,7 @@ pub mod agent;
 pub mod api;
 pub mod auth;
 pub mod config;
+pub mod conversation;
 pub mod crypto;
 pub mod cuebridge;
 pub mod engine;
@@ -20,5 +21,6 @@ pub mod projects;
 pub mod structures;
 pub mod taxonomy;
 pub mod semantic;
+pub mod sentences;
 #[cfg(feature = "semantic-encoder")]
 pub mod semantic_encoder;

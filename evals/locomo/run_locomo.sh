@@ -29,11 +29,12 @@ fi
 
 CUEMAP_URL="${CUEMAP_URL:-http://127.0.0.1:8735}"
 LIMIT="${LIMIT:-20}"
-EXPANSION_DEPTH="${EXPANSION_DEPTH:-10}"
+# Unset: the engine default (conversation_round). Earlier releases used 10 here.
+EXPANSION_DEPTH="${EXPANSION_DEPTH:-}"
 MODE="${MODE:-raw}"
 SEMANTIC_MODE="${SEMANTIC_MODE:-hybrid}"
 OUT_DIR="${OUT_DIR:-$SCRIPT_DIR/results}"
-OUTPUT="${OUTPUT:-$OUT_DIR/locomo_${MODE}_depth${EXPANSION_DEPTH}.json}"
+OUTPUT="${OUTPUT:-$OUT_DIR/locomo_${MODE}_depth${EXPANSION_DEPTH:-default}.json}"
 
 case "$SEMANTIC_MODE" in
   lexical|semantic|hybrid)
@@ -51,15 +52,22 @@ args=(
   "${PYTHON:-python3}" "$HARNESS"
   --url "$CUEMAP_URL"
   --limit "$LIMIT"
-  --expansion-depth "$EXPANSION_DEPTH"
   --ordered-reconstruction "${ORDERED_RECONSTRUCTION:-auto}"
   --evidence-coverage "${EVIDENCE_COVERAGE:-off}"
   --no-auto-reinforce
   --output "$OUTPUT"
 )
+if [[ -n "$EXPANSION_DEPTH" ]]; then
+  args+=(--expansion-depth "$EXPANSION_DEPTH")
+fi
 
 if [[ "${DELETE_PROJECTS:-1}" == "1" ]]; then
   args+=(--delete-project-after-record)
+fi
+
+# Recall-only reads the project ids from the existing OUTPUT file and overwrites it.
+if [[ "${RECALL_ONLY:-0}" == "1" ]]; then
+  args+=(--recall-only)
 fi
 
 if [[ -n "${DATASET:-}" ]]; then
@@ -98,7 +106,7 @@ case "$MODE" in
 esac
 
 echo "Running LoCoMo in $MODE mode"
-echo "Expansion depth: $EXPANSION_DEPTH"
+echo "Expansion depth: ${EXPANSION_DEPTH:-engine default}"
 echo "Retrieval mode: $SEMANTIC_MODE"
 echo "CueMap binary: $CUEMAP_RUST_BIN ($("$CUEMAP_RUST_BIN" --version))"
 echo "Output: $OUTPUT"

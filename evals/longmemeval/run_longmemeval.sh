@@ -82,6 +82,19 @@ if [[ "${DELETE_PROJECTS:-1}" == "1" ]]; then
   args+=(--delete-project-after-record)
 fi
 
+if [[ -n "${EXPANSION_DEPTH:-}" ]]; then
+  args+=(--expansion-depth "$EXPANSION_DEPTH")
+fi
+
+if [[ "${SOURCE_ORDER_METADATA:-0}" == "1" ]]; then
+  args+=(--source-order-metadata)
+fi
+
+# Recall-only reads the project ids from the existing OUTPUT file and overwrites it.
+if [[ "${RECALL_ONLY:-0}" == "1" ]]; then
+  args+=(--recall-only)
+fi
+
 if [[ -n "${DATASET:-}" ]]; then
   args+=(--dataset "$DATASET")
 fi

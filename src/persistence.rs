@@ -51,6 +51,28 @@ struct PersistedState<T> {
     cue_global_counts: Option<HashMap<String, u64>>,
 }
 
+// Version 2 snapshots used bincode, which encodes struct fields positionally,
+// so they are read through this fixed layout.
+#[derive(Deserialize)]
+struct LegacyPersistedState<T> {
+    memories: HashMap<MemoryId, Memory<T>>,
+    source_key_to_id: HashMap<String, MemoryId>,
+    cue_index: HashMap<String, Vec<MemoryId>>,
+    next_memory_id: MemoryId,
+    version: u32,
+    saved_at: u64,
+    cue_global_counts: Option<HashMap<String, u64>>,
+}
+
+impl<T> From<LegacyPersistedState<T>> for PersistedState<T> {
+    fn from(state: LegacyPersistedState<T>) -> Self {
+        Self { memories: state.memories, source_key_to_id: state.source_key_to_id,
+            cue_index: state.cue_index, next_memory_id: state.next_memory_id,
+            version: state.version, saved_at: state.saved_at,
+            cue_global_counts: state.cue_global_counts }
+    }
+}
+
 // Version 2 snapshots used bincode. Version 3 uses zstd-compressed JSON so
 // serde_json::Value metadata can be restored reliably (bincode cannot
 // deserialize dynamic JSON values) without making snapshots unnecessarily
@@ -80,7 +102,8 @@ where
 
     match serde_json::from_slice(&decoded) {
         Ok(state) => Ok(state),
-        Err(json_error) => bincode::deserialize(&decoded).map_err(|bincode_error| {
+        Err(json_error) => bincode::deserialize::<LegacyPersistedState<T>>(&decoded)
+            .map(Into::into).map_err(|bincode_error| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(

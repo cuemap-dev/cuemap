@@ -59,5 +59,5 @@ The publish job publishes the exact tarballs produced and exercised by the
 build jobs; pushes to `main` do not publish packages.
 
 Native packages and the TypeScript SDK must reach the registry before the MCP
-package can resolve its v0.7.3 dependency floor. After publication, refresh the
+package can resolve its v0.7.5 dependency floor. After publication, refresh the
 MCP lockfile from the registry to capture the published tarball integrity hashes.

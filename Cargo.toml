@@ -1,6 +1,6 @@
 [package]
 name = "cuemap"
-version = "0.7.3"
+version = "0.7.5"
 edition = "2021"
 autobins = false
 license = "Apache-2.0"

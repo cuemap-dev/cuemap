@@ -85,6 +85,37 @@ impl Default for SemanticRecallMode {
 pub trait SemanticEncoder: Send + Sync {
     fn dimensions(&self) -> usize;
     fn encode(&self, text: &str) -> Result<Vec<f32>, String>;
+
+    /// Contextual token states for background enrichment. Offsets refer to
+    /// UTF-8 byte positions in the supplied text; special tokens have no span.
+    fn encode_tokens(&self, _text: &str) -> Result<TokenStates, String> {
+        Err("token states are unavailable for this encoder".to_string())
+    }
+}
+
+/// How bounded hybrid reranking combines lexical and semantic evidence.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum HybridFusion {
+    /// v0.7.3 behaviour: weighted sum of min-max normalized lexical and
+    /// semantic scores over the slate.
+    MinMax,
+    /// Reciprocal rank fusion: each lane contributes 1 / (k + rank).
+    Rrf,
+}
+
+impl Default for HybridFusion {
+    fn default() -> Self {
+        Self::MinMax
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TokenStates {
+    pub dimensions: usize,
+    pub vectors: Vec<f32>,
+    pub offsets: Vec<Option<(u32, u32)>>,
+    pub active: Vec<bool>,
 }
 
 impl Default for SemanticIndexMode {
@@ -122,7 +153,9 @@ pub struct SemanticConfig {
     pub encoder_threads: usize,
     /// Enables the CoreML execution provider on Apple targets when the
     /// bundled ONNX Runtime was built with CoreML support. Non-Apple targets
-    /// ignore this setting.
+    /// ignore this setting. Off by default: for the small bundled encoder the
+    /// per-call CoreML overhead dominates (BEAM 128k on Apple silicon: query
+    /// encoding 6.7 ms with CoreML, 1.1 ms on the CPU, same accuracy).
     pub coreml_enabled: bool,
     /// Representation used for vectors persisted with memories.
     pub storage: SemanticStorage,
@@ -155,6 +188,16 @@ pub struct SemanticConfig {
     /// reranking. The final request limit is applied after this window is
     /// reranked. Zero uses the default window.
     pub semantic_rerank_candidate_limit: usize,
+    /// Fusion used by bounded hybrid reranking. `minmax` keeps the v0.7.3
+    /// ordering; `rrf` fuses lexical and semantic ranks instead of scores.
+    pub fusion: HybridFusion,
+    /// Rank constant k for reciprocal rank fusion. 60 is the conventional
+    /// value from the original RRF paper (Cormack et al., 2009); it was not
+    /// fitted to any CueMap benchmark.
+    pub rrf_rank_constant: usize,
+    /// Adds the intent bonus back after reciprocal rank fusion. When false,
+    /// rank fusion uses only lexical and semantic ranks.
+    pub rrf_keep_intent: bool,
     /// Number of query text embeddings retained in the bounded in-memory
     /// cache. Zero disables query embedding caching.
     pub query_embedding_cache_capacity: usize,
@@ -167,6 +210,20 @@ pub struct SemanticConfig {
     /// Maximum fraction of the lexical score range used to penalize a
     /// confidently non-memory candidate.
     pub intent_no_recall_penalty: f64,
+    /// Experimental, off by default: classify memories (except assistant, tool and
+    /// system messages) sentence by sentence with the WildChat memory-type head instead
+    /// of the query-trained intent probe. Queries keep the intent probe. Existing
+    /// memories need `POST /intent/reclassify` (or new ingestion) to get the new type;
+    /// until then they take no part in intent reranking.
+    pub memory_type_head: bool,
+    /// Optional local ONNX model used only for memory typing (empty: the main encoder).
+    /// It is loaded once per process and never downloaded or bundled.
+    pub memory_type_model_path: String,
+    /// Tokenizer JSON for `memory_type_model_path` (empty: the bundled tokenizer).
+    pub memory_type_tokenizer_path: String,
+    /// Optional CMPINTP1 head file for memory typing (empty: the bundled head, which
+    /// only fits the main encoder). Required with `memory_type_model_path`.
+    pub memory_type_head_path: String,
     /// Absolute cap on the score delta contributed by intent reranking. This
     /// keeps even a strong exact-intent match from overwhelming lexical and
     /// semantic evidence.
@@ -195,7 +252,7 @@ impl Default for SemanticConfig {
             tokenizer_path: String::new(),
             max_tokens: 128,
             encoder_threads: 0,
-            coreml_enabled: true,
+            coreml_enabled: false,
             storage: SemanticStorage::Auto,
             index: SemanticIndexMode::Auto,
             max_memory_mb: 0,
@@ -207,10 +264,17 @@ impl Default for SemanticConfig {
             semantic_score_multiplier: 100.0,
             semantic_rerank_weight: 0.60,
             semantic_rerank_candidate_limit: 200,
+            fusion: HybridFusion::MinMax,
+            rrf_rank_constant: 60,
+            rrf_keep_intent: true,
             query_embedding_cache_capacity: 256,
             intent_rerank_enabled: true,
             intent_rerank_weight: 0.65,
             intent_no_recall_penalty: 0.20,
+            memory_type_head: false,
+            memory_type_model_path: String::new(),
+            memory_type_tokenizer_path: String::new(),
+            memory_type_head_path: String::new(),
             intent_rerank_max_delta: 64.0,
             reranker_enabled: false,
             reranker_bias: 0.0,
@@ -303,6 +367,9 @@ impl SemanticConfig {
         if resolved.semantic_rerank_candidate_limit == 0 {
             resolved.semantic_rerank_candidate_limit = 200;
         }
+        if resolved.rrf_rank_constant == 0 {
+            resolved.rrf_rank_constant = 60;
+        }
         resolved.intent_rerank_weight = if resolved.intent_rerank_weight.is_finite() {
             resolved.intent_rerank_weight.clamp(0.0, 1.0)
         } else {
@@ -379,6 +446,60 @@ pub fn load_configured_encoder(
     {
         Err("semantic encoder is configured but this binary was built without the 'semantic-encoder' feature".to_string())
     }
+}
+
+/// A memory-typing setup loaded from local files: the optional typing encoder, the head
+/// bytes, and a version naming the pair (a hash of the head and model files).
+#[derive(Clone)]
+pub struct MemoryTypingAssets {
+    pub encoder: Option<Arc<dyn SemanticEncoder>>,
+    pub head: Arc<Vec<u8>>,
+    pub version: String,
+}
+
+/// Loads (once per process, shared by every project) the local typing model and head
+/// named in `config`. `Ok(None)` when no local head is configured, so the bundled head
+/// applies.
+pub fn load_memory_typing_assets(config: &SemanticConfig) -> Result<Option<MemoryTypingAssets>, String> {
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<(String, String, String), MemoryTypingAssets>>> = OnceLock::new();
+    let head_path = config.memory_type_head_path.trim().to_string();
+    let model_path = config.memory_type_model_path.trim().to_string();
+    let tokenizer_path = config.memory_type_tokenizer_path.trim().to_string();
+    if head_path.is_empty() {
+        if model_path.is_empty() {
+            return Ok(None);
+        }
+        return Err("memory_type_model_path needs memory_type_head_path (the bundled head only fits the main encoder)".to_string());
+    }
+    let key = (head_path.clone(), model_path.clone(), tokenizer_path.clone());
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(assets) = cache.lock().map_err(|_| "memory typing cache lock poisoned".to_string())?.get(&key) {
+        return Ok(Some(assets.clone()));
+    }
+    let head = std::fs::read(&head_path).map_err(|error| format!("cannot read memory-type head {head_path}: {error}"))?;
+    let mut digest = Sha256::new();
+    digest.update(&head);
+    let encoder = if model_path.is_empty() {
+        None
+    } else {
+        digest.update(std::fs::read(&model_path).map_err(|error| format!("cannot read typing model {model_path}: {error}"))?);
+        let mut typing = config.clone();
+        typing.profile = SemanticProfile::Quality;
+        typing.encoder_enabled = true;
+        typing.model_path = model_path.clone();
+        typing.tokenizer_path = tokenizer_path.clone();
+        typing.dimensions = 0;
+        typing.max_tokens = 128;
+        typing.coreml_enabled = false;
+        load_configured_encoder(&typing)?
+    };
+    let hash = digest.finalize().iter().take(6).map(|byte| format!("{byte:02x}")).collect::<String>();
+    let assets = MemoryTypingAssets { encoder, head: Arc::new(head), version: format!("memtype-local-{hash}") };
+    cache.lock().map_err(|_| "memory typing cache lock poisoned".to_string())?.insert(key, assets.clone());
+    Ok(Some(assets))
 }
 
 fn estimate_memory_bytes(

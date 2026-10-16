@@ -38,7 +38,7 @@ RUN apt-get update \
 
 FROM debian:bookworm-slim AS runtime
 
-ARG VERSION=0.7.3
+ARG VERSION=0.7.5
 ARG REVISION=""
 
 LABEL org.opencontainers.image.title="CueMap Engine" \

@@ -1,4 +1,5 @@
 pub mod chunker;
+pub mod conversation_import;
 pub mod ingester;
 pub mod manager;
 pub mod search;

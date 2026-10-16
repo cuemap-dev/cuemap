@@ -3,3 +3,4 @@ results/
 *.jsonl
 *.log
 
+!intent/wildchat/typing/*.json

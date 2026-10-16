@@ -189,6 +189,11 @@ pub struct Memory<T> {
     /// confidence-weighted hybrid reranking.
     #[serde(default)]
     pub intent_classification: Option<IntentClassification>,
+    /// Classification by the memory-type head (`SemanticConfig::memory_type_head`),
+    /// kept apart from `intent_classification` so turning the head off restores the
+    /// previous behaviour without reclassifying.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_type_classification: Option<IntentClassification>,
     /// Type-specific stats payload
     pub stats: T,
 }
@@ -216,6 +221,7 @@ impl<T: Default> Memory<T> {
             scoring_features: MemoryScoringFeatures::default(),
             semantic_vector: None,
             intent_classification: None,
+            memory_type_classification: None,
             stats: T::default(),
         }
     }

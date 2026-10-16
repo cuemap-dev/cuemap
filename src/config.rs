@@ -200,6 +200,23 @@ impl ServerConfig {
                 config.semantic.semantic_rerank_weight = weight;
             }
         }
+        if let Ok(fusion) = env::var("CUEMAP_SEMANTIC_FUSION") {
+            config.semantic.fusion = match fusion.trim().to_ascii_lowercase().as_str() {
+                "minmax" => crate::semantic::HybridFusion::MinMax,
+                "rrf" => crate::semantic::HybridFusion::Rrf,
+                _ => config.semantic.fusion,
+            };
+        }
+        if let Ok(constant) = env::var("CUEMAP_SEMANTIC_RRF_RANK_CONSTANT") {
+            if let Ok(constant) = constant.parse::<usize>() {
+                config.semantic.rrf_rank_constant = constant;
+            }
+        }
+        if let Ok(keep) = env::var("CUEMAP_SEMANTIC_RRF_KEEP_INTENT") {
+            if let Ok(keep) = keep.parse::<bool>() {
+                config.semantic.rrf_keep_intent = keep;
+            }
+        }
         if let Ok(limit) = env::var("CUEMAP_SEMANTIC_RERANK_CANDIDATE_LIMIT") {
             if let Ok(limit) = limit.parse::<usize>() {
                 config.semantic.semantic_rerank_candidate_limit = limit;
@@ -224,6 +241,24 @@ impl ServerConfig {
             if let Ok(penalty) = penalty.parse::<f64>() {
                 config.semantic.intent_no_recall_penalty = penalty;
             }
+        }
+        if let Ok(enabled) = env::var("CUEMAP_MEMORY_TYPE_HEAD") {
+            if let Ok(enabled) = enabled.trim().parse::<bool>().or_else(|_| match enabled.trim() {
+                "1" => Ok(true),
+                "0" => Ok(false),
+                _ => Err(()),
+            }) {
+                config.semantic.memory_type_head = enabled;
+            }
+        }
+        if let Ok(path) = env::var("CUEMAP_MEMORY_TYPE_MODEL_PATH") {
+            config.semantic.memory_type_model_path = path;
+        }
+        if let Ok(path) = env::var("CUEMAP_MEMORY_TYPE_TOKENIZER_PATH") {
+            config.semantic.memory_type_tokenizer_path = path;
+        }
+        if let Ok(path) = env::var("CUEMAP_MEMORY_TYPE_HEAD_PATH") {
+            config.semantic.memory_type_head_path = path;
         }
         if let Ok(max_delta) = env::var("CUEMAP_SEMANTIC_INTENT_RERANK_MAX_DELTA") {
             if let Ok(max_delta) = max_delta.parse::<f64>() {

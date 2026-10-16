@@ -30,7 +30,9 @@ warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
 
 RESULTS_DIR = str(Path(__file__).resolve().parents[1] / "results")
-EVIDENCE_MATCHER = "sentence_or_chunk_overlap_v1"
+EVIDENCE_MATCHER = "sentence_or_chunk_overlap_suffix_clean_v2"
+SOURCE_CONTENT_POLICY = "beam_suffix_clean_v3_participants"
+BEAM_SUFFIX = re.compile(r"\s+->->\s+\d+,\d+\)?\s*$")
 MIN_EVIDENCE_CHARS = 40
 MIN_EVIDENCE_TOKENS = 6
 try:
@@ -51,6 +53,7 @@ def clean_output(text: str) -> str:
 
 
 def normalize_text(text: str) -> str:
+    text = BEAM_SUFFIX.sub("",text)
     text = text.replace("assistant: ", "").replace("user: ", "")
     text = re.sub(r"\s+", " ", text)
     return text.strip().lower()
@@ -767,6 +770,8 @@ def build_recall_payload(
         "evidence_coverage_session_scan_limit": args.evidence_coverage_session_scan_limit,
         "evidence_coverage_max_sessions": args.evidence_coverage_max_sessions,
     }
+    if env_bool("CUEMAP_TRACE_TIMING"):
+        payload["trace_timing"] = True
     if args.expansion_depth is not None:
         payload["expansion_depth"] = args.expansion_depth
     if query_time:
@@ -799,6 +804,15 @@ def run_recall_attempt(
         timeout=120,
     )
     latency_ms = int((time.perf_counter() - recall_started) * 1000)
+    timing_file = os.environ.get("CUEMAP_TIMING_FILE")
+    if timing_file:
+        sample = {
+            "http_latency_ms": latency_ms,
+            "engine_latency_ms": recall_response.get("engine_latency"),
+            "timing": recall_response.get("timing", {}),
+        }
+        with open(timing_file, "a", encoding="utf-8") as output:
+            output.write(json.dumps(sample) + "\n")
     recalled_results = recall_response.get("results")
     if not isinstance(recalled_results, list):
         raise RuntimeError(f"POST /recall returned no results array: {recall_response!r}")
@@ -1027,11 +1041,12 @@ def evaluate():
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument(
         "--expansion-depth",
-        type=int,
+        type=lambda value: int(value) if value.strip().isdigit() else value.strip(),
         default=None,
         help=(
             "Pass through cuemap recall --expansion-depth. A value of 4 includes "
-            "up to three neighboring memories before and after each hit."
+            "up to three neighboring memories before and after each hit; "
+            "conversation_round attaches the message each hit replies to."
         ),
     )
     parser.add_argument("--start-index", type=int, default=0)
@@ -1160,10 +1175,13 @@ def evaluate():
         help="Active CueBridge artifact file or directory; path and sha256 are recorded in result metadata.",
     )
     parser.add_argument("--output", default=None)
+    parser.add_argument("--reuse-projects-from", default=None, help="Use project IDs from this prior result file for recall-only comparisons.")
     add_cuebridge_compare_args(parser)
     args = parser.parse_args()
     cuebridge_mode = cuebridge_compare_mode(args)
     cuebridge_enabled = cuebridge_mode != "off"
+    if args.reuse_projects_from and not args.recall_only:
+        raise ValueError("--reuse-projects-from requires --recall-only")
     if args.recall_only and args.start_step != "ingest":
         raise ValueError("--start-step is for non-recall-only runs.")
     if args.start_step in CUEBRIDGE_ARTIFACT_STEPS and not cuebridge_enabled:
@@ -1212,11 +1230,21 @@ def evaluate():
 
     project_mapping = {}
     if args.recall_only:
-        if not os.path.exists(output_path):
-            raise FileNotFoundError(f"{output_path} not found; recall-only needs an existing output file")
-        with open(output_path, "r") as f:
+        mapping_path=args.reuse_projects_from or output_path
+        if not os.path.exists(mapping_path):
+            raise FileNotFoundError(f"{mapping_path} not found; recall-only needs existing project IDs")
+        with open(mapping_path, "r") as f:
             old_results = json.load(f)
+        if any(row.get('context')!=args.context or row.get('source_content_policy')!=SOURCE_CONTENT_POLICY for row in old_results):
+            raise ValueError('Shared projects require the same context, clean source view, and participant metadata. Ingest once with this harness before recall-only comparisons.')
+        for row in old_results:
+            for key in ('ingest_long_form','source_order_metadata','long_form_segmenter','segment_window_size',
+                        'segment_overlap','segment_min_chunk_chars','segment_max_chunk_chars'):
+                if row.get(key)!=getattr(args,key):raise ValueError(f'shared corpus preparation differs: {key}')
         project_mapping = {r["record_idx"]: r["project_id"] for r in old_results}
+        if len(project_mapping)!=len(old_results):raise ValueError('duplicate record project mappings')
+        if any(index not in project_mapping for index,_ in records_to_test):
+            raise ValueError('shared project mapping does not cover all requested records')
 
     results = []
     hit_at_1 = hit_at_5 = hit_at_10 = hit_at_20 = hit_at_50 = hit_at_100 = 0
@@ -1309,9 +1337,19 @@ def evaluate():
 
             for msg in flat_chat:
                 role = msg.get("role", "")
-                content = msg.get("content", "")
+                original_content = msg.get("content", "")
+                content = BEAM_SUFFIX.sub("",original_content)
                 text_to_add = f"{role}: {content}"
-                metadata = {"source_role": role}
+                metadata = {"source_role": role, "source_content_policy":SOURCE_CONTENT_POLICY}
+                if content != original_content:
+                    metadata["source_original_suffix"]=original_content[len(content):]
+                if msg.get("index") is not None:
+                    metadata["source_beam_index"]=msg["index"]
+                # BEAM explicitly models one user and assistant per record.
+                if role in ("user","assistant"):
+                    metadata["source_actor_id"]=f"beam:{args.context}:record:{record_idx}:{role}"
+                    addressee='assistant' if role=='user' else 'user'
+                    metadata["source_addressee_id"]=f"beam:{args.context}:record:{record_idx}:{addressee}"
                 time_anchor = msg.get("time_anchor")
                 if time_anchor:
                     metadata["source_date"] = time_anchor
@@ -1392,6 +1430,7 @@ def evaluate():
             print(f"\nIngested {total_messages} messages.")
             if not args.no_wait_bg:
                 settle_status = wait_for_bg_jobs(project_id, args.url, args.timeout_seconds, args.poll_seconds)
+
 
         # Parse probing questions
         probing_questions_raw = record.get("probing_questions", "")
@@ -1654,6 +1693,8 @@ def evaluate():
             "cuebridge_compare_mode": cuebridge_mode,
             "cuebridge_built_artifacts": artifact_metadata,
             "settle_status": settle_status,
+            "source_content_policy":SOURCE_CONTENT_POLICY,
+            "reuse_projects_from":args.reuse_projects_from,
             "probing_results": record_results,
         })
         save_results(output_path, results)

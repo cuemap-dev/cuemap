@@ -902,9 +902,11 @@ def evaluate():
     )
     parser.add_argument(
         "--expansion-depth",
-        type=int,
         default=None,
-        help="Pass through cuemap recall --expansion-depth to include neighboring chunk/context memories around each hit.",
+        help=(
+            "Pass through cuemap recall --expansion-depth: a number to include neighboring "
+            "chunk/context memories around each hit, or conversation_round."
+        ),
     )
     parser.add_argument(
         "--ordered-reconstruction",
